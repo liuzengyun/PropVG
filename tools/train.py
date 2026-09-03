@@ -171,7 +171,7 @@ def main_worker(cfg):
             F1score, Nacc_rec, gIoU, cIoU = 0, 0, 0, 0
             mIoU, oIoU, macc = 0, 0, 0
             mRR, rIoU = 0, 0
-            d_acc = 0
+            d_acc, top5_acc = 0, 0
 
             for _prefix, _loader in zip(items, dataloaders[1:]):
                 if is_main():
@@ -196,6 +196,8 @@ def main_worker(cfg):
                     oIoU += set_oIoU
                     mRR += set_mRR
                     rIoU += set_rIoU
+                elif cfg.dataset == "AerialVG":
+                    d_acc, top5_acc, mIoU = evaluate_model(_prefix, cfg, model, _loader)
                 elif (
                     cfg.dataset == "MixedSeg"
                     or cfg.dataset == "RefCOCOUNC"
@@ -223,6 +225,8 @@ def main_worker(cfg):
                 oIoU /= len(dataloaders[1:])
                 mRR /= len(dataloaders[1:])
                 rIoU /= len(dataloaders[1:])
+            elif cfg.dataset == "AerialVG":
+                pass
             elif (
                 cfg.dataset == "MixedSeg"
                 or cfg.dataset == "RefCOCOUNC"
@@ -282,6 +286,17 @@ def main_worker(cfg):
                     }
                     save_compare_det = "mIoU"
                     save_compare_seg = "mRR"
+                elif cfg.dataset == "AerialVG":
+                    saved_info = {
+                        "epoch": epoch,
+                        "top1_acc": d_acc,
+                        "top5_acc": top5_acc,
+                        "mIoU": mIoU,
+                        "best_top1_acc": best_d_acc,
+                        "best_mIoU": best_mIoU,
+                    }
+                    save_compare_det = "top1_acc"
+                    save_compare_seg = "mIoU"
                 elif (
                     cfg.dataset == "MixedSeg"
                     or cfg.dataset == "RefCOCOUNC"
@@ -322,6 +337,9 @@ def main_worker(cfg):
                 best_oIoU = max(oIoU, best_oIoU)
                 best_mRR = max(mRR, best_mRR)
                 best_rIoU = max(rIoU, best_rIoU)
+            elif cfg.dataset == "AerialVG":
+                best_d_acc = max(d_acc, best_d_acc)
+                best_mIoU = max(mIoU, best_mIoU)
             elif (
                 cfg.dataset == "MixedSeg"
                 or cfg.dataset == "RefCOCOUNC"

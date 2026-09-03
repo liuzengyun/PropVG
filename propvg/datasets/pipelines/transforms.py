@@ -65,24 +65,36 @@ class Resize(object):
     def _resize_img(self, results):
         if self.keep_ratio:
             img = mmcv.imrescale(
-                results["img"], results["scale"], interpolation=self.interpolation, backend=self.backend
+                results["img"], results["scale"],
+                interpolation=self.interpolation,
+                backend=self.backend
             )
             new_h, new_w = img.shape[:2]
             h, w = results["ori_shape"][:2]
             w_scale, h_scale = new_w / w, new_h / h
         else:
+            scale = results["scale"]
+
+            if isinstance(scale, (tuple, list)):
+                scale = (int(scale[0]), int(scale[1]))
+            else:
+                scale = int(scale)
+
             img, w_scale, h_scale = mmcv.imresize(
                 results["img"],
-                results["scale"],
+                scale,
                 return_scale=True,
                 interpolation=self.interpolation,
                 backend=self.backend,
             )
-        scale_factor = numpy.array([w_scale, h_scale, w_scale, h_scale], dtype=numpy.float32)
+
+        scale_factor = numpy.array(
+            [w_scale, h_scale, w_scale, h_scale],
+            dtype=numpy.float32
+        )
 
         results["img"] = img
         results["img_shape"] = img.shape
-        # in case that there is no padding
         results["pad_shape"] = img.shape
         results["scale_factor"] = scale_factor
         results["keep_ratio"] = self.keep_ratio

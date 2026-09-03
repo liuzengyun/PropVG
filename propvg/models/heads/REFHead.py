@@ -573,9 +573,11 @@ class REFHead(nn.Module):
     def forward_train(self, x, targets, cls_feat=None, lan_feat=None, lan_mask=None, img=None):
         device = x.device
         extra_dict = {}
-        target_mask = torch.from_numpy(
-            np.concatenate([maskUtils.decode(target)[None] for target in targets["mask"]])
-        ).to(device)
+        target_mask = None
+        if targets["mask"] is not None:
+            target_mask = torch.from_numpy(
+                np.concatenate([maskUtils.decode(target)[None] for target in targets["mask"]])
+            ).to(device)
         img_metas = targets["img_metas"]
         refer_indices = [meta["refer_target_index"] for meta in img_metas]
 
@@ -639,10 +641,14 @@ class REFHead(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        # ! segmentaton branch
-        pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
-        pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
-        pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
+        # ! segmentation branch (not needed for box-only datasets such as
+        # AerialVG; skipping it avoids both forward and backward compute).
+        if target_mask is not None:
+            pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
+            pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
+            pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
+        else:
+            pred_seg = None
 
         # refer interaction
         refer_query_embed = self.refer_adapter(inter_states[-1])
@@ -667,7 +673,7 @@ class REFHead(nn.Module):
         )
 
         # ! seg loss
-        loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"])
+        loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"]) if target_mask is not None else x.sum() * 0.0
 
         loss_dict = {
             "loss_mask": loss_mask,
@@ -676,7 +682,7 @@ class REFHead(nn.Module):
         }
 
         pred_dict = {
-            "pred_global_mask": pred_seg.detach(),
+            "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
             "pred_class_allobj": outputs_class[-1].detach(),
             "pred_bbox_allobj": outputs_coord[-1].detach(),
             "refer_label": refer_score.detach(),
@@ -684,7 +690,7 @@ class REFHead(nn.Module):
         }
         return loss_dict, pred_dict, extra_dict
 
-    def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None):
+    def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None, with_mask=True):
         extra_dict = {}
 
         # all feats embedding to hidden_channels
@@ -747,10 +753,13 @@ class REFHead(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        # ! segmentaton branch
-        pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
-        pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
-        pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
+        # ! segmentation branch; skip for box-only datasets (AerialVG).
+        if with_mask:
+            pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
+            pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
+            pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
+        else:
+            pred_seg = None
 
         # refer interaction
         refer_query_embed = self.refer_adapter(inter_states[-1])
@@ -761,7 +770,7 @@ class REFHead(nn.Module):
         refer_score = refer_label
 
         pred_dict = {
-            "pred_global_mask": pred_seg.detach(),
+            "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
             "pred_class_allobj": outputs_class[-1].detach(),
             "pred_bbox_allobj": outputs_coord[-1].detach(),
             "refer_label": refer_score.detach(),

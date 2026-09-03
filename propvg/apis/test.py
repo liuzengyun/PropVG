@@ -129,6 +129,27 @@ def accuracy(pred_bboxes, gt_bboxes, pred_masks, gt_masks, is_crowd=None, device
     return det_acc * 100.0, mask_miou * 100.0, mask_oiou, mask_acc, det_accs
 
 
+def aerialvg_box_metrics(pred_bboxes, gt_bboxes):
+    """Top-1/Top-5 Acc@0.5 and top-1 mean box IoU."""
+    top1, top5, miou = [], [], []
+    for prediction, target in zip(pred_bboxes, gt_bboxes):
+        scores = prediction["scores"].reshape(-1)
+        boxes = prediction["boxes"]
+        order = scores.argsort(descending=True)
+        boxes = boxes[order]
+        target = torch.as_tensor(target, dtype=boxes.dtype, device=boxes.device).reshape(-1, 4)[0]
+        lt = torch.maximum(boxes[:, :2], target[:2])
+        rb = torch.minimum(boxes[:, 2:], target[2:])
+        inter = (rb - lt).clamp(min=0).prod(dim=1)
+        areas = (boxes[:, 2:] - boxes[:, :2]).clamp(min=0).prod(dim=1)
+        target_area = (target[2:] - target[:2]).clamp(min=0).prod()
+        ious = inter / (areas + target_area - inter).clamp(min=1e-6)
+        top1.append((ious[0] >= 0.5).float())
+        top5.append((ious[:5].max() >= 0.5).float())
+        miou.append(ious[0])
+    return tuple(torch.stack(x).mean().item() * 100.0 for x in (top1, top5, miou))
+
+
 def evaluate_model(prefex, cfg, model, loader):
     model.eval()
     device = list(model.parameters())[0].device
@@ -215,6 +236,14 @@ def evaluate_model(prefex, cfg, model, loader):
                 + f"MaskACC@0.7-0.9: [{PR_list_res[0]:.2f}, {PR_list_res[1]:.2f}, {PR_list_res[2]:.2f}"
             )
         return F1_score_rec, N_acc, T_acc, gIoU_res, cIoU_res, PR_list_res
+    elif cfg.dataset == "AerialVG":
+        top1, top5, miou = aerialvg_box_metrics(pred_bboxes, gt_bboxes)
+        if is_main():
+            get_root_logger().info(
+                f"------------ validate ------------ time: {(time.time() - start):.2f}, "
+                f"Top-1 Acc@0.5: {top1:.2f}%, Top-5 Acc@0.5: {top5:.2f}%, box mIoU: {miou:.2f}%"
+            )
+        return top1, top5, miou
     elif cfg.dataset == "RefZOM":
         mIoU, oIoU, macc, PR_list = refzom_evaluate(
             pred_bboxes, pred_masks, gt_masks, threshold=cfg.model.post_params["score_threshold"]

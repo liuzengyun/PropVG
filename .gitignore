@@ -20,3 +20,6 @@ detrex
 propvg_data
 work_dir
 data
+third/
+*.egg-info
+*.pth

@@ -142,7 +142,7 @@ class MIXRefUniModel_OMG(OneStageModel):
 
         with torch.no_grad():
             predictions = self.get_predictions_parts(
-                pred_dict, img_metas, rescale=rescale, with_bbox=True, with_mask=True
+                pred_dict, img_metas, rescale=rescale, with_bbox=True, with_mask=False
             )
         self.iter += 1
         # if is_main() and self.iter % 100 == 0 and self.visualize:
@@ -205,7 +205,9 @@ class MIXRefUniModel_OMG(OneStageModel):
             "mask_parts": gt_mask_parts_rle,
         }
 
-        pred_dict, extra_dict = self.head.forward_test(img_feat, cls_feat, text_feat, text_attention_mask, img)
+        pred_dict, extra_dict = self.head.forward_test(
+            img_feat, cls_feat, text_feat, text_attention_mask, img, with_mask=with_mask
+        )
 
         predictions = self.get_predictions_parts(
             pred_dict,
