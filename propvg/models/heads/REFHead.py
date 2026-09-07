@@ -24,6 +24,7 @@ from propvg.models.heads.transformers.deformable_transformer import (
 from .modules import SegBranch
 from .unet_head import SimpleFPN, UnetDecoder
 from propvg.models.losses.segloss import seg_loss
+from .grab_binding import GrabGraphBinding
 
 
 class GlobalCrossAttention(nn.Module):
@@ -429,8 +430,10 @@ class REFHead(nn.Module):
         num_queries=20,
         detr_loss={},
         MTD={},
+        enable_grab=True,
     ):
         super(REFHead, self).__init__()
+        self.enable_grab = enable_grab
         self.seg_branch = SegBranch(hidden_channels, upsample_rate=1)
         if "aux" in loss_weight["mask"]:
             self.seg_branch_aux_list = nn.ModuleList(
@@ -513,6 +516,10 @@ class REFHead(nn.Module):
         self.query_pos = nn.Embedding(num_queries, hidden_channels)
         self.refer_loss = nn.CrossEntropyLoss()
         self.mrsm = CRS(hidden_channels)
+        # GrabVG-style language-conditioned local graph binding.  It refines
+        # query features only; proposal boxes and the original PropVG losses
+        # remain unchanged.
+        self.grab_binding = GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48)
         self.dist_head = MTDv2(hidden_channels, MTD["K"])
         self.num_queries = num_queries
         self.refer_class_embed = nn.Linear(hidden_channels, 1 + 1)
@@ -650,8 +657,15 @@ class REFHead(nn.Module):
         else:
             pred_seg = None
 
-        # refer interaction
-        refer_query_embed = self.refer_adapter(inter_states[-1])
+        # GrabVG-style appearance/topology binding before CRS selection.
+        if self.enable_grab:
+            bound_queries, filter_scores = self.grab_binding(
+                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visual=multi_level_feats[0]
+            )
+            extra_dict["grab_filter_scores"] = filter_scores.detach()
+        else:
+            bound_queries, filter_scores = inter_states[-1], None
+        refer_query_embed = self.refer_adapter(bound_queries)
 
         # refer_label - sigmoided
         refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
@@ -674,11 +688,22 @@ class REFHead(nn.Module):
 
         # ! seg loss
         loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"]) if target_mask is not None else x.sum() * 0.0
+        # Filtering supervision: every DETR-matched foreground proposal is
+        # positive; unmatched decoder queries are background.
+        if self.enable_grab:
+            filter_target = torch.zeros_like(filter_scores)
+            for bi, (qind, _) in enumerate(indices_foreground[-1]):
+                if qind.numel():
+                    filter_target[bi, qind] = 1.0
+            loss_filter = F.binary_cross_entropy_with_logits(filter_scores, filter_target)
+        else:
+            loss_filter = x.sum() * 0.0
 
         loss_dict = {
             "loss_mask": loss_mask,
             "loss_det": loss_det,
             "loss_refer": loss_refer,
+            "loss_filter": loss_filter * 0.5,
         }
 
         pred_dict = {
@@ -761,8 +786,14 @@ class REFHead(nn.Module):
         else:
             pred_seg = None
 
-        # refer interaction
-        refer_query_embed = self.refer_adapter(inter_states[-1])
+        # GrabVG-style appearance/topology binding before CRS selection.
+        if self.enable_grab:
+            bound_queries, _ = self.grab_binding(
+                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visual=multi_level_feats[0]
+            )
+        else:
+            bound_queries = inter_states[-1]
+        refer_query_embed = self.refer_adapter(bound_queries)
 
         # refer_label - sigmoided
         refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)

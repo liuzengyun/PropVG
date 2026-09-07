@@ -1,1 +1,1 @@
-CUDA_VISIBLE_DEVICES=1 python tools/train.py configs/aerialvg/PropVG-aerialvg.py
+CUDA_VISIBLE_DEVICES=3 python tools/train.py configs/aerialvg/PropVG-aerialvg.py

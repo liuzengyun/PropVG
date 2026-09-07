@@ -133,11 +133,14 @@ def aerialvg_box_metrics(pred_bboxes, gt_bboxes):
     """Top-1/Top-5 Acc@0.5 and top-1 mean box IoU."""
     top1, top5, miou = [], [], []
     for prediction, target in zip(pred_bboxes, gt_bboxes):
-        scores = prediction["scores"].reshape(-1)
-        boxes = prediction["boxes"]
+        # Distributed evaluation may return predictions from different CUDA
+        # devices. Metrics are small; compute them on CPU to avoid device
+        # mismatch during the final reduction.
+        scores = prediction["scores"].detach().reshape(-1).cpu()
+        boxes = prediction["boxes"].detach().cpu()
         order = scores.argsort(descending=True)
         boxes = boxes[order]
-        target = torch.as_tensor(target, dtype=boxes.dtype, device=boxes.device).reshape(-1, 4)[0]
+        target = torch.as_tensor(target, dtype=boxes.dtype).cpu().reshape(-1, 4)[0]
         lt = torch.maximum(boxes[:, :2], target[:2])
         rb = torch.minimum(boxes[:, 2:], target[2:])
         inter = (rb - lt).clamp(min=0).prod(dim=1)

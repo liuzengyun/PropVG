@@ -1,7 +1,8 @@
 """AerialVG (ODVG jsonl) dataset adapter.
 
-Each JSONL record becomes one referring-expression sample.  The first region
-is the referred target; remaining regions are auxiliary image-level boxes.
+Each JSONL record becomes one referring-expression sample.  Only the first
+region is the referred target. Other regions are contextual annotation and
+are deliberately not passed to the detection loss.
 """
 import json
 import os.path as osp
@@ -27,16 +28,28 @@ class AerialVG(Dataset):
             for line_number, line in enumerate(handle, 1):
                 record = json.loads(line)
                 regions = record.get("grounding", {}).get("regions", [])
-                boxes, phrases = [], []
-                for region in regions:
-                    box = region.get("bbox")
-                    if not box or len(box) != 4:
-                        continue
+                # regions[0] is always the referring target. Keep valid
+                # context boxes in the record so the pipeline can optionally
+                # use them for DETR proposal supervision.
+                if regions:
+                    box = regions[0].get("bbox")
+                else:
+                    box = None
+                boxes = []
+                phrases = []
+                if box and len(box) == 4:
                     x1, y1, x2, y2 = map(float, box)
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    boxes.append([x1, y1, x2, y2])
-                    phrases.append(region.get("phrase", ""))
+                    if x2 > x1 and y2 > y1:
+                        boxes.append([x1, y1, x2, y2])
+                        phrases.append(regions[0].get("phrase", ""))
+                        for region in regions[1:]:
+                            aux = region.get("bbox")
+                            if not aux or len(aux) != 4:
+                                continue
+                            ax1, ay1, ax2, ay2 = map(float, aux)
+                            if ax2 > ax1 and ay2 > ay1:
+                                boxes.append([ax1, ay1, ax2, ay2])
+                                phrases.append(region.get("phrase", ""))
                 if boxes:
                     caption = record.get("grounding", {}).get("caption", "")
                     target_phrase = phrases[0] if phrases else ""

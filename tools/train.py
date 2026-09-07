@@ -296,7 +296,7 @@ def main_worker(cfg):
                         "best_mIoU": best_mIoU,
                     }
                     save_compare_det = "top1_acc"
-                    save_compare_seg = "mIoU"
+                    save_compare_seg = None
                 elif (
                     cfg.dataset == "MixedSeg"
                     or cfg.dataset == "RefCOCOUNC"

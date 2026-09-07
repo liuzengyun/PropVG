@@ -134,7 +134,8 @@ def save_checkpoint(
         }
     )
     latest_path = osp.join(work_dir, "latest.pth")
-    det_best_path = osp.join(work_dir, "det_best.pth")
+    det_best_name = "top1_best.pth" if save_key_metric.get("Det") == "top1_acc" else "det_best.pth"
+    det_best_path = osp.join(work_dir, det_best_name)
     segm_best_path = osp.join(work_dir, "segm_best.pth")
     torch.save(checkpoint, latest_path)
     if is_main():
@@ -145,7 +146,8 @@ def save_checkpoint(
         shutil.copyfile(latest_path, det_best_path)
         if is_main():
             logger.info(f"saved epoch {epoch} checkpoint at {det_best_path}")
-    if checkpoint[save_key_metric["Seg"]] > checkpoint["best_{}".format(save_key_metric["Seg"])]:
+    seg_metric = save_key_metric.get("Seg")
+    if seg_metric is not None and checkpoint[seg_metric] > checkpoint["best_{}".format(seg_metric)]:
         shutil.copyfile(latest_path, segm_best_path)
         if is_main():
             logger.info(f"saved epoch {epoch} checkpoint at {segm_best_path}")
