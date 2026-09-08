@@ -1,6 +1,8 @@
 import time
 import argparse
+import os
 import os.path as osp
+import shutil
 import torch.distributed as dist
 
 import mmcv
@@ -68,6 +70,11 @@ def main_worker(cfg):
     #     raise NotImplementedError("Distributed training is not supported for RRefCOCO dataset.")
     cfg.rank, cfg.world_size = get_dist_info()
     if is_main():
+        # Keep an exact copy of the model code used by this run so that old
+        # experiments remain reproducible after the working tree changes.
+        source_dir = osp.abspath(osp.join(osp.dirname(__file__), "..", "propvg"))
+        backup_dir = osp.join(cfg.work_dir, "propvg")
+        shutil.copytree(source_dir, backup_dir, dirs_exist_ok=True)
         wandb.init(project="propvg-seg-offline", tags=[cfg.tag_name], name=cfg.wandb_name, mode="offline")
         logger = get_root_logger(log_file=osp.join(cfg.work_dir, str(cfg.timestamp) + "_train_log.txt"))
         logger.info(cfg.pretty_text)
@@ -160,6 +167,9 @@ def main_worker(cfg):
     import time
 
     begin_time = time.time()
+    # Top-5 and mIoU in the final directory name must come from the epoch with
+    # the best Top-1 accuracy, rather than independently chosen/final values.
+    best_aerialvg_metrics = None
     for epoch in range(start_epoch + 1, cfg.scheduler_config.max_epoch):
         start_time = time.time()
         train_model(epoch, cfg, model, optimizer, dataloaders[0])
@@ -198,6 +208,8 @@ def main_worker(cfg):
                     rIoU += set_rIoU
                 elif cfg.dataset == "AerialVG":
                     d_acc, top5_acc, mIoU = evaluate_model(_prefix, cfg, model, _loader)
+                    if best_aerialvg_metrics is None or d_acc > best_aerialvg_metrics[0]:
+                        best_aerialvg_metrics = (d_acc, top5_acc, mIoU)
                 elif (
                     cfg.dataset == "MixedSeg"
                     or cfg.dataset == "RefCOCOUNC"
@@ -355,10 +367,19 @@ def main_worker(cfg):
         if cfg.distributed:
             dist.barrier()
 
+    main_process = is_main()
     if cfg.distributed:
         dist.destroy_process_group()
 
     wandb.finish()
+
+    if main_process and cfg.dataset == "AerialVG" and best_aerialvg_metrics is not None:
+        top1, top5, miou = best_aerialvg_metrics
+        final_work_dir = f"{cfg.work_dir}+top1={top1:.2f}+top5={top5:.2f}+miou={miou:.2f}"
+        if osp.abspath(final_work_dir) != osp.abspath(cfg.work_dir):
+            if osp.exists(final_work_dir):
+                raise FileExistsError(f"Cannot rename work directory: destination already exists: {final_work_dir}")
+            os.rename(cfg.work_dir, final_work_dir)
 
 
 def main():

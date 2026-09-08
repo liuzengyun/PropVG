@@ -7,24 +7,34 @@ del AerialVG, LoadAerialVGAnnotations
 
 work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-aerialvg586"
 
-# AerialVG provides one caption query and one referred target box per image.
-# Context/relationship region boxes are ignored by the dataset adapter.
+# AerialVG provides one referred target (regions[0]); optional additional
+# region boxes serve only as proposal/teacher-style supervision.
 # Select the AerialVG-specific validation branch in the training runner.
 dataset = "AerialVG"
 dataset_type = "AerialVG"
 # Maximum observed AerialVG caption length is 55 SentencePiece tokens;
 # 64 leaves room for BEiT3 BOS/EOS tokens without truncation.
 max_token = 64
+
 # False: supervise only regions[0] (the referring target).
 # True: also use regions[1:] as DETR proposal detection targets.
-use_auxiliary_gt = False
+use_auxiliary_gt = True
+# False: fine-tune all BEiT-3 parameters with lr_vis_enc.
+# True: freeze the complete BEiT-3 vision-language backbone.
+freeze_beit3 = False
+
+enable_grab=True
+
+
+
 img_size = 586
 patch_size = 16
 img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])
 
 train_pipeline = [
     dict(type="LoadAerialVGAnnotations", max_token=max_token, use_auxiliary_boxes=use_auxiliary_gt),
-    dict(type="Resize", img_scale=(img_size, img_size), keep_ratio=False),
+    dict(type="Resize", img_scale=(img_size, img_size), keep_ratio=True),
+    dict(type="Pad", size=(img_size, img_size)),
     dict(type="Normalize", **img_norm_cfg),
     dict(type="DefaultFormatBundle"),
     dict(type="CollectData", keys=["img", "ref_expr_inds", "text_attention_mask", "gt_bbox"],
@@ -46,7 +56,8 @@ data = dict(
 model = dict(
     type="MIXRefUniModel_OMG",
     vis_enc=dict(type="BEIT3", img_size=img_size, patch_size=patch_size, vit_type="base", drop_path_rate=0.1,
-                 vocab_size=64010, freeze_layer=-1, vision_embed_proj_interpolate=False,
+                 vocab_size=64010, freeze_layer=-1, freeze_beit3=freeze_beit3,
+                 vision_embed_proj_interpolate=False,
                  # Load the base BEiT-3 weights only.  This is not a PropVG
                  # task checkpoint; the AerialVG detection/referring head is
                  # still initialized and trained from scratch.
@@ -58,7 +69,7 @@ model = dict(
                          "matcher": {"cost_class": 1.0, "cost_bbox": 5.0, "cost_giou": 2.0}},
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
-              enable_grab=False),
+              enable_grab=enable_grab),
     post_params={"score_weighted": False, "mask_threshold": 0.5, "score_threshold": 0.7,
                  "with_nms": False, "with_mask": False},
     process_visual=False,
@@ -67,10 +78,10 @@ model = dict(
 grad_norm_clip = 0.15
 use_fp16 = False
 ema = False
-lr = 0.00015
-optimizer_config = dict(type="Adam", lr=lr, lr_vis_enc=0.000015, lr_lan_enc=lr,
+lr = 0.0004
+optimizer_config = dict(type="Adam", lr=lr, lr_vis_enc=0.00004, lr_lan_enc=lr,
                         betas=(0.9, 0.98), eps=1e-9, weight_decay=0, amsgrad=True)
-scheduler_config = dict(type="MultiStepLRWarmUp", warmup_epochs=1, decay_steps=[24, 32], decay_ratio=0.1, max_epoch=36)
+scheduler_config = dict(type="MultiStepLRWarmUp", warmup_epochs=2, decay_steps=[24, 32], decay_ratio=0.1, max_epoch=36)
 log_interval = 50
 start_save_checkpoint = 0
 # finetune_from = "PropVG-grefcoco.pth"

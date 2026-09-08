@@ -206,7 +206,7 @@ class MIXRefUniModel_OMG(OneStageModel):
         }
 
         pred_dict, extra_dict = self.head.forward_test(
-            img_feat, cls_feat, text_feat, text_attention_mask, img, with_mask=with_mask
+            img_feat, cls_feat, text_feat, text_attention_mask, img, targets=targets, with_mask=with_mask
         )
 
         predictions = self.get_predictions_parts(

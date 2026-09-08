@@ -38,6 +38,7 @@ class BEIT3(BEiT3Wrapper):
         vocab_size=64010,
         norm_layer=nn.LayerNorm,
         freeze_layer=-1,
+        freeze_beit3=False,
         vision_embed_proj_interpolate=False,
         pretrain="/home/dmmm/demo_mirror/vlm/unilm/beit3/pretrain_weights/beit3_base_patch16_384_coco_retrieval.zip",
     ):
@@ -67,6 +68,7 @@ class BEIT3(BEiT3Wrapper):
         # )
         # self.pooler.apply(self._init_weights)
         self.hidden_size = embed_dim
+        self.freeze_beit3 = freeze_beit3
         self.vision_embed_proj_interpolate = vision_embed_proj_interpolate
         # load pretrain checkpoint
         if isinstance(pretrain, str):
@@ -77,6 +79,15 @@ class BEIT3(BEiT3Wrapper):
                 freeze_layer if freeze_layer <= len(self.beit3.encoder.layers) else len(self.beit3.encoder.layers)
             )
             self._freeze_stages()
+        if self.freeze_beit3:
+            for parameter in self.parameters():
+                parameter.requires_grad = False
+            self.eval()
+
+    def train(self, mode=True):
+        # A fully frozen BEiT-3 must also remain in eval mode so stochastic
+        # depth/dropout do not change its features during head training.
+        return super().train(False if self.freeze_beit3 else mode)
 
     def _freeze_stages(self):
         if self.frozen_stages >= 0:

@@ -565,15 +565,16 @@ class REFHead(nn.Module):
             result[i, shot_query_inds] = 1
         return result
 
-    def x_mask_pos_enc(self, x, img_shape):
+    def x_mask_pos_enc(self, x, img_metas):
         batch_size = x.size(0)
-        input_img_h, input_img_w = img_shape
-        x_mask = x.new_ones((batch_size, input_img_h, input_img_w))
-        for img_id in range(batch_size):
-            img_h, img_w = img_shape
-            x_mask[img_id, :img_h, :img_w] = 0
-
-        x_mask = F.interpolate(x_mask.unsqueeze(1), size=x.size()[-2:]).to(torch.bool).squeeze(1)
+        feat_h, feat_w = x.shape[-2:]
+        x_mask = torch.ones((batch_size, feat_h, feat_w), dtype=torch.bool, device=x.device)
+        for img_id, meta in enumerate(img_metas):
+            img_h, img_w = meta["img_shape"][:2]
+            pad_h, pad_w = meta["pad_shape"][:2]
+            valid_h = min(feat_h, int(np.ceil(img_h * feat_h / pad_h)))
+            valid_w = min(feat_w, int(np.ceil(img_w * feat_w / pad_w)))
+            x_mask[img_id, :valid_h, :valid_w] = False
         x_pos_embeds = self.position_embedding(x_mask)
         return x_mask, x_pos_embeds
 
@@ -605,7 +606,7 @@ class REFHead(nn.Module):
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
-            img_masks, pos_embed = self.x_mask_pos_enc(feat, feat.shape[-2:])
+            img_masks, pos_embed = self.x_mask_pos_enc(feat, img_metas)
             multi_level_masks.append(img_masks.to(torch.bool))
             multi_level_position_embeddings.append(pos_embed)
 
@@ -659,12 +660,16 @@ class REFHead(nn.Module):
 
         # GrabVG-style appearance/topology binding before CRS selection.
         if self.enable_grab:
-            bound_queries, filter_scores = self.grab_binding(
-                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visual=multi_level_feats[0]
+            bound_queries, bound_boxes, filter_scores, selected_indices = self.grab_binding(
+                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visuals=multi_level_feats
             )
             extra_dict["grab_filter_scores"] = filter_scores.detach()
+            selected_classes = outputs_class[-1].gather(
+                1, selected_indices[..., None].expand(-1, -1, outputs_class.shape[-1])
+            )
         else:
             bound_queries, filter_scores = inter_states[-1], None
+            bound_boxes, selected_classes, selected_indices = outputs_coord[-1], outputs_class[-1], None
         refer_query_embed = self.refer_adapter(bound_queries)
 
         # refer_label - sigmoided
@@ -681,7 +686,10 @@ class REFHead(nn.Module):
 
         # ! refer loss
         # prepare the target for referring
-        target_gt_refer = self.prepare_referring_targets(indices_foreground[-1], refer_indices, self.num_queries)
+        target_gt_refer_full = self.prepare_referring_targets(indices_foreground[-1], refer_indices, self.num_queries)
+        target_gt_refer = (
+            target_gt_refer_full.gather(1, selected_indices) if self.enable_grab else target_gt_refer_full
+        )
         loss_refer = (
             F.binary_cross_entropy(refer_label.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
         )
@@ -695,7 +703,13 @@ class REFHead(nn.Module):
             for bi, (qind, _) in enumerate(indices_foreground[-1]):
                 if qind.numel():
                     filter_target[bi, qind] = 1.0
-            loss_filter = F.binary_cross_entropy_with_logits(filter_scores, filter_target)
+            filter_bce = F.binary_cross_entropy_with_logits(filter_scores, filter_target)
+            referred_exists = target_gt_refer_full.sum(1) > 0
+            referred_kept = target_gt_refer.sum(1) > 0
+            referred_logit = (filter_scores * target_gt_refer_full).sum(1) / target_gt_refer_full.sum(1).clamp(min=1.0)
+            missing = referred_exists & (~referred_kept)
+            keep_loss = (-F.logsigmoid(referred_logit) * missing.float()).sum() / referred_exists.float().sum().clamp(min=1.0)
+            loss_filter = filter_bce + keep_loss
         else:
             loss_filter = x.sum() * 0.0
 
@@ -708,8 +722,8 @@ class REFHead(nn.Module):
 
         pred_dict = {
             "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
-            "pred_class_allobj": outputs_class[-1].detach(),
-            "pred_bbox_allobj": outputs_coord[-1].detach(),
+            "pred_class_allobj": selected_classes.detach(),
+            "pred_bbox_allobj": bound_boxes.detach(),
             "refer_label": refer_score.detach(),
             "att_map": att_map[-1].detach(),
         }
@@ -735,7 +749,9 @@ class REFHead(nn.Module):
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
-            img_masks, pos_embed = self.x_mask_pos_enc(feat, feat.shape[-2:])
+            img_masks, pos_embed = self.x_mask_pos_enc(feat, targets["img_metas"] if targets is not None else [
+                {"img_shape": img.shape[-2:], "pad_shape": img.shape[-2:]} for _ in range(img.shape[0])
+            ])
             multi_level_masks.append(img_masks.to(torch.bool))
             multi_level_position_embeddings.append(pos_embed)
 
@@ -788,11 +804,15 @@ class REFHead(nn.Module):
 
         # GrabVG-style appearance/topology binding before CRS selection.
         if self.enable_grab:
-            bound_queries, _ = self.grab_binding(
-                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visual=multi_level_feats[0]
+            bound_queries, bound_boxes, _, selected_indices = self.grab_binding(
+                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visuals=multi_level_feats
+            )
+            selected_classes = outputs_class[-1].gather(
+                1, selected_indices[..., None].expand(-1, -1, outputs_class.shape[-1])
             )
         else:
             bound_queries = inter_states[-1]
+            bound_boxes, selected_classes = outputs_coord[-1], outputs_class[-1]
         refer_query_embed = self.refer_adapter(bound_queries)
 
         # refer_label - sigmoided
@@ -802,8 +822,8 @@ class REFHead(nn.Module):
 
         pred_dict = {
             "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
-            "pred_class_allobj": outputs_class[-1].detach(),
-            "pred_bbox_allobj": outputs_coord[-1].detach(),
+            "pred_class_allobj": selected_classes.detach(),
+            "pred_bbox_allobj": bound_boxes.detach(),
             "refer_label": refer_score.detach(),
             "att_map": att_map[-1].detach(),
         }

@@ -3,6 +3,7 @@ import argparse
 
 import torch
 from mmcv import Config
+from tqdm import tqdm
 
 # Register only the AerialVG additions.
 from propvg.datasets.aerialvg import AerialVG  # noqa: F401
@@ -25,7 +26,7 @@ def box_iou(boxes, target):
 def evaluate(model, loader):
     top1, top5, top1_iou = [], [], []
     model.eval()
-    for inputs in loader:
+    for inputs in tqdm(loader, total=len(loader), desc="Evaluating AerialVG", dynamic_ncols=True):
         img_metas = inputs["img_metas"].data[0]
         boxes_per_image = inputs["gt_bbox"].data[0]
         targets = [boxes[meta["refer_target_index"][0]] for boxes, meta in zip(boxes_per_image, img_metas)]
