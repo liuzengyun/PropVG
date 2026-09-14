@@ -1,5 +1,6 @@
 import time
 import copy
+import os
 import numpy
 import torch
 import random
@@ -18,7 +19,7 @@ except:
     pass
 
 
-def set_random_seed(seed, deterministic=False):
+def set_random_seed(seed, deterministic=False, strict=False):
     """Args:
     seed (int): Seed to be used.
     deterministic (bool): Whether to set the deterministic option for
@@ -28,11 +29,19 @@ def set_random_seed(seed, deterministic=False):
     """
     random.seed(seed)
     numpy.random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     if deterministic:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    if strict:
+        # Use deterministic kernels whenever PyTorch provides them. Some
+        # third-party CUDA extensions used by Deformable-DETR are outside
+        # PyTorch's determinism checks, so warn instead of aborting training.
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def train_model(epoch, cfg, model, optimizer, loader):

@@ -3,6 +3,7 @@ ema_factor = 0.999
 use_fp16 = False
 seed = 6666
 deterministic = True
+strict_reproducibility = False
 log_level = "INFO"
 log_interval = 50
 save_interval = -1

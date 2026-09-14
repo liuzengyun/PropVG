@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-aerialvg586"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-aerialvg586—extra_gt_prop"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -16,6 +16,9 @@ dataset_type = "AerialVG"
 # 64 leaves room for BEiT3 BOS/EOS tokens without truncation.
 max_token = 64
 
+# Fix every controllable Python/NumPy/PyTorch/DataLoader random source.
+strict_reproducibility = True
+
 # False: supervise only regions[0] (the referring target).
 # True: also use regions[1:] as DETR proposal detection targets.
 use_auxiliary_gt = True
@@ -23,7 +26,7 @@ use_auxiliary_gt = True
 # True: freeze the complete BEiT-3 vision-language backbone.
 freeze_beit3 = False
 
-enable_grab=True
+enable_grab=False
 
 
 

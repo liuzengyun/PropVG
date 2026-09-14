@@ -183,6 +183,11 @@ def evaluate_model(prefex, cfg, model, loader):
             img_metas = inputs["img_metas"].data[0]
             refer_box = [gt_bbox_[img_meta["refer_target_index"]] for img_meta, gt_bbox_ in zip(img_metas, gt_bbox)]
 
+            # AerialVG ground-truth boxes are evaluator-only data. Do not
+            # expose either the referred box or auxiliary boxes to inference.
+            if cfg.dataset == "AerialVG":
+                inputs.pop("gt_bbox", None)
+
             if not cfg.distributed:
                 inputs = extract_data(inputs)
 
@@ -242,8 +247,9 @@ def evaluate_model(prefex, cfg, model, loader):
     elif cfg.dataset == "AerialVG":
         top1, top5, miou = aerialvg_box_metrics(pred_bboxes, gt_bboxes)
         if is_main():
+            split_name = getattr(loader.dataset, "which_set", prefex)
             get_root_logger().info(
-                f"------------ validate ------------ time: {(time.time() - start):.2f}, "
+                f"------------ {split_name} ------------ time: {(time.time() - start):.2f}, "
                 f"Top-1 Acc@0.5: {top1:.2f}%, Top-5 Acc@0.5: {top5:.2f}%, box mIoU: {miou:.2f}%"
             )
         return top1, top5, miou

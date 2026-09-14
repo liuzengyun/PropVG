@@ -1,5 +1,6 @@
 import numpy
 import random
+import torch
 
 from functools import partial
 from .utils import collate_fn
@@ -26,6 +27,7 @@ def worker_init_fn(worker_id, num_workers, rank, seed):
     worker_seed = num_workers * rank + worker_id + seed
     numpy.random.seed(worker_seed)
     random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
 
 
 def build_dataloader(cfg,
@@ -47,6 +49,11 @@ def build_dataloader(cfg,
     init_fn = partial(
         worker_init_fn, num_workers=cfg.data.workers_per_gpu, rank=cfg.rank, seed=cfg.seed) if cfg.seed is not None else None
 
+    generator = None
+    if cfg.seed is not None:
+        generator = torch.Generator()
+        generator.manual_seed(int(cfg.seed) + int(cfg.rank))
+
     return DataLoader(dataset,
                       batch_size=cfg.data.samples_per_gpu,
                       sampler=sampler,
@@ -57,5 +64,6 @@ def build_dataloader(cfg,
                       collate_fn=partial(
                           collate, samples_per_gpu=cfg.data.samples_per_gpu),
                       worker_init_fn=init_fn,
+                      generator=generator,
                       drop_last=False,
                       persistent_workers=cfg.distributed)

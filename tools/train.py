@@ -3,6 +3,10 @@ import argparse
 import os
 import os.path as osp
 import shutil
+
+# Must be configured before CUDA creates a cuBLAS handle.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch.distributed as dist
 
 import mmcv
@@ -371,15 +375,41 @@ def main_worker(cfg):
     if cfg.distributed:
         dist.destroy_process_group()
 
-    wandb.finish()
-
+    test_aerialvg_metrics = None
     if main_process and cfg.dataset == "AerialVG" and best_aerialvg_metrics is not None:
-        top1, top5, miou = best_aerialvg_metrics
-        final_work_dir = f"{cfg.work_dir}+top1={top1:.2f}+top5={top5:.2f}+miou={miou:.2f}"
+        # Final test is deliberately single-GPU and is performed only once,
+        # after model selection has finished on val. This avoids distributed
+        # sampler padding and prevents test results from influencing which
+        # checkpoint is selected.
+        best_checkpoint = osp.join(cfg.work_dir, "top1_best.pth")
+        if not osp.isfile(best_checkpoint):
+            raise FileNotFoundError(f"Best AerialVG checkpoint not found: {best_checkpoint}")
+
+        eval_model = model.module if hasattr(model, "module") else model
+        load_checkpoint(eval_model, load_from=best_checkpoint, dataset=cfg.dataset)
+
+        single_gpu_cfg = cfg.copy()
+        single_gpu_cfg.distributed = False
+        single_gpu_cfg.rank = 0
+        single_gpu_cfg.world_size = 1
+        test_dataset = build_dataset(single_gpu_cfg.data.test)
+        test_loader = build_dataloader(single_gpu_cfg, test_dataset)
+        logger.info("Evaluating best-val checkpoint on AerialVG-test with one GPU: %s", best_checkpoint)
+        test_aerialvg_metrics = evaluate_model("test", single_gpu_cfg, eval_model, test_loader)
+
+        val_top1, val_top5, val_miou = best_aerialvg_metrics
+        test_top1, test_top5, test_miou = test_aerialvg_metrics
+        final_work_dir = (
+            f"{cfg.work_dir}"
+            f"+val_top1={val_top1:.2f}+val_top5={val_top5:.2f}+val_miou={val_miou:.2f}"
+            f"+test_top1={test_top1:.2f}+test_top5={test_top5:.2f}+test_miou={test_miou:.2f}"
+        )
         if osp.abspath(final_work_dir) != osp.abspath(cfg.work_dir):
             if osp.exists(final_work_dir):
                 raise FileExistsError(f"Cannot rename work directory: destination already exists: {final_work_dir}")
             os.rename(cfg.work_dir, final_work_dir)
+
+    wandb.finish()
 
 
 def main():
@@ -411,7 +441,11 @@ def main():
         mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))
 
     if cfg.seed is not None:
-        set_random_seed(cfg.seed, deterministic=cfg.deterministic)
+        set_random_seed(
+            cfg.seed,
+            deterministic=cfg.deterministic,
+            strict=cfg.get("strict_reproducibility", False),
+        )
 
     main_worker(cfg)
 
