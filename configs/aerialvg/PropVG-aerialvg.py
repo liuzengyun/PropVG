@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-aerialvg586—extra_gt_prop"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher+prop"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -21,7 +21,20 @@ strict_reproducibility = True
 
 # False: supervise only regions[0] (the referring target).
 # True: also use regions[1:] as DETR proposal detection targets.
-use_auxiliary_gt = True
+use_auxiliary_gt = False
+# True: keep regions[0] as the referring GT and append retained predictions
+# from teacher_trainset.json as proposal-only detection supervision for train.
+# Validation and test never load teacher predictions.
+teacher = True
+teacher_annsfile = "data/AerialVG/teacher_trainset.json"
+# Teacher predictions overlapping the exact refer GT at or above this IoU are
+# discarded; the original refer GT remains the only target for that instance.
+teacher_dedup_iou = 0.5
+# Suppress lower-ranked teacher predictions which overlap another retained
+# teacher prediction. This prevents duplicate pseudo targets for one object.
+teacher_nms_iou = 0.5
+if teacher and use_auxiliary_gt:
+    raise ValueError("teacher and use_auxiliary_gt are mutually exclusive")
 # False: fine-tune all BEiT-3 parameters with lr_vis_enc.
 # True: freeze the complete BEiT-3 vision-language backbone.
 freeze_beit3 = False
@@ -35,7 +48,8 @@ patch_size = 16
 img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375])
 
 train_pipeline = [
-    dict(type="LoadAerialVGAnnotations", max_token=max_token, use_auxiliary_boxes=use_auxiliary_gt),
+    dict(type="LoadAerialVGAnnotations", max_token=max_token,
+         use_auxiliary_boxes=use_auxiliary_gt, use_teacher_boxes=teacher),
     dict(type="Resize", img_scale=(img_size, img_size), keep_ratio=True),
     dict(type="Pad", size=(img_size, img_size)),
     dict(type="Normalize", **img_norm_cfg),
@@ -43,13 +57,25 @@ train_pipeline = [
     dict(type="CollectData", keys=["img", "ref_expr_inds", "text_attention_mask", "gt_bbox"],
          meta_keys=["filename", "expression", "ori_shape", "img_shape", "pad_shape", "scale_factor", "refer_target_index", "empty"]),
 ]
-val_pipeline = train_pipeline.copy()
+val_pipeline = [
+    dict(type="LoadAerialVGAnnotations", max_token=max_token,
+         use_auxiliary_boxes=use_auxiliary_gt, use_teacher_boxes=False),
+    dict(type="Resize", img_scale=(img_size, img_size), keep_ratio=True),
+    dict(type="Pad", size=(img_size, img_size)),
+    dict(type="Normalize", **img_norm_cfg),
+    dict(type="DefaultFormatBundle"),
+    dict(type="CollectData", keys=["img", "ref_expr_inds", "text_attention_mask", "gt_bbox"],
+         meta_keys=["filename", "expression", "ori_shape", "img_shape", "pad_shape", "scale_factor", "refer_target_index", "empty"]),
+]
 
 data = dict(
     samples_per_gpu=8,
     workers_per_gpu=8,
     train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_train_odvg.jsonl",
-               imgsfile="data/AerialVG/images", pipeline=train_pipeline),
+               imgsfile="data/AerialVG/images", pipeline=train_pipeline,
+               teacher_annsfile=teacher_annsfile if teacher else None,
+               teacher_dedup_iou=teacher_dedup_iou,
+               teacher_nms_iou=teacher_nms_iou),
     val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
              imgsfile="data/AerialVG/images", pipeline=val_pipeline),
     test=dict(type=dataset_type, which_set="test", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",

@@ -157,10 +157,17 @@ def main_worker(cfg):
         best_macc,
         best_d_acc,
     ) = (-1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    resume_metadata = {}
     if cfg.resume_from:
-        start_epoch, _, _, flag = load_checkpoint(
-            model, cfg.resume_from, amp=cfg.use_fp16, optimizer=optimizer, scheduler=scheduler
+        start_epoch, best_d_acc, best_mIoU, flag, resume_metadata = load_checkpoint(
+            model, cfg.resume_from, amp=cfg.use_fp16, optimizer=optimizer, scheduler=scheduler,
+            dataset=cfg.dataset, return_metadata=True
         )
+        # Checkpoints produced by older versions were saved before the epoch's
+        # scheduler step. Advance them once so resume matches uninterrupted
+        # training. New checkpoints explicitly record the corrected state.
+        if not resume_metadata.get("scheduler_state_is_next_epoch", False):
+            scheduler.step()
     elif cfg.finetune_from:
         load_pretrained_checkpoint(model, cfg.finetune_from, amp=cfg.use_fp16, dataset=cfg.dataset)
     elif cfg.load_from:
@@ -174,9 +181,52 @@ def main_worker(cfg):
     # Top-5 and mIoU in the final directory name must come from the epoch with
     # the best Top-1 accuracy, rather than independently chosen/final values.
     best_aerialvg_metrics = None
+    if cfg.dataset == "AerialVG" and resume_metadata:
+        running_top1 = resume_metadata.get(
+            "running_best_top1_acc",
+            max(resume_metadata.get("best_top1_acc", 0.0), resume_metadata.get("top1_acc", 0.0)),
+        )
+        # New checkpoints store all three metrics from the same best-Top1
+        # epoch. The fallback keeps older checkpoints resumable.
+        if "best_top5_acc_at_top1" in resume_metadata:
+            best_aerialvg_metrics = (
+                running_top1,
+                resume_metadata["best_top5_acc_at_top1"],
+                resume_metadata["best_mIoU_at_top1"],
+            )
+        elif resume_metadata.get("top1_acc", 0.0) >= resume_metadata.get("best_top1_acc", 0.0):
+            best_aerialvg_metrics = (
+                resume_metadata.get("top1_acc", 0.0),
+                resume_metadata.get("top5_acc", 0.0),
+                resume_metadata.get("mIoU", 0.0),
+            )
+        else:
+            best_aerialvg_metrics = (running_top1, 0.0, 0.0)
+        best_d_acc = running_top1
+        best_mIoU = max(best_mIoU, best_aerialvg_metrics[2])
+
+        # Runs are written to a fresh timestamp directory. Carry the previous
+        # best checkpoint forward so a resumed run with no new best still has
+        # the correct model for final single-GPU testing.
+        if is_main():
+            previous_best = osp.join(osp.dirname(cfg.resume_from), "top1_best.pth")
+            current_best = osp.join(cfg.work_dir, "top1_best.pth")
+            if osp.isfile(previous_best):
+                shutil.copyfile(previous_best, current_best)
+            elif resume_metadata.get("top1_acc", -1.0) >= running_top1:
+                shutil.copyfile(cfg.resume_from, current_best)
+            else:
+                logger.warning(
+                    "Could not locate the historical top1_best.pth beside %s; "
+                    "final best-checkpoint testing will require a new best epoch.",
+                    cfg.resume_from,
+                )
     for epoch in range(start_epoch + 1, cfg.scheduler_config.max_epoch):
         start_time = time.time()
         train_model(epoch, cfg, model, optimizer, dataloaders[0])
+        # Save the scheduler state for the *next* epoch. This keeps resumed LR
+        # progression identical to uninterrupted training.
+        scheduler.step()
         this_epoch_train_time = int(time.time() - start_time)
         if is_main():
             logger.info("this_epoch_train_time={}m-{}s".format(this_epoch_train_time // 60, this_epoch_train_time % 60))
@@ -310,6 +360,9 @@ def main_worker(cfg):
                         "mIoU": mIoU,
                         "best_top1_acc": best_d_acc,
                         "best_mIoU": best_mIoU,
+                        "running_best_top1_acc": best_aerialvg_metrics[0],
+                        "best_top5_acc_at_top1": best_aerialvg_metrics[1],
+                        "best_mIoU_at_top1": best_aerialvg_metrics[2],
                     }
                     save_compare_det = "top1_acc"
                     save_compare_seg = None
@@ -365,8 +418,6 @@ def main_worker(cfg):
                 best_mIoU = max(mIoU, best_mIoU)
                 best_oIoU = max(oIoU, best_oIoU)
                 best_d_acc = max(d_acc, best_d_acc)
-
-        scheduler.step()
 
         if cfg.distributed:
             dist.barrier()

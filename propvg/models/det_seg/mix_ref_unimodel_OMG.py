@@ -124,7 +124,7 @@ class MIXRefUniModel_OMG(OneStageModel):
             back to `ori_shape`.
 
         """
-        B, _, H, W = img.shape
+        B, _channels, H, W = img.shape
         img_feat, text_feat, cls_feat = self.extract_visual_language(img, ref_expr_inds, text_attention_mask)
         img_feat = img_feat.transpose(-1, -2).reshape(B, -1, H // self.patch_size, W // self.patch_size)  # (B, C, H, W)
 
@@ -140,10 +140,6 @@ class MIXRefUniModel_OMG(OneStageModel):
             img_feat, copy.deepcopy(targets), cls_feat, text_feat, text_attention_mask, img
         )
 
-        with torch.no_grad():
-            predictions = self.get_predictions_parts(
-                pred_dict, img_metas, rescale=rescale, with_bbox=True, with_mask=False
-            )
         self.iter += 1
         # if is_main() and self.iter % 100 == 0 and self.visualize:
         #     self.visualiation_parts(
@@ -155,7 +151,10 @@ class MIXRefUniModel_OMG(OneStageModel):
         #         text_attention_mask,
         #     )
 
-        return losses_dict, _
+        # The training loop only consumes losses. Post-processing predictions
+        # here used to waste time every batch and the old second return value
+        # was accidentally the image channel count.
+        return losses_dict, None
 
     def extract_visual_language(self, img, ref_expr_inds, text_attention_mask=None):
         x, y, c = self.vis_enc(img, ref_expr_inds, text_attention_mask)

@@ -1,9 +1,4 @@
-"""AerialVG (ODVG jsonl) dataset adapter.
-
-Each JSONL record becomes one referring-expression sample.  Only the first
-region is the referred target. Other regions are contextual annotation and
-are deliberately not passed to the detection loss.
-"""
+"""AerialVG (ODVG jsonl) dataset adapter."""
 import json
 import os.path as osp
 
@@ -17,13 +12,29 @@ from propvg.utils import get_root_logger, is_main
 
 @DATASETS.register_module()
 class AerialVG(Dataset):
-    def __init__(self, imgsfile, annsfile, pipeline, which_set="train", max_samples=None, **kwargs):
+    def __init__(self, imgsfile, annsfile, pipeline, which_set="train", max_samples=None,
+                 teacher_annsfile=None, teacher_dedup_iou=0.5,
+                 teacher_nms_iou=0.5, **kwargs):
         if which_set not in ("train", "val", "test"):
             raise ValueError("AerialVG supports train, val, and test splits")
+        if teacher_annsfile is not None and which_set != "train":
+            raise ValueError("Teacher boxes may only be loaded for the AerialVG training split")
         self.which_set = which_set
         self.imgsfile = imgsfile
         self.pipeline = Compose(pipeline)
         self.samples = []
+
+        teacher_records = None
+        if teacher_annsfile is not None:
+            with open(teacher_annsfile, "r", encoding="utf-8") as handle:
+                teacher_data = json.load(handle)
+            teacher_records = {}
+            for teacher_record in teacher_data:
+                sample_id = int(teacher_record["sample_id"])
+                if sample_id in teacher_records:
+                    raise ValueError(f"Duplicate teacher sample_id: {sample_id}")
+                teacher_records[sample_id] = teacher_record
+
         with open(annsfile, "r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, 1):
                 record = json.loads(line)
@@ -55,7 +66,7 @@ class AerialVG(Dataset):
                     target_phrase = phrases[0] if phrases else ""
                     if not caption.strip() and not target_phrase.strip():
                         continue
-                    self.samples.append({
+                    sample = {
                         "filename": record["filename"],
                         "width": record["width"],
                         "height": record["height"],
@@ -64,7 +75,89 @@ class AerialVG(Dataset):
                         "target_phrase": target_phrase,
                         "refer_target_index": 0,
                         "line_number": line_number,
-                    })
+                    }
+                    if teacher_records is not None:
+                        sample_id = line_number - 1
+                        if sample_id not in teacher_records:
+                            raise ValueError(f"Missing teacher prediction for sample_id={sample_id}")
+                        teacher_record = teacher_records[sample_id]
+                        if teacher_record.get("filename") != record["filename"]:
+                            raise ValueError(
+                                f"Teacher/sample mismatch at sample_id={sample_id}: "
+                                f"{teacher_record.get('filename')!r} != {record['filename']!r}"
+                            )
+
+                        teacher_boxes = []
+                        teacher_scores = []
+                        predictions = sorted(teacher_record.get("predictions", []), key=lambda pred: pred["rank"])
+                        for prediction in predictions:
+                            teacher_box = prediction.get("bbox_xyxy")
+                            if teacher_box is None or len(teacher_box) != 4:
+                                continue
+                            tx1, ty1, tx2, ty2 = map(float, teacher_box)
+                            tx1 = min(max(tx1, 0.0), float(record["width"]))
+                            tx2 = min(max(tx2, 0.0), float(record["width"]))
+                            ty1 = min(max(ty1, 0.0), float(record["height"]))
+                            ty2 = min(max(ty2, 0.0), float(record["height"]))
+                            if tx2 > tx1 and ty2 > ty1:
+                                teacher_boxes.append([tx1, ty1, tx2, ty2])
+                                teacher_scores.append(float(prediction.get("score", 0.0)))
+                        if not teacher_boxes:
+                            raise ValueError(f"No valid teacher boxes for sample_id={sample_id}")
+
+                        # The exact annotated referent is always the only
+                        # target supervision for that object. Remove teacher
+                        # predictions which overlap it, avoiding duplicate or
+                        # conflicting DETR targets for the same instance.
+                        teacher_array = np.asarray(teacher_boxes, dtype=np.float64)
+                        refer_box = np.asarray(boxes[0], dtype=np.float64)
+                        lt = np.maximum(teacher_array[:, :2], refer_box[:2])
+                        rb = np.minimum(teacher_array[:, 2:], refer_box[2:])
+                        intersection = np.clip(rb - lt, 0.0, None).prod(axis=1)
+                        teacher_area = np.clip(teacher_array[:, 2:] - teacher_array[:, :2], 0.0, None).prod(axis=1)
+                        refer_area = np.clip(refer_box[2:] - refer_box[:2], 0.0, None).prod()
+                        ious = intersection / np.maximum(teacher_area + refer_area - intersection, 1e-6)
+                        keep = ious < float(teacher_dedup_iou)
+                        teacher_boxes = [box for box, keep_box in zip(teacher_boxes, keep) if keep_box]
+                        teacher_scores = [score for score, keep_box in zip(teacher_scores, keep) if keep_box]
+
+                        # Predictions are already rank ordered. Greedily keep
+                        # the highest-ranked box and suppress later teacher
+                        # boxes describing the same object. Without this,
+                        # Hungarian matching treats duplicate pseudo boxes as
+                        # distinct objects and reduces proposal diversity.
+                        nms_boxes = []
+                        nms_scores = []
+                        for teacher_box, teacher_score in zip(teacher_boxes, teacher_scores):
+                            if nms_boxes:
+                                kept = np.asarray(nms_boxes, dtype=np.float64)
+                                candidate = np.asarray(teacher_box, dtype=np.float64)
+                                lt = np.maximum(kept[:, :2], candidate[:2])
+                                rb = np.minimum(kept[:, 2:], candidate[2:])
+                                intersection = np.clip(rb - lt, 0.0, None).prod(axis=1)
+                                kept_area = np.clip(kept[:, 2:] - kept[:, :2], 0.0, None).prod(axis=1)
+                                candidate_area = np.clip(candidate[2:] - candidate[:2], 0.0, None).prod()
+                                ious = intersection / np.maximum(
+                                    kept_area + candidate_area - intersection, 1e-6
+                                )
+                                if np.any(ious >= float(teacher_nms_iou)):
+                                    continue
+                            nms_boxes.append(teacher_box)
+                            nms_scores.append(teacher_score)
+                        teacher_boxes = nms_boxes
+                        teacher_scores = nms_scores
+
+                        sample.update(
+                            teacher_boxes=teacher_boxes,
+                            teacher_scores=teacher_scores,
+                        )
+                    self.samples.append(sample)
+
+        if teacher_records is not None and len(teacher_records) != line_number:
+            raise ValueError(
+                f"Teacher annotation count ({len(teacher_records)}) does not match "
+                f"training annotation count ({line_number})"
+            )
         if max_samples is not None:
             self.samples = self.samples[:int(max_samples)]
         if not self.samples:

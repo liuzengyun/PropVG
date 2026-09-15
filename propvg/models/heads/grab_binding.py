@@ -81,7 +81,7 @@ class GrabGraphBinding(nn.Module):
         # Per paper, the original decoder features—not filter features—continue.
         return _gather_nodes(queries, indices), _gather_nodes(boxes, indices), logits, indices
 
-    def _appearance(self, queries, boxes, text, text_mask, visuals):
+    def _appearance(self, queries, boxes, text, text_mask, visuals, visual_masks=None):
         b, n, c = queries.shape
         padding = text_mask.bool() if text_mask is not None else None
         anchor = self.anchor_query[None].expand(b, -1, -1)
@@ -93,11 +93,22 @@ class GrabGraphBinding(nn.Module):
         centers, sizes = boxes[..., :2], boxes[..., 2:].clamp(min=1e-5)
         points = centers[:, :, None] + (self.base_points[None, None] + offsets) * sizes[:, :, None]
         points = points.clamp(0.0, 1.0)
-        grid = points.mul(2.0).sub(1.0).reshape(b, n * self.num_anchors, 1, 2)
 
         sampled_levels = []
         for level, visual in enumerate(visuals):
-            sampled = F.grid_sample(visual, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+            # Proposal boxes are normalized against the valid, unpadded image,
+            # whereas grid_sample coordinates span the complete padded feature
+            # map. Convert into each level's padded coordinate system using
+            # the same validity masks as the deformable DETR decoder.
+            level_points = points
+            if visual_masks is not None:
+                mask = visual_masks[level]
+                valid_h = (~mask[:, :, 0]).sum(1).to(points.dtype) / mask.shape[1]
+                valid_w = (~mask[:, 0, :]).sum(1).to(points.dtype) / mask.shape[2]
+                valid_ratio = torch.stack((valid_w, valid_h), dim=-1)
+                level_points = points * valid_ratio[:, None, None, :]
+            grid = level_points.mul(2.0).sub(1.0).reshape(b, n * self.num_anchors, 1, 2)
+            sampled = F.grid_sample(visual, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
             sampled = sampled.squeeze(-1).transpose(1, 2).reshape(b, n, self.num_anchors, c)
             sampled_levels.append(self.level_proj[level](sampled))
         sampled = torch.stack(sampled_levels, dim=0).mean(0)
@@ -139,8 +150,8 @@ class GrabGraphBinding(nn.Module):
         gate = torch.sigmoid(self.final_gate(torch.cat((z, appearance), dim=-1)))
         return gate * z + (1.0 - gate) * appearance
 
-    def forward(self, queries, boxes, text, text_mask=None, visuals=None):
+    def forward(self, queries, boxes, text, text_mask=None, visuals=None, visual_masks=None):
         queries, boxes, filter_logits, selected = self._filter(queries, boxes, text, text_mask)
-        appearance = self._appearance(queries, boxes, text, text_mask, visuals)
+        appearance = self._appearance(queries, boxes, text, text_mask, visuals, visual_masks)
         graph = self._topology(appearance, boxes, self._sentence_pool(text, text_mask))
         return graph, boxes, filter_logits, selected

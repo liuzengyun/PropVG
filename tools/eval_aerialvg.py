@@ -30,6 +30,9 @@ def evaluate(model, loader):
         img_metas = inputs["img_metas"].data[0]
         boxes_per_image = inputs["gt_bbox"].data[0]
         targets = [boxes[meta["refer_target_index"][0]] for boxes, meta in zip(boxes_per_image, img_metas)]
+        # Ground truth is retained locally for metric computation only. Never
+        # expose it to the model during visual-grounding inference.
+        inputs.pop("gt_bbox", None)
         # These are needed only by the original segmentation evaluator, not
         # this box-grounding evaluation.
         inputs.pop("gt_mask_rle", None)

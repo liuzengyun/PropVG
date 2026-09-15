@@ -50,6 +50,16 @@ def log_loaded_info(ckpt, load_file, dataset=None):
         if "best_macc" in ckpt:
             log_str += f"best best_macc: {ckpt['best_macc']:.2f}\n"
             best_miou = ckpt["best_macc"]
+    elif dataset == "AerialVG":
+        best_d_acc = ckpt.get(
+            "running_best_top1_acc",
+            max(ckpt.get("best_top1_acc", 0.0), ckpt.get("top1_acc", 0.0)),
+        )
+        best_miou = ckpt.get("best_mIoU_at_top1", ckpt.get("best_mIoU", 0.0))
+        log_str += f"best Top-1 Acc@0.5: {best_d_acc:.2f}\n"
+        if "best_top5_acc_at_top1" in ckpt:
+            log_str += f"Top-5 Acc@0.5 at best Top-1: {ckpt['best_top5_acc_at_top1']:.2f}\n"
+        log_str += f"box mIoU at best Top-1: {best_miou:.2f}\n"
     logger.info(log_str)
     return best_d_acc, best_miou
 
@@ -84,7 +94,8 @@ def load_pretrained_checkpoint(model, finetune_from=None, amp=False, dataset=Non
     return start_epoch, best_d_acc, best_miou
 
 
-def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimizer=None, scheduler=None, dataset=None):
+def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimizer=None, scheduler=None,
+                    dataset=None, return_metadata=False):
     start_epoch, best_d_acc, best_giou, best_oiou = -1, 0.0, 0.0, 0.0
     flag = True
     assert not (resume_from is not None and load_from is not None)
@@ -114,7 +125,17 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
             start_epoch = ckpt["epoch"]
     if is_main():
         best_d_acc, best_giou = log_loaded_info(ckpt, load_file, dataset)
-    return start_epoch, best_d_acc, best_giou, flag
+    result = (start_epoch, best_d_acc, best_giou, flag)
+    if return_metadata:
+        metadata_keys = (
+            "epoch", "top1_acc", "top5_acc", "mIoU",
+            "best_top1_acc", "running_best_top1_acc",
+            "best_top5_acc_at_top1", "best_mIoU_at_top1",
+            "scheduler_state_is_next_epoch",
+        )
+        metadata = {key: ckpt[key] for key in metadata_keys if key in ckpt}
+        return result + (metadata,)
+    return result
 
 
 def save_checkpoint(
@@ -130,6 +151,7 @@ def save_checkpoint(
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict(),
+            "scheduler_state_is_next_epoch": True,
             "lr": optimizer.param_groups[0]["lr"],
         }
     )

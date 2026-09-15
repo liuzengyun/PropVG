@@ -251,6 +251,16 @@ class DETRLoss(nn.Module):
     def _set_aux_loss(self, outputs_class, outputs_coord):
         return [{"pred_logits": a, "pred_boxes": b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
+    def _apply_loss_weights(self, loss_dict):
+        """Apply final-layer weights to the corresponding auxiliary losses."""
+        weight_dict = self.criterion.weight_dict
+        for key in loss_dict:
+            base_key, separator, layer = key.rpartition("_")
+            weight_key = base_key if separator and layer.isdigit() else key
+            if weight_key in weight_dict:
+                loss_dict[key] *= weight_dict[weight_key]
+        return loss_dict
+
     def forward(self, output_class, output_coord, targets):
         output = {
             "pred_logits": output_class[-1],
@@ -259,11 +269,7 @@ class DETRLoss(nn.Module):
         if self.aux_loss:
             output["aux_outputs"] = self._set_aux_loss(output_class, output_coord)
         loss_dict, indices = self.criterion(output, targets, return_indices=True)
-        weight_dict = self.criterion.weight_dict
-        for k in loss_dict.keys():
-            if k in weight_dict:
-                loss_dict[k] *= weight_dict[k]
-        return loss_dict, indices
+        return self._apply_loss_weights(loss_dict), indices
 
     def forward_withmatching(self, output_class, output_coord, targets, matching_list):
         output = {
@@ -273,11 +279,7 @@ class DETRLoss(nn.Module):
         if self.aux_loss:
             output["aux_outputs"] = self._set_aux_loss(output_class, output_coord)
         loss_dict, indices = self.criterion(output, targets, matching_list, return_indices=True)
-        weight_dict = self.criterion.weight_dict
-        for k in loss_dict.keys():
-            if k in weight_dict:
-                loss_dict[k] *= weight_dict[k]
-        return loss_dict, indices
+        return self._apply_loss_weights(loss_dict), indices
 
 
 class CRS(nn.Module):
@@ -661,7 +663,8 @@ class REFHead(nn.Module):
         # GrabVG-style appearance/topology binding before CRS selection.
         if self.enable_grab:
             bound_queries, bound_boxes, filter_scores, selected_indices = self.grab_binding(
-                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visuals=multi_level_feats
+                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask,
+                visuals=multi_level_feats, visual_masks=multi_level_masks
             )
             extra_dict["grab_filter_scores"] = filter_scores.detach()
             selected_classes = outputs_class[-1].gather(
@@ -805,7 +808,8 @@ class REFHead(nn.Module):
         # GrabVG-style appearance/topology binding before CRS selection.
         if self.enable_grab:
             bound_queries, bound_boxes, _, selected_indices = self.grab_binding(
-                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask, visuals=multi_level_feats
+                inter_states[-1], outputs_coord[-1].detach(), lan_feat, lan_mask,
+                visuals=multi_level_feats, visual_masks=multi_level_masks
             )
             selected_classes = outputs_class[-1].gather(
                 1, selected_indices[..., None].expand(-1, -1, outputs_class.shape[-1])

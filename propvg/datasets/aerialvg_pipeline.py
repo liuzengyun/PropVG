@@ -21,12 +21,16 @@ def _clean_text(text):
 @PIPELINES.register_module()
 class LoadAerialVGAnnotations:
     def __init__(self, max_token=40, color_type="color", backend=None,
-                 file_client_cfg=dict(backend="disk"), use_auxiliary_boxes=False):
+                 file_client_cfg=dict(backend="disk"), use_auxiliary_boxes=False,
+                 use_teacher_boxes=False):
+        if use_auxiliary_boxes and use_teacher_boxes:
+            raise ValueError("AerialVG auxiliary GT boxes and teacher boxes are mutually exclusive")
         self.max_token = max_token
         self.color_type = color_type
         self.backend = backend
         self.file_client_cfg = file_client_cfg.copy()
         self.use_auxiliary_boxes = use_auxiliary_boxes
+        self.use_teacher_boxes = use_teacher_boxes
         self.file_client = None
         self.tokenizer = XLMRobertaTokenizer("pretrain_weights/beit3.spm")
 
@@ -47,7 +51,16 @@ class LoadAerialVGAnnotations:
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
         pad = self.max_token - len(tokens)
 
-        selected_boxes = ann["boxes"] if self.use_auxiliary_boxes else ann["boxes"][:1]
+        if self.use_teacher_boxes:
+            if "teacher_boxes" not in ann:
+                raise ValueError("Teacher mode is enabled but this sample has no teacher boxes")
+            # The original regions[0] GT remains the sole referring target.
+            # Teacher predictions are proposal-only auxiliary supervision.
+            selected_boxes = ann["boxes"][:1] + ann["teacher_boxes"]
+            refer_target_index = 0
+        else:
+            selected_boxes = ann["boxes"] if self.use_auxiliary_boxes else ann["boxes"][:1]
+            refer_target_index = ann["refer_target_index"]
         results.update(
             filename=filename, img=image, img_shape=image.shape, ori_shape=image.shape,
             expression=expression,
@@ -55,6 +68,6 @@ class LoadAerialVGAnnotations:
             text_attention_mask=np.asarray([0] * len(tokens) + [1] * pad, dtype=np.int64),
             gt_bbox=[np.asarray(box, dtype=np.float64) for box in selected_boxes],
             with_bbox=True, with_mask=False, empty=True,
-            refer_target_index=[ann["refer_target_index"]],
+            refer_target_index=[refer_target_index],
         )
         return results
