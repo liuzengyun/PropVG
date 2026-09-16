@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher+prop"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher+grab"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -39,7 +39,7 @@ if teacher and use_auxiliary_gt:
 # True: freeze the complete BEiT-3 vision-language backbone.
 freeze_beit3 = False
 
-enable_grab=False
+enable_grab=True
 
 
 
@@ -94,6 +94,7 @@ model = dict(
     lan_enc=None,
     fusion=None,
     head=dict(type="REFHead", input_channels=768, hidden_channels=256, num_queries=256,
+              box_only=True,
               detr_loss={"criterion": {"loss_class": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0},
                          "matcher": {"cost_class": 1.0, "cost_bbox": 5.0, "cost_giou": 2.0}},
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},

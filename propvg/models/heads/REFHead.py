@@ -433,11 +433,13 @@ class REFHead(nn.Module):
         detr_loss={},
         MTD={},
         enable_grab=True,
+        box_only=False,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
-        self.seg_branch = SegBranch(hidden_channels, upsample_rate=1)
-        if "aux" in loss_weight["mask"]:
+        self.box_only = box_only
+        self.seg_branch = None if box_only else SegBranch(hidden_channels, upsample_rate=1)
+        if not box_only and "aux" in loss_weight["mask"]:
             self.seg_branch_aux_list = nn.ModuleList(
                 [SegBranch(hidden_channels // 4 * (2**i), upsample_rate=1) for i in range(4)]
             )
@@ -463,24 +465,30 @@ class REFHead(nn.Module):
 
         self.loss_weight = loss_weight
         self.lan_embedding = nn.Linear(input_channels, hidden_channels, bias=False)
-        hidden_channels_ = hidden_channels * 2
-        self.img_embedding = nn.Conv2d(input_channels, hidden_channels_, kernel_size=1, bias=False)
+        # In box-only mode, retain the original 512-channel projection and
+        # lateral FPN capacity, but emit only the 256 channels consumed by the
+        # detector. This removes segmentation outputs without narrowing the
+        # detector's upstream representation.
+        fpn_channels = hidden_channels * 2
+        fpn_out_channels = hidden_channels if box_only else fpn_channels
+        self.img_embedding = nn.Conv2d(input_channels, fpn_channels, kernel_size=1, bias=False)
         self.neck = SimpleFPN(
-            backbone_channel=hidden_channels_,
+            backbone_channel=fpn_channels,
             in_channels=[
-                hidden_channels_ // 4,
-                hidden_channels_ // 2,
-                hidden_channels_,
-                hidden_channels_,
+                fpn_channels // 4,
+                fpn_channels // 2,
+                fpn_channels,
+                fpn_channels,
             ],
             out_channels=[
-                hidden_channels_,
-                hidden_channels_,
-                hidden_channels_,
-                hidden_channels_,
+                fpn_out_channels,
+                fpn_out_channels,
+                fpn_out_channels,
+                fpn_out_channels,
             ],
+            lateral_channels=[fpn_channels, fpn_channels, fpn_channels, fpn_channels],
         )
-        self.unet_decoder = UnetDecoder(hidden_channels, 1)
+        self.unet_decoder = None if box_only else UnetDecoder(hidden_channels, 1)
 
         self.detrloss = DETRLoss(
             aux_loss=True,
@@ -522,7 +530,7 @@ class REFHead(nn.Module):
         # query features only; proposal boxes and the original PropVG losses
         # remain unchanged.
         self.grab_binding = GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48)
-        self.dist_head = MTDv2(hidden_channels, MTD["K"])
+        self.dist_head = None if box_only else MTDv2(hidden_channels, MTD["K"])
         self.num_queries = num_queries
         self.refer_class_embed = nn.Linear(hidden_channels, 1 + 1)
         self.refer_bbox_embed = MLP(
@@ -598,13 +606,16 @@ class REFHead(nn.Module):
         # ! neck
         x_c1, x_c2, x_c3, x_c4 = self.neck(img_feat)
 
-        multi_level_feats = [x_c1[:, :256, :, :], x_c2[:, :256, :, :], x_c3[:, :256, :, :], x_c4[:, :256, :, :]]
-        seg_feat = [
-            x_c4[:, 256:, :, :],
-            x_c3[:, 256:, :, :],
-            x_c2[:, 256:, :, :],
-            x_c1[:, 256:, :, :],
-        ]
+        if self.box_only:
+            multi_level_feats = [x_c1, x_c2, x_c3, x_c4]
+            seg_feat = None
+        else:
+            multi_level_feats = [
+                x_c1[:, :256], x_c2[:, :256], x_c3[:, :256], x_c4[:, :256]
+            ]
+            seg_feat = [
+                x_c4[:, 256:], x_c3[:, 256:], x_c2[:, 256:], x_c1[:, 256:]
+            ]
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
@@ -654,6 +665,8 @@ class REFHead(nn.Module):
         # ! segmentation branch (not needed for box-only datasets such as
         # AerialVG; skipping it avoids both forward and backward compute).
         if target_mask is not None:
+            if self.box_only:
+                raise ValueError("box_only=True cannot train with segmentation masks")
             pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
             pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
             pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
@@ -742,13 +755,16 @@ class REFHead(nn.Module):
         # ! neck
         x_c1, x_c2, x_c3, x_c4 = self.neck(img_feat)
 
-        multi_level_feats = [x_c1[:, :256, :, :], x_c2[:, :256, :, :], x_c3[:, :256, :, :], x_c4[:, :256, :, :]]
-        seg_feat = [
-            x_c4[:, 256:, :, :],
-            x_c3[:, 256:, :, :],
-            x_c2[:, 256:, :, :],
-            x_c1[:, 256:, :, :],
-        ]
+        if self.box_only:
+            multi_level_feats = [x_c1, x_c2, x_c3, x_c4]
+            seg_feat = None
+        else:
+            multi_level_feats = [
+                x_c1[:, :256], x_c2[:, :256], x_c3[:, :256], x_c4[:, :256]
+            ]
+            seg_feat = [
+                x_c4[:, 256:], x_c3[:, 256:], x_c2[:, 256:], x_c1[:, 256:]
+            ]
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
@@ -799,6 +815,8 @@ class REFHead(nn.Module):
 
         # ! segmentation branch; skip for box-only datasets (AerialVG).
         if with_mask:
+            if self.box_only:
+                raise ValueError("box_only=True cannot run segmentation inference")
             pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
             pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
             pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
