@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher+grab"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher+crv"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -39,7 +39,12 @@ if teacher and use_auxiliary_gt:
 # True: freeze the complete BEiT-3 vision-language backbone.
 freeze_beit3 = False
 
-enable_grab=True
+enable_grab=False
+
+# Independent counterfactual candidate verifier. It runs after the original
+# CRS and keeps only the ambiguous raw Top-K proposals for final re-ranking.
+enable_crv = True
+crv_topk = 5
 
 
 
@@ -94,12 +99,18 @@ model = dict(
     lan_enc=None,
     fusion=None,
     head=dict(type="REFHead", input_channels=768, hidden_channels=256, num_queries=256,
-              box_only=True,
               detr_loss={"criterion": {"loss_class": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0},
                          "matcher": {"cost_class": 1.0, "cost_bbox": 5.0, "cost_giou": 2.0}},
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
-                           "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
-              enable_grab=enable_grab),
+                           "bbox": 0.1, "allbbox": 0.1, "refer": 1.0, "crv": 0.5}, MTD={"K": 250},
+              enable_grab=enable_grab, enable_crv=enable_crv,
+              crv=dict(topk=crv_topk, verifier_dim=256, grid_size=24, num_heads=8, num_layers=2,
+                       verifier_dropout=0.0,
+                       core_expansion=1.5, feather_expansion=2.0, neutral_mode="mean",
+                       margin=0.2, ranking_loss_weight=1.0,
+                       positive_iou_threshold=0.5, negative_iou_threshold=0.3,
+                       negative_max_gt_coverage=0.1,
+                       detach_inputs=True)),
     post_params={"score_weighted": False, "mask_threshold": 0.5, "score_threshold": 0.7,
                  "with_nms": False, "with_mask": False},
     process_visual=False,

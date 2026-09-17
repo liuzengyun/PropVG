@@ -152,7 +152,6 @@ class SimpleFPN(BaseModule):
         # out_channels=[96, 192, 384, 768],
         out_channels=[256, 256, 256, 256],
         num_outs=4,
-        lateral_channels=None,
         norm_cfg=dict(type="LN2d", requires_grad=True),
         conv_cfg=None,
         act_cfg=None,
@@ -163,10 +162,8 @@ class SimpleFPN(BaseModule):
         self.backbone_channel = backbone_channel
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.lateral_channels = lateral_channels or out_channels
         self.num_ins = len(in_channels)
         self.num_outs = num_outs
-        assert len(self.lateral_channels) == self.num_ins
 
         self.fpn1 = nn.Sequential(
             nn.ConvTranspose2d(self.backbone_channel, self.backbone_channel // 2, 2, 2),
@@ -183,11 +180,10 @@ class SimpleFPN(BaseModule):
 
         for i in range(self.num_ins):
             l_conv = ConvModule(
-                in_channels[i], self.lateral_channels[i], 1,
-                conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg, inplace=False
+                in_channels[i], out_channels[i], 1, conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg, inplace=False
             )
             fpn_conv = ConvModule(
-                self.lateral_channels[i],
+                out_channels[i],
                 out_channels[i],
                 3,
                 padding=1,

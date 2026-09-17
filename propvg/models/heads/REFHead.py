@@ -25,6 +25,7 @@ from .modules import SegBranch
 from .unet_head import SimpleFPN, UnetDecoder
 from propvg.models.losses.segloss import seg_loss
 from .grab_binding import GrabGraphBinding
+from .crv import CounterfactualReferentVerifier, gather_candidates
 
 
 class GlobalCrossAttention(nn.Module):
@@ -433,13 +434,14 @@ class REFHead(nn.Module):
         detr_loss={},
         MTD={},
         enable_grab=True,
-        box_only=False,
+        enable_crv=False,
+        crv=None,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
-        self.box_only = box_only
-        self.seg_branch = None if box_only else SegBranch(hidden_channels, upsample_rate=1)
-        if not box_only and "aux" in loss_weight["mask"]:
+        self.enable_crv = enable_crv
+        self.seg_branch = SegBranch(hidden_channels, upsample_rate=1)
+        if "aux" in loss_weight["mask"]:
             self.seg_branch_aux_list = nn.ModuleList(
                 [SegBranch(hidden_channels // 4 * (2**i), upsample_rate=1) for i in range(4)]
             )
@@ -465,30 +467,24 @@ class REFHead(nn.Module):
 
         self.loss_weight = loss_weight
         self.lan_embedding = nn.Linear(input_channels, hidden_channels, bias=False)
-        # In box-only mode, retain the original 512-channel projection and
-        # lateral FPN capacity, but emit only the 256 channels consumed by the
-        # detector. This removes segmentation outputs without narrowing the
-        # detector's upstream representation.
-        fpn_channels = hidden_channels * 2
-        fpn_out_channels = hidden_channels if box_only else fpn_channels
-        self.img_embedding = nn.Conv2d(input_channels, fpn_channels, kernel_size=1, bias=False)
+        hidden_channels_ = hidden_channels * 2
+        self.img_embedding = nn.Conv2d(input_channels, hidden_channels_, kernel_size=1, bias=False)
         self.neck = SimpleFPN(
-            backbone_channel=fpn_channels,
+            backbone_channel=hidden_channels_,
             in_channels=[
-                fpn_channels // 4,
-                fpn_channels // 2,
-                fpn_channels,
-                fpn_channels,
+                hidden_channels_ // 4,
+                hidden_channels_ // 2,
+                hidden_channels_,
+                hidden_channels_,
             ],
             out_channels=[
-                fpn_out_channels,
-                fpn_out_channels,
-                fpn_out_channels,
-                fpn_out_channels,
+                hidden_channels_,
+                hidden_channels_,
+                hidden_channels_,
+                hidden_channels_,
             ],
-            lateral_channels=[fpn_channels, fpn_channels, fpn_channels, fpn_channels],
         )
-        self.unet_decoder = None if box_only else UnetDecoder(hidden_channels, 1)
+        self.unet_decoder = UnetDecoder(hidden_channels, 1)
 
         self.detrloss = DETRLoss(
             aux_loss=True,
@@ -530,7 +526,11 @@ class REFHead(nn.Module):
         # query features only; proposal boxes and the original PropVG losses
         # remain unchanged.
         self.grab_binding = GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48)
-        self.dist_head = None if box_only else MTDv2(hidden_channels, MTD["K"])
+        self.crv = (
+            CounterfactualReferentVerifier(hidden_channels=hidden_channels, **(crv or {}))
+            if enable_crv else None
+        )
+        self.dist_head = MTDv2(hidden_channels, MTD["K"])
         self.num_queries = num_queries
         self.refer_class_embed = nn.Linear(hidden_channels, 1 + 1)
         self.refer_bbox_embed = MLP(
@@ -606,16 +606,13 @@ class REFHead(nn.Module):
         # ! neck
         x_c1, x_c2, x_c3, x_c4 = self.neck(img_feat)
 
-        if self.box_only:
-            multi_level_feats = [x_c1, x_c2, x_c3, x_c4]
-            seg_feat = None
-        else:
-            multi_level_feats = [
-                x_c1[:, :256], x_c2[:, :256], x_c3[:, :256], x_c4[:, :256]
-            ]
-            seg_feat = [
-                x_c4[:, 256:], x_c3[:, 256:], x_c2[:, 256:], x_c1[:, 256:]
-            ]
+        multi_level_feats = [x_c1[:, :256, :, :], x_c2[:, :256, :, :], x_c3[:, :256, :, :], x_c4[:, :256, :, :]]
+        seg_feat = [
+            x_c4[:, 256:, :, :],
+            x_c3[:, 256:, :, :],
+            x_c2[:, 256:, :, :],
+            x_c1[:, 256:, :, :],
+        ]
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
@@ -662,11 +659,9 @@ class REFHead(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        # ! segmentation branch (not needed for box-only datasets such as
-        # AerialVG; skipping it avoids both forward and backward compute).
+        # ! segmentation branch (AerialVG has no mask target, so this branch
+        # is naturally skipped while retaining the original module layout).
         if target_mask is not None:
-            if self.box_only:
-                raise ValueError("box_only=True cannot train with segmentation masks")
             pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
             pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
             pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
@@ -710,6 +705,47 @@ class REFHead(nn.Module):
             F.binary_cross_entropy(refer_label.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
         )
 
+        # CRV is downstream of the original CRS. DETR and CRS retain their
+        # full-candidate losses; only the ambiguous Top-K candidates continue
+        # to the final prediction output.
+        if self.enable_crv:
+            refer_gt_boxes = []
+            refer_gt_valid = []
+            for normalized_targets, refer_index in zip(target_gt, refer_indices):
+                refer_index = torch.as_tensor(refer_index, device=device, dtype=torch.long).flatten()
+                valid_index = refer_index.numel() > 0 and int(refer_index[0]) < len(normalized_targets["boxes"])
+                if valid_index:
+                    refer_gt_boxes.append(normalized_targets["boxes"][refer_index[0]])
+                else:
+                    refer_gt_boxes.append(normalized_targets["boxes"].new_zeros(4))
+                refer_gt_valid.append(valid_index)
+            refer_gt_boxes = torch.stack(refer_gt_boxes)
+            refer_gt_valid = torch.as_tensor(refer_gt_valid, device=device, dtype=torch.bool)
+            crv_output = self.crv(
+                visual=multi_level_feats[0],
+                visual_mask=multi_level_masks[0],
+                boxes=bound_boxes,
+                refer_scores=refer_score,
+                text=lan_feat,
+                text_mask=lan_mask,
+                target_boxes=refer_gt_boxes,
+                target_valid=refer_gt_valid,
+            )
+            crv_indices = crv_output["indices"]
+            bound_boxes = gather_candidates(bound_boxes, crv_indices)
+            selected_classes = gather_candidates(selected_classes, crv_indices)
+            refer_score = crv_output["weighted_scores"]
+            loss_crv = crv_output["loss"] * self.loss_weight.get("crv", 1.0)
+            extra_dict["crv_original_support_scores"] = crv_output["original_support_scores"].detach()
+            extra_dict["crv_masked_support_scores"] = crv_output["masked_support_scores"].detach()
+            extra_dict["crv_support_drop_logits"] = crv_output["support_drop_logits"].detach()
+            extra_dict["crv_importance_scores"] = crv_output["importance_scores"].detach()
+            extra_dict["crv_selected_indices"] = crv_indices.detach()
+            extra_dict["crv_selected_ious"] = crv_output["selected_ious"].detach()
+            extra_dict["crv_expanded_gt_coverage"] = crv_output["expanded_gt_coverage"].detach()
+        else:
+            loss_crv = x.sum() * 0.0
+
         # ! seg loss
         loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"]) if target_mask is not None else x.sum() * 0.0
         # Filtering supervision: every DETR-matched foreground proposal is
@@ -734,6 +770,7 @@ class REFHead(nn.Module):
             "loss_det": loss_det,
             "loss_refer": loss_refer,
             "loss_filter": loss_filter * 0.5,
+            "loss_crv": loss_crv,
         }
 
         pred_dict = {
@@ -755,16 +792,13 @@ class REFHead(nn.Module):
         # ! neck
         x_c1, x_c2, x_c3, x_c4 = self.neck(img_feat)
 
-        if self.box_only:
-            multi_level_feats = [x_c1, x_c2, x_c3, x_c4]
-            seg_feat = None
-        else:
-            multi_level_feats = [
-                x_c1[:, :256], x_c2[:, :256], x_c3[:, :256], x_c4[:, :256]
-            ]
-            seg_feat = [
-                x_c4[:, 256:], x_c3[:, 256:], x_c2[:, 256:], x_c1[:, 256:]
-            ]
+        multi_level_feats = [x_c1[:, :256, :, :], x_c2[:, :256, :, :], x_c3[:, :256, :, :], x_c4[:, :256, :, :]]
+        seg_feat = [
+            x_c4[:, 256:, :, :],
+            x_c3[:, 256:, :, :],
+            x_c2[:, 256:, :, :],
+            x_c1[:, 256:, :, :],
+        ]
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
@@ -813,10 +847,8 @@ class REFHead(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        # ! segmentation branch; skip for box-only datasets (AerialVG).
+        # ! segmentation branch; AerialVG evaluation calls with_mask=False.
         if with_mask:
-            if self.box_only:
-                raise ValueError("box_only=True cannot run segmentation inference")
             pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
             pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
             pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
@@ -841,6 +873,25 @@ class REFHead(nn.Module):
         refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
+
+        if self.enable_crv:
+            crv_output = self.crv(
+                visual=multi_level_feats[0],
+                visual_mask=multi_level_masks[0],
+                boxes=bound_boxes,
+                refer_scores=refer_score,
+                text=lan_feat,
+                text_mask=lan_mask,
+            )
+            crv_indices = crv_output["indices"]
+            bound_boxes = gather_candidates(bound_boxes, crv_indices)
+            selected_classes = gather_candidates(selected_classes, crv_indices)
+            refer_score = crv_output["weighted_scores"]
+            extra_dict["crv_original_support_scores"] = crv_output["original_support_scores"].detach()
+            extra_dict["crv_masked_support_scores"] = crv_output["masked_support_scores"].detach()
+            extra_dict["crv_support_drop_logits"] = crv_output["support_drop_logits"].detach()
+            extra_dict["crv_importance_scores"] = crv_output["importance_scores"].detach()
+            extra_dict["crv_selected_indices"] = crv_indices.detach()
 
         pred_dict = {
             "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,

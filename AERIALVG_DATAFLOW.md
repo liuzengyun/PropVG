@@ -8,6 +8,8 @@
 teacher = True
 use_auxiliary_gt = False
 enable_grab = False
+enable_crv = True
+crv_topk = 8
 freeze_beit3 = False
 
 img_size = 586
@@ -15,10 +17,9 @@ patch_size = 16
 max_token = 64
 num_queries = 256
 samples_per_gpu = 8
-box_only = True
 ```
 
-因此当前实验是 **PropVG + teacher proposal GT**。Grab 代码保留在模型中，但当前 forward 不执行 Grab。
+因此当前实验是 **PropVG + teacher proposal GT + CRV**，Grab 当前关闭。CRV 的完整设计、损失和维度见项目根目录的 `CRV_DESIGN.md`。
 
 下面使用以下符号：
 
@@ -49,7 +50,7 @@ Deformable DETR Decoder + 256 个 query
                 ↓
 CRS 计算每个候选框与文本的相关性
                 ↓
-按 256 个 referring score 降序排列
+CRV 取原始 CRS Top-8，执行反事实验证并融合重排
                 ↓
 最高分候选框作为最终 Top-1 定位结果
 ```
@@ -263,13 +264,13 @@ text_feat: [B,64,768]
 
 ### 6.3 SimFPN
 
-当前 `box_only=True`。SimFPN 保留原始 512 通道的内部与 lateral 表达，但每层最终只输出检测需要的 256 通道：
+当前已经恢复到高性能备份实验的原始分支逻辑：SimFPN 完整输出 512 通道并执行跨 512 通道的 LN2d，随后检测分支取前 256 通道：
 
 ```text
-x_c1: [B,256,144,144]
-x_c2: [B,256,72,72]
-x_c3: [B,256,36,36]
-x_c4: [B,256,18,18]
+x_c1: [B,512,144,144] → 前256通道用于检测
+x_c2: [B,512,72,72]   → 前256通道用于检测
+x_c3: [B,512,36,36]   → 前256通道用于检测
+x_c4: [B,512,18,18]   → 前256通道用于检测
 ```
 
 这些特征全部用于检测分支：
@@ -296,7 +297,7 @@ position embedding:[B,256,Hl,Wl]
 
 visual mask 标记有效 resize 图像和 padding 区域。
 
-AerialVG 没有 mask 标注，因此不会构建分割 head、UNet decoder 和依赖分割特征的 MTD。SimFPN 保留原始检测分支上游的 512 通道容量，但不再生成每层额外的 256 个分割输出通道，`loss_mask=0`。
+AerialVG 没有 mask 标注，但当前完整保留并构建高性能备份版中的 SegHead、UNet decoder、MTD 和历史预测层。FPN 后 256 通道仍按原逻辑组成 `seg_feat`；因为 AerialVG 的 `target_mask=None` 且推理使用 `with_mask=False`，分割 decoder 不执行，所以 `loss_mask=0`。这样构建逻辑、参数布局、随机初始化顺序和数据流均与指定备份版本一致。
 
 ## 7. Deformable DETR 生成候选框
 
@@ -513,8 +514,9 @@ loss = loss_det + loss_refer
 
 ```text
 loss_mask   = 0：AerialVG 不运行分割分支
-loss_nt     = 0：box_only 模式不构建依赖分割特征的 MTD
+loss_nt     = 0：当前 AerialVG forward 没有调用 MTD
 loss_filter = 0：当前 enable_grab=False
+loss_crv：当前 enable_crv=True，监督反事实支持度与真/假候选排序
 ```
 
 ## 10. 推理与最终目标框
@@ -564,7 +566,7 @@ box mIoU      = 最高分框与原始 GT 的平均 IoU
 
 验证和测试只使用原始 refer GT 计算指标，teacher 框不进入验证或测试。
 
-## 11. 打开 Grab 后新增的流程
+## 11. Grab 开启时的可选流程
 
 当配置改为：
 
@@ -645,7 +647,7 @@ adjacency: [B,128,128]
 
 检测 loss 仍在 Grab 过滤前的全部 256 个 query 上计算。Grab 的 `loss_filter` 监督哪些候选应该被保留：所有 Hungarian 匹配到前景 GT 的 query 都是过滤正样本，未匹配 query 是负样本。
 
-当前配置 `enable_grab=False`，所以上述 Grab 分支不会执行。
+当前配置 `enable_grab=False`，所以上述 Grab 分支不会执行。CRV 直接从 PropVG/CRS 的 256 个候选中选择原始 Top-8 并反事实重排，最终只输出 8 个候选。CRV 细节见 `CRV_DESIGN.md`。
 
 ## 12. 当前实际主线总结
 
@@ -660,9 +662,11 @@ Deformable DETR 生成 256 个候选框
     ↓
 CRS 使用完整文本给 256 个候选框打 referring score
     ↓
-按照 referring score 排序
+CRV 选取原始 Top-8，用共享两层跨模态评分器分别计算原始场景与逐候选遮挡场景的支持度
     ↓
-最高分候选框作为最终 visual grounding 结果
+用“原始支持度减去遮挡后支持度”得到反事实重要性，乘法加权原始 CRS 分数并重排
+    ↓
+加权分数最高的候选框作为最终 visual grounding 结果
 ```
 
 训练时，原始 refer GT 同时提供检测监督和 referring 监督；teacher 框只提供候选目标检测监督。验证和测试只使用原始 refer GT。
