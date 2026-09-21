@@ -56,6 +56,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
     end = time.time()
 
     loss_det_list, loss_mask_list, loss_label_nt_list, loss_refer_list, loss_filter_list, loss_crv_list = [], [], [], [], [], []
+    crv_final_bce_list, crv_alpha_list = [], []
     for batch, inputs in enumerate(loader):
         data_time = time.time() - end
         if not cfg.distributed:
@@ -69,6 +70,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss_refer = losses.pop("loss_refer", torch.tensor([0.0], device=device))
         loss_filter = losses.pop("loss_filter", torch.tensor([0.0], device=device))
         loss_crv = losses.pop("loss_crv", torch.tensor([0.0], device=device))
+        crv_final_bce = losses.pop("metric_crv_final_bce", torch.tensor([0.0], device=device))
+        crv_alpha = losses.pop("metric_crv_alpha", torch.tensor([0.0], device=device))
         loss = loss_det + loss_mask + loss_label_nt + loss_refer + loss_filter + loss_crv
         # loss = loss_det
         optimizer.zero_grad()
@@ -78,7 +81,19 @@ def train_model(epoch, cfg, model, optimizer, loader):
         else:
             loss.backward()
         if cfg.grad_norm_clip:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_norm_clip)
+            # CRV input tensors are detached, but clipping all model gradients
+            # in one norm would still let a large CRV gradient rescale the
+            # otherwise independent PropVG gradients. Clip both groups
+            # independently so CRV cannot perturb baseline optimization.
+            crv_parameters, base_parameters = [], []
+            for name, parameter in model.named_parameters():
+                if parameter.grad is None:
+                    continue
+                (crv_parameters if ".crv." in name else base_parameters).append(parameter)
+            if base_parameters:
+                torch.nn.utils.clip_grad_norm_(base_parameters, cfg.grad_norm_clip)
+            if crv_parameters:
+                torch.nn.utils.clip_grad_norm_(crv_parameters, cfg.grad_norm_clip)
         optimizer.step()
 
         if cfg.distributed:
@@ -88,12 +103,16 @@ def train_model(epoch, cfg, model, optimizer, loader):
             loss_refer = reduce_mean(loss_refer)
             loss_filter = reduce_mean(loss_filter)
             loss_crv = reduce_mean(loss_crv)
+            crv_final_bce = reduce_mean(crv_final_bce)
+            crv_alpha = reduce_mean(crv_alpha)
         loss_det_list.append(loss_det.item())
         loss_mask_list.append(loss_mask.item())
         loss_label_nt_list.append(loss_label_nt.item())
         loss_refer_list.append(loss_refer.item())
         loss_filter_list.append(loss_filter.item())
         loss_crv_list.append(loss_crv.item())
+        crv_final_bce_list.append(crv_final_bce.item())
+        crv_alpha_list.append(crv_alpha.item())
 
         if is_main():
             if (batch + 1) % cfg.log_interval == 0 or batch + 1 == batches:
@@ -107,6 +126,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
                     + f"loss_refer: {sum(loss_refer_list) / len(loss_refer_list):.4f}, "
                     + f"loss_filter: {sum(loss_filter_list) / len(loss_filter_list):.4f}, "
                     + f"loss_crv: {sum(loss_crv_list) / len(loss_crv_list):.4f}, "
+                    + f"crv_final_bce: {sum(crv_final_bce_list) / len(crv_final_bce_list):.4f}, "
+                    + f"crv_alpha: {sum(crv_alpha_list) / len(crv_alpha_list):.4f}, "
                     + f"lr: {optimizer.param_groups[0]['lr']:.6f}, "
                 )
 
@@ -118,6 +139,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
                         "loss_refer": sum(loss_refer_list) / len(loss_refer_list),
                         "loss_filter": sum(loss_filter_list) / len(loss_filter_list),
                         "loss_crv": sum(loss_crv_list) / len(loss_crv_list),
+                        "crv_final_bce": sum(crv_final_bce_list) / len(crv_final_bce_list),
+                        "crv_alpha": sum(crv_alpha_list) / len(crv_alpha_list),
                         "lr": optimizer.param_groups[0]["lr"],
                     }
                 )

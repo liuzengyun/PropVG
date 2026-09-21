@@ -736,15 +736,24 @@ class REFHead(nn.Module):
             selected_classes = gather_candidates(selected_classes, crv_indices)
             refer_score = crv_output["weighted_scores"]
             loss_crv = crv_output["loss"] * self.loss_weight.get("crv", 1.0)
-            extra_dict["crv_original_support_scores"] = crv_output["original_support_scores"].detach()
-            extra_dict["crv_masked_support_scores"] = crv_output["masked_support_scores"].detach()
+            crv_final_bce_metric = crv_output["loss_final_bce"].detach()
+            crv_alpha_metric = crv_output["fusion_alpha"].detach()
+            extra_dict["crv_original_support_logits"] = crv_output["original_support_logits"].detach()
+            extra_dict["crv_masked_support_logits"] = crv_output["masked_support_logits"].detach()
+            extra_dict["crv_relative_support_scores"] = crv_output["relative_support_scores"].detach()
             extra_dict["crv_support_drop_logits"] = crv_output["support_drop_logits"].detach()
             extra_dict["crv_importance_scores"] = crv_output["importance_scores"].detach()
+            extra_dict["crv_fusion_residual_logits"] = crv_output["fusion_residual_logits"].detach()
+            extra_dict["crv_fused_logits"] = crv_output["fused_logits"].detach()
+            extra_dict["crv_fusion_alpha"] = crv_output["fusion_alpha"].detach()
+            extra_dict["crv_gt_support_drop_logits"] = crv_output["gt_support_drop_logits"].detach()
             extra_dict["crv_selected_indices"] = crv_indices.detach()
             extra_dict["crv_selected_ious"] = crv_output["selected_ious"].detach()
             extra_dict["crv_expanded_gt_coverage"] = crv_output["expanded_gt_coverage"].detach()
         else:
             loss_crv = x.sum() * 0.0
+            crv_final_bce_metric = loss_crv.detach()
+            crv_alpha_metric = loss_crv.detach()
 
         # ! seg loss
         loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"]) if target_mask is not None else x.sum() * 0.0
@@ -771,6 +780,10 @@ class REFHead(nn.Module):
             "loss_refer": loss_refer,
             "loss_filter": loss_filter * 0.5,
             "loss_crv": loss_crv,
+            # Logging-only diagnostics; train.py deliberately excludes them
+            # from the summed optimization loss.
+            "metric_crv_final_bce": crv_final_bce_metric,
+            "metric_crv_alpha": crv_alpha_metric,
         }
 
         pred_dict = {
@@ -887,10 +900,14 @@ class REFHead(nn.Module):
             bound_boxes = gather_candidates(bound_boxes, crv_indices)
             selected_classes = gather_candidates(selected_classes, crv_indices)
             refer_score = crv_output["weighted_scores"]
-            extra_dict["crv_original_support_scores"] = crv_output["original_support_scores"].detach()
-            extra_dict["crv_masked_support_scores"] = crv_output["masked_support_scores"].detach()
+            extra_dict["crv_original_support_logits"] = crv_output["original_support_logits"].detach()
+            extra_dict["crv_masked_support_logits"] = crv_output["masked_support_logits"].detach()
+            extra_dict["crv_relative_support_scores"] = crv_output["relative_support_scores"].detach()
             extra_dict["crv_support_drop_logits"] = crv_output["support_drop_logits"].detach()
             extra_dict["crv_importance_scores"] = crv_output["importance_scores"].detach()
+            extra_dict["crv_fusion_residual_logits"] = crv_output["fusion_residual_logits"].detach()
+            extra_dict["crv_fused_logits"] = crv_output["fused_logits"].detach()
+            extra_dict["crv_fusion_alpha"] = crv_output["fusion_alpha"].detach()
             extra_dict["crv_selected_indices"] = crv_indices.detach()
 
         pred_dict = {

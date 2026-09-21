@@ -44,7 +44,7 @@ enable_grab=False
 # Independent counterfactual candidate verifier. It runs after the original
 # CRS and keeps only the ambiguous raw Top-K proposals for final re-ranking.
 enable_crv = True
-crv_topk = 5
+crv_topk = 6
 
 
 
@@ -107,7 +107,12 @@ model = dict(
               crv=dict(topk=crv_topk, verifier_dim=256, grid_size=24, num_heads=8, num_layers=2,
                        verifier_dropout=0.0,
                        core_expansion=1.5, feather_expansion=2.0, neutral_mode="mean",
-                       margin=0.2, ranking_loss_weight=1.0,
+                       margin=0.2, positive_drop_margin=0.5,
+                       ranking_loss_weight=1.0, fused_ranking_loss_weight=1.0,
+                       final_bce_loss_weight=0.5,
+                       gt_drop_loss_weight=1.0,
+                       fusion_alpha_init=1.0, fusion_alpha_max=2.0,
+                       fusion_temperature=1.0,
                        positive_iou_threshold=0.5, negative_iou_threshold=0.3,
                        negative_max_gt_coverage=0.1,
                        detach_inputs=True)),

@@ -25,7 +25,14 @@ class CounterfactualReferentVerifier(nn.Module):
         feather_expansion=2.0,
         neutral_mode="mean",
         margin=0.2,
+        positive_drop_margin=0.5,
         ranking_loss_weight=1.0,
+        fused_ranking_loss_weight=1.0,
+        final_bce_loss_weight=0.5,
+        gt_drop_loss_weight=1.0,
+        fusion_alpha_init=1.0,
+        fusion_alpha_max=2.0,
+        fusion_temperature=1.0,
         positive_iou_threshold=0.5,
         negative_iou_threshold=0.3,
         negative_max_gt_coverage=0.1,
@@ -46,7 +53,13 @@ class CounterfactualReferentVerifier(nn.Module):
         self.feather_expansion = float(feather_expansion)
         self.neutral_mode = neutral_mode
         self.margin = float(margin)
+        self.positive_drop_margin = float(positive_drop_margin)
         self.ranking_loss_weight = float(ranking_loss_weight)
+        self.fused_ranking_loss_weight = float(fused_ranking_loss_weight)
+        self.final_bce_loss_weight = float(final_bce_loss_weight)
+        self.gt_drop_loss_weight = float(gt_drop_loss_weight)
+        self.fusion_alpha_max = float(fusion_alpha_max)
+        self.fusion_temperature = float(fusion_temperature)
         self.positive_iou_threshold = float(positive_iou_threshold)
         self.negative_iou_threshold = float(negative_iou_threshold)
         self.negative_max_gt_coverage = float(negative_max_gt_coverage)
@@ -76,26 +89,52 @@ class CounterfactualReferentVerifier(nn.Module):
             nn.GELU(),
             nn.Linear(verifier_dim, 1),
         )
-        # Start as an exact order-preserving re-ranker: support=0.5 and
-        # importance=0.5 for every candidate, so multiplying all raw CRS
-        # scores by the same constant cannot change their initial ranking.
+        # Start as an exact order-preserving re-ranker: every original/masked
+        # support logit and therefore every residual is zero, so the initial
+        # final probability is exactly the raw CRS probability.
         nn.init.zeros_(self.support_head[-1].weight)
         nn.init.zeros_(self.support_head[-1].bias)
+        if self.fusion_alpha_max <= 0:
+            raise ValueError("CRV fusion_alpha_max must be positive")
+        if not 0 < fusion_alpha_init < self.fusion_alpha_max:
+            raise ValueError("CRV fusion_alpha_init must be between 0 and fusion_alpha_max")
+        if self.fusion_temperature <= 0:
+            raise ValueError("CRV fusion_temperature must be positive")
+        # Bounded positive fusion strength. Although alpha starts non-zero,
+        # the zero-initialized support head makes every initial drop exactly
+        # zero, hence final_score == raw_CRS_score at initialization.
+        alpha_ratio = torch.tensor(float(fusion_alpha_init / self.fusion_alpha_max))
+        inverse_sigmoid = torch.logit(alpha_ratio)
+        self.fusion_alpha_raw = nn.Parameter(inverse_sigmoid)
         if neutral_mode == "learnable":
             self.neutral_feature = nn.Parameter(torch.zeros(1, hidden_channels, 1, 1))
         else:
             self.register_parameter("neutral_feature", None)
 
+    @property
+    def fusion_alpha(self):
+        return self.fusion_alpha_max * self.fusion_alpha_raw.sigmoid()
+
     @staticmethod
-    def _balanced_binary_loss(logits, targets, valid):
-        positive = (targets > 0.5) & valid
-        negative = (targets <= 0.5) & valid
-        losses = []
-        if positive.any():
-            losses.append(F.binary_cross_entropy_with_logits(logits[positive], torch.ones_like(logits[positive])))
-        if negative.any():
-            losses.append(F.binary_cross_entropy_with_logits(logits[negative], torch.zeros_like(logits[negative])))
-        return sum(losses) / max(len(losses), 1)
+    def _masked_mean(values, valid):
+        if valid.any():
+            return values[valid].mean()
+        return values.sum() * 0.0
+
+    @staticmethod
+    def _balanced_bce_with_logits(logits, positive, negative):
+        positive_loss = F.binary_cross_entropy_with_logits(
+            logits, torch.ones_like(logits), reduction="none"
+        )
+        negative_loss = F.binary_cross_entropy_with_logits(
+            logits, torch.zeros_like(logits), reduction="none"
+        )
+        positive_count = positive.sum().to(logits.dtype)
+        negative_count = negative.sum().to(logits.dtype)
+        positive_mean = (positive_loss * positive.to(logits.dtype)).sum() / positive_count.clamp(min=1.0)
+        negative_mean = (negative_loss * negative.to(logits.dtype)).sum() / negative_count.clamp(min=1.0)
+        group_count = (positive_count > 0).to(logits.dtype) + (negative_count > 0).to(logits.dtype)
+        return (positive_mean + negative_mean) / group_count.clamp(min=1.0)
 
     def _select(self, scores):
         k = min(self.topk, scores.shape[1])
@@ -293,19 +332,49 @@ class CounterfactualReferentVerifier(nn.Module):
         selected_boxes = gather_candidates(boxes, indices)
         selected_scores = scores.gather(1, indices)
 
+        # During training, append the exact referring GT as one additional
+        # intervention.  It guarantees a stable positive counterfactual even
+        # when no sufficiently accurate proposal enters raw CRS Top-K.  The GT
+        # scene is never constructed during validation or inference.
+        candidate_count = selected_boxes.shape[1]
+        intervention_boxes = selected_boxes.detach()
+        has_gt_intervention = target_boxes is not None
+        if has_gt_intervention:
+            intervention_boxes = torch.cat(
+                (intervention_boxes, target_boxes.detach()[:, None]), dim=1
+            )
         scenes, valid_visual = self._scene_features(
-            visual, visual_mask, selected_boxes.detach()
+            visual, visual_mask, intervention_boxes
         )
         scene_support_logits = self._scene_support(scenes, valid_visual, text, text_mask)
         original_support_logits = scene_support_logits[:, :1]
-        masked_support_logits = scene_support_logits[:, 1:]
+        masked_support_logits = scene_support_logits[:, 1:1 + candidate_count]
+        gt_masked_support_logits = (
+            scene_support_logits[:, 1 + candidate_count:2 + candidate_count]
+            if has_gt_intervention else None
+        )
 
         # A large positive drop means that removing this candidate destroys
         # scene support for the full expression, so it is counterfactually
         # important. The shared scorer makes the comparison explicitly paired.
         support_drop_logits = original_support_logits - masked_support_logits
-        importance_scores = support_drop_logits.sigmoid()
-        weighted_scores = (selected_scores * importance_scores).unsqueeze(-1)
+        gt_support_drop_logits = (
+            original_support_logits - gt_masked_support_logits
+            if gt_masked_support_logits is not None else None
+        )
+
+        # Treat CRV as a bounded residual correction to the original CRS
+        # probability. This keeps final scores in [0, 1], enables direct final
+        # BCE supervision, and prevents an extreme drop from overwhelming CRS.
+        alpha = self.fusion_alpha.to(support_drop_logits.dtype)
+        fusion_residual_logits = alpha * torch.tanh(
+            support_drop_logits / self.fusion_temperature
+        )
+        raw_crs_logits = torch.logit(selected_scores.clamp(min=1e-6, max=1.0 - 1e-6))
+        fused_logits = raw_crs_logits + fusion_residual_logits
+        weighted_scores = fused_logits.sigmoid().unsqueeze(-1)
+        # Kept as a diagnostic odds multiplier: final odds = raw odds * importance.
+        importance_scores = fusion_residual_logits.exp()
 
         loss = visual.sum() * 0.0
         selected_ious = None
@@ -323,39 +392,107 @@ class CounterfactualReferentVerifier(nn.Module):
             if target_valid is not None:
                 positive = positive & target_valid[:, None]
                 negative = negative & target_valid[:, None]
-            pairable_sample = positive.any(1) & negative.any(1)
-            valid_supervision = (positive | negative) & pairable_sample[:, None]
-            importance_targets = positive.to(support_drop_logits.dtype)
-            drop_loss = self._balanced_binary_loss(
-                support_drop_logits, importance_targets, valid_supervision
+            if target_valid is None:
+                target_valid = torch.ones(
+                    support_drop_logits.shape[0], dtype=torch.bool,
+                    device=support_drop_logits.device,
+                )
+
+            # Purely relative counterfactual supervision.  Removing a true
+            # referent must produce a positive drop; removing a reliable
+            # distractor should leave support unchanged (drop near zero).
+            candidate_positive_loss = self._masked_mean(
+                F.relu(self.positive_drop_margin - support_drop_logits), positive
+            )
+            candidate_negative_loss = self._masked_mean(
+                F.smooth_l1_loss(
+                    support_drop_logits, torch.zeros_like(support_drop_logits), reduction="none"
+                ),
+                negative,
+            )
+            gt_positive_loss = self._masked_mean(
+                F.relu(self.positive_drop_margin - gt_support_drop_logits[:, 0]),
+                target_valid,
+            )
+            drop_loss = (
+                candidate_positive_loss
+                + candidate_negative_loss
+                + self.gt_drop_loss_weight * gt_positive_loss
             )
 
             # Removing a target-covering candidate must cause a larger support
             # drop than removing any reliable high-scoring distractor.
-            pair_valid = (
-                positive[:, :, None]
-                & negative[:, None, :]
-                & pairable_sample[:, None, None]
-            )
+            pair_valid = positive[:, :, None] & negative[:, None, :]
             rank_terms = F.relu(
                 self.margin
                 - support_drop_logits[:, :, None]
                 + support_drop_logits[:, None, :]
             )
-            if pair_valid.any():
-                rank_loss = rank_terms[pair_valid].mean()
-            else:
-                rank_loss = support_drop_logits.sum() * 0.0
-            loss = drop_loss + self.ranking_loss_weight * rank_loss
+            candidate_rank_loss = self._masked_mean(rank_terms, pair_valid)
+
+            # The exact-GT intervention also ranks against every reliable hard
+            # distractor, including samples whose Top-K has no positive box.
+            gt_rank_terms = F.relu(
+                self.margin - gt_support_drop_logits + support_drop_logits
+            )
+            gt_pair_valid = target_valid[:, None] & negative
+            gt_rank_loss = self._masked_mean(gt_rank_terms, gt_pair_valid)
+            rank_loss = candidate_rank_loss + gt_rank_loss
+
+            # Optimize the score actually used at inference.  Ranking drops in
+            # isolation was insufficient when raw CRS assigned a distractor a
+            # much larger score than the correct proposal.
+            fused_rank_terms = F.relu(
+                self.margin
+                - fused_logits[:, :, None]
+                + fused_logits[:, None, :]
+            )
+            fused_rank_loss = self._masked_mean(fused_rank_terms, pair_valid)
+
+            # Directly supervise the exact scores used at inference. Samples
+            # with no positive Top-K proposal are skipped: suppressing all of
+            # their candidates cannot recover the absent target. Positives and
+            # negatives are averaged as two groups to avoid class imbalance.
+            bce_sample_valid = positive.any(dim=1)
+            final_bce_positive = positive & bce_sample_valid[:, None]
+            final_bce_negative = negative & bce_sample_valid[:, None]
+            final_bce_loss = self._balanced_bce_with_logits(
+                fused_logits, final_bce_positive, final_bce_negative
+            )
+            loss = (
+                drop_loss
+                + self.ranking_loss_weight * rank_loss
+                + self.fused_ranking_loss_weight * fused_rank_loss
+                + self.final_bce_loss_weight * final_bce_loss
+            )
+        else:
+            candidate_positive_loss = loss
+            candidate_negative_loss = loss
+            gt_positive_loss = loss
+            rank_loss = loss
+            fused_rank_loss = loss
+            final_bce_loss = loss
 
         return {
             "indices": indices,
             "weighted_scores": weighted_scores,
             "importance_scores": importance_scores,
-            "original_support_scores": original_support_logits.sigmoid(),
-            "masked_support_scores": masked_support_logits.sigmoid(),
+            "fusion_residual_logits": fusion_residual_logits,
+            "fused_logits": fused_logits,
+            "fusion_alpha": alpha,
+            "original_support_logits": original_support_logits,
+            "masked_support_logits": masked_support_logits,
+            "relative_support_scores": -support_drop_logits,
             "support_drop_logits": support_drop_logits,
+            "gt_masked_support_logits": gt_masked_support_logits,
+            "gt_support_drop_logits": gt_support_drop_logits,
             "selected_ious": selected_ious,
             "expanded_gt_coverage": expanded_gt_coverage,
+            "loss_candidate_positive": candidate_positive_loss,
+            "loss_candidate_negative": candidate_negative_loss,
+            "loss_gt_positive": gt_positive_loss,
+            "loss_drop_rank": rank_loss,
+            "loss_fused_rank": fused_rank_loss,
+            "loss_final_bce": final_bce_loss,
             "loss": loss,
         }
