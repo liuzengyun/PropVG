@@ -1,6 +1,7 @@
 """AerialVG (ODVG jsonl) dataset adapter."""
 import json
 import os.path as osp
+from numbers import Integral
 
 import numpy as np
 from torch.utils.data import Dataset
@@ -14,11 +15,17 @@ from propvg.utils import get_root_logger, is_main
 class AerialVG(Dataset):
     def __init__(self, imgsfile, annsfile, pipeline, which_set="train", max_samples=None,
                  teacher_annsfile=None, teacher_dedup_iou=0.5,
-                 teacher_nms_iou=0.5, **kwargs):
+                 teacher_nms_iou=0.5, teacher_max_boxes=None, **kwargs):
         if which_set not in ("train", "val", "test"):
             raise ValueError("AerialVG supports train, val, and test splits")
         if teacher_annsfile is not None and which_set != "train":
             raise ValueError("Teacher boxes may only be loaded for the AerialVG training split")
+        if teacher_max_boxes is not None and (
+            isinstance(teacher_max_boxes, bool)
+            or not isinstance(teacher_max_boxes, Integral)
+            or teacher_max_boxes < 0
+        ):
+            raise ValueError("teacher_max_boxes must be a non-negative integer or None")
         self.which_set = which_set
         self.imgsfile = imgsfile
         self.pipeline = Compose(pipeline)
@@ -144,8 +151,11 @@ class AerialVG(Dataset):
                                     continue
                             nms_boxes.append(teacher_box)
                             nms_scores.append(teacher_score)
-                        teacher_boxes = nms_boxes
-                        teacher_scores = nms_scores
+                        # Limit proposal-only teacher supervision after
+                        # deduplication, so lower-ranked boxes can fill slots
+                        # vacated by predictions overlapping the refer GT.
+                        teacher_boxes = nms_boxes[:teacher_max_boxes]
+                        teacher_scores = nms_scores[:teacher_max_boxes]
 
                         sample.update(
                             teacher_boxes=teacher_boxes,

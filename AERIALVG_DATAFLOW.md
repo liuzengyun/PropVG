@@ -9,7 +9,7 @@ teacher = True
 use_auxiliary_gt = False
 enable_grab = False
 enable_crv = True
-crv_topk = 8
+crv_topk = 6
 freeze_beit3 = False
 
 img_size = 586
@@ -30,7 +30,7 @@ samples_per_gpu = 8
 ## 2. 总体流程
 
 ```text
-AerialVG JSONL + teacher_trainset.json
+AerialVG JSONL + teacher_valset.json
                 ↓
 读取图像、完整文本、原始 refer GT、teacher 候选框
                 ↓
@@ -50,7 +50,7 @@ Deformable DETR Decoder + 256 个 query
                 ↓
 CRS 计算每个候选框与文本的相关性
                 ↓
-CRV 取原始 CRS Top-8，执行反事实验证并融合重排
+CRV 取原始 CRS Top-6，用同一完整文本比较原场景与各候选遮挡场景并重排
                 ↓
 最高分候选框作为最终 Top-1 定位结果
 ```
@@ -59,11 +59,19 @@ CRV 取原始 CRS Top-8，执行反事实验证并融合重排
 
 ### 3.1 原始 AerialVG 标注
 
-训练集来自：
+当前快速调试配置的训练数据来自官方 val split：
 
 ```text
-data/AerialVG/annotation/vg_train_odvg.jsonl
+data/AerialVG/annotation/vg_val_odvg.jsonl
 ```
+
+当前 val 和 test 都指向官方 test split：
+
+```text
+data/AerialVG/annotation/vg_test_odvg.jsonl
+```
+
+因此当前配置只适合快速实验；val/test 相同会造成模型选择使用 test 信息，不应作为最终规范结果。正式实验需要恢复官方 train/val/test 独立划分。
 
 每一行是一张图和一段 referring expression：
 
@@ -95,7 +103,7 @@ regions[1:] = AerialVG 自带的其他区域标注
 teacher 框来自：
 
 ```text
-data/AerialVG/teacher_trainset.json
+data/AerialVG/teacher_valset.json
 ```
 
 处理顺序：
@@ -507,7 +515,7 @@ loss_refer = BCE(refer_score,target_gt_refer) × 1.0
 当前总训练 loss 为：
 
 ```text
-loss = loss_det + loss_refer
+loss = loss_det + loss_refer + loss_crv
 ```
 
 其余项：
@@ -516,17 +524,24 @@ loss = loss_det + loss_refer
 loss_mask   = 0：AerialVG 不运行分割分支
 loss_nt     = 0：当前 AerialVG forward 没有调用 MTD
 loss_filter = 0：当前 enable_grab=False
-loss_crv：当前 enable_crv=True，监督反事实支持度与真/假候选排序
+loss_crv = 0.5 × (loss_counterfactual + loss_final_rank)
 ```
 
 ## 10. 推理与最终目标框
 
-推理阶段不会把 GT 框传给模型。模型最终得到：
+推理阶段不会把 GT 框传给模型。CRV 之前得到：
 
 ```text
 outputs_class[-1]: [B,256,2]
 outputs_coord[-1]: [B,256,4]
 refer_score:       [B,256,1]
+```
+
+CRV 根据原始 `refer_score` 选择 Top-6，并输出：
+
+```text
+pred_bbox_allobj: [B,6,4]
+refer_label:      [B,6,1]，即融合后的 final_score
 ```
 
 归一化的 `cxcywh` 框先转为 `xyxy`，再乘有效 resize 图像宽高：
@@ -539,8 +554,8 @@ y 坐标 × img_shape.height
 输出：
 
 ```text
-pred_boxes:  [B,256,4]
-pred_scores: [B,256]
+pred_boxes:  [B,6,4]
+pred_scores: [B,6]
 ```
 
 当前：
@@ -549,11 +564,11 @@ pred_scores: [B,256]
 with_nms = False
 ```
 
-候选框最终只按照 CRS 的 `refer_score` 排序。检测分类概率会被保留为 `det_score`，但不参与 AerialVG 的最终候选排序。
+候选框最终按照 `final_score = sigmoid(logit(CRS score) + tanh(CRV drop))` 排序。检测分类概率会被保留为 `det_score`，但不参与 AerialVG 的最终候选排序。
 
 ```text
-Top-1 框 = refer_score 最高的候选框
-Top-5 框 = refer_score 最高的前五个候选框
+Top-1 框 = final_score 最高的候选框
+Top-5 框 = final_score 最高的前五个候选框
 ```
 
 指标计算：
@@ -647,7 +662,7 @@ adjacency: [B,128,128]
 
 检测 loss 仍在 Grab 过滤前的全部 256 个 query 上计算。Grab 的 `loss_filter` 监督哪些候选应该被保留：所有 Hungarian 匹配到前景 GT 的 query 都是过滤正样本，未匹配 query 是负样本。
 
-当前配置 `enable_grab=False`，所以上述 Grab 分支不会执行。CRV 直接从 PropVG/CRS 的 256 个候选中选择原始 Top-8 并反事实重排，最终只输出 8 个候选。CRV 细节见 `CRV_DESIGN.md`。
+当前配置 `enable_grab=False`，所以上述 Grab 分支不会执行。CRV 直接从 PropVG/CRS 的 256 个候选中选择原始 Top-6 并反事实重排，最终只输出 6 个候选。CRV 细节见 `CRV_DESIGN.md`。
 
 ## 12. 当前实际主线总结
 
@@ -662,11 +677,13 @@ Deformable DETR 生成 256 个候选框
     ↓
 CRS 使用完整文本给 256 个候选框打 referring score
     ↓
-CRV 选取原始 Top-8，用共享两层跨模态评分器分别计算原始场景与逐候选遮挡场景的支持度
+CRV 选取原始 Top-6；同一份完整文本用共享评分器计算一次原场景支持度，并分别计算各候选遮挡场景的支持度
     ↓
-用“原始支持度减去遮挡后支持度”得到反事实重要性，乘法加权原始 CRS 分数并重排
+用“原始支持度减去遮挡后支持度”得到反事实重要性，作为有界残差加到原始 CRS logit 后重排
     ↓
 加权分数最高的候选框作为最终 visual grounding 结果
 ```
+
+训练时 `loss_counterfactual` 和 `loss_final_rank` 都只更新 CRV。视觉特征、候选框、文本特征和 CRS 分数在进入 CRV 时全部 detach，所以 CRV 不会更新 CRS、Grab、DETR、SimFPN、BEiT-3 或文本主干；CRS 仍只由原始 `loss_refer` 训练。正样本定义为 `IoU>0.5`，负样本仅为 `IoU=0`，中间候选全部忽略；所有正负候选独立做 pairwise ranking，正确 proposal 之间不竞争。训练、验证和测试都只需正常计算一次 CRS。
 
 训练时，原始 refer GT 同时提供检测监督和 referring 监督；teacher 框只提供候选目标检测监督。验证和测试只使用原始 refer GT。

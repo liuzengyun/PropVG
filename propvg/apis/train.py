@@ -56,7 +56,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
     end = time.time()
 
     loss_det_list, loss_mask_list, loss_label_nt_list, loss_refer_list, loss_filter_list, loss_crv_list = [], [], [], [], [], []
-    crv_final_bce_list, crv_alpha_list = [], []
+    crv_cf_list, crv_final_rank_list = [], []
     for batch, inputs in enumerate(loader):
         data_time = time.time() - end
         if not cfg.distributed:
@@ -70,8 +70,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss_refer = losses.pop("loss_refer", torch.tensor([0.0], device=device))
         loss_filter = losses.pop("loss_filter", torch.tensor([0.0], device=device))
         loss_crv = losses.pop("loss_crv", torch.tensor([0.0], device=device))
-        crv_final_bce = losses.pop("metric_crv_final_bce", torch.tensor([0.0], device=device))
-        crv_alpha = losses.pop("metric_crv_alpha", torch.tensor([0.0], device=device))
+        crv_cf = losses.pop("metric_crv_cf", torch.tensor([0.0], device=device))
+        crv_final_rank = losses.pop("metric_crv_final_rank", torch.tensor([0.0], device=device))
         loss = loss_det + loss_mask + loss_label_nt + loss_refer + loss_filter + loss_crv
         # loss = loss_det
         optimizer.zero_grad()
@@ -81,10 +81,9 @@ def train_model(epoch, cfg, model, optimizer, loader):
         else:
             loss.backward()
         if cfg.grad_norm_clip:
-            # CRV input tensors are detached, but clipping all model gradients
-            # in one norm would still let a large CRV gradient rescale the
-            # otherwise independent PropVG gradients. Clip both groups
-            # independently so CRV cannot perturb baseline optimization.
+            # CRV is fully detached from the baseline. Clip CRV-local and
+            # baseline gradients independently so a large CRV norm cannot
+            # indirectly rescale CRS or the rest of PropVG.
             crv_parameters, base_parameters = [], []
             for name, parameter in model.named_parameters():
                 if parameter.grad is None:
@@ -103,16 +102,16 @@ def train_model(epoch, cfg, model, optimizer, loader):
             loss_refer = reduce_mean(loss_refer)
             loss_filter = reduce_mean(loss_filter)
             loss_crv = reduce_mean(loss_crv)
-            crv_final_bce = reduce_mean(crv_final_bce)
-            crv_alpha = reduce_mean(crv_alpha)
+            crv_cf = reduce_mean(crv_cf)
+            crv_final_rank = reduce_mean(crv_final_rank)
         loss_det_list.append(loss_det.item())
         loss_mask_list.append(loss_mask.item())
         loss_label_nt_list.append(loss_label_nt.item())
         loss_refer_list.append(loss_refer.item())
         loss_filter_list.append(loss_filter.item())
         loss_crv_list.append(loss_crv.item())
-        crv_final_bce_list.append(crv_final_bce.item())
-        crv_alpha_list.append(crv_alpha.item())
+        crv_cf_list.append(crv_cf.item())
+        crv_final_rank_list.append(crv_final_rank.item())
 
         if is_main():
             if (batch + 1) % cfg.log_interval == 0 or batch + 1 == batches:
@@ -126,8 +125,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
                     + f"loss_refer: {sum(loss_refer_list) / len(loss_refer_list):.4f}, "
                     + f"loss_filter: {sum(loss_filter_list) / len(loss_filter_list):.4f}, "
                     + f"loss_crv: {sum(loss_crv_list) / len(loss_crv_list):.4f}, "
-                    + f"crv_final_bce: {sum(crv_final_bce_list) / len(crv_final_bce_list):.4f}, "
-                    + f"crv_alpha: {sum(crv_alpha_list) / len(crv_alpha_list):.4f}, "
+                    + f"crv_cf: {sum(crv_cf_list) / len(crv_cf_list):.4f}, "
+                    + f"crv_final_rank: {sum(crv_final_rank_list) / len(crv_final_rank_list):.4f}, "
                     + f"lr: {optimizer.param_groups[0]['lr']:.6f}, "
                 )
 
@@ -139,8 +138,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
                         "loss_refer": sum(loss_refer_list) / len(loss_refer_list),
                         "loss_filter": sum(loss_filter_list) / len(loss_filter_list),
                         "loss_crv": sum(loss_crv_list) / len(loss_crv_list),
-                        "crv_final_bce": sum(crv_final_bce_list) / len(crv_final_bce_list),
-                        "crv_alpha": sum(crv_alpha_list) / len(crv_alpha_list),
+                        "crv_cf": sum(crv_cf_list) / len(crv_cf_list),
+                        "crv_final_rank": sum(crv_final_rank_list) / len(crv_final_rank_list),
                         "lr": optimizer.param_groups[0]["lr"],
                     }
                 )

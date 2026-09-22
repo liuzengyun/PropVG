@@ -217,6 +217,8 @@ def main():
         selected_boxes = gather_candidates(call["boxes"], selected_indices)[0]
         selected_raw = call["refer_scores"].squeeze(-1).gather(1, selected_indices)[0]
         selected_weighted = output["weighted_scores"][0, :, 0]
+        candidate_original_logits = output["original_support_logits"][0]
+        candidate_original_support = candidate_original_logits.sigmoid()
         candidate_masked_logits = output["masked_support_logits"][0]
         candidate_masked_support = candidate_masked_logits.sigmoid()
         candidate_drop = output["support_drop_logits"][0]
@@ -229,16 +231,18 @@ def main():
             ((gt_normalized_xyxy[:2] + gt_normalized_xyxy[2:]) / 2,
              gt_normalized_xyxy[2:] - gt_normalized_xyxy[:2])
         )[None].to(visual.device)
-        gt_scenes, gt_valid = crv._scene_features(visual, visual_mask, gt_normalized[:, None])
-        gt_support_logits = crv._scene_support(gt_scenes, gt_valid, text, text_mask)[0]
+        gt_original, gt_masked, gt_valid = crv._scene_features(
+            visual, visual_mask, gt_normalized[:, None]
+        )
+        gt_support_logits = crv._paired_support(
+            gt_original, gt_masked, gt_valid, text, text_mask
+        )[0]
         original_logit = gt_support_logits[0]
         gt_masked_logit = gt_support_logits[1]
         original_support = original_logit.sigmoid()
         gt_masked_support = gt_masked_logit.sigmoid()
         gt_drop = original_logit - gt_masked_logit
-        gt_residual = crv.fusion_alpha.to(gt_drop.dtype) * torch.tanh(
-            gt_drop / crv.fusion_temperature
-        )
+        gt_residual = torch.tanh(gt_drop)
         gt_importance = gt_residual.exp()
         # Only the paired difference is trained.  Absolute sigmoid support can
         # therefore saturate at 1 because a shared logit offset cancels from
@@ -281,7 +285,7 @@ def main():
             draw_box(panel, box, (20, 80, 240), f"C{candidate_index + 1}", 3)
             panels.append(add_panel_title(panel, [
                 f"MASK C{candidate_index + 1}  raw-rank={candidate_index + 1} final-rank={int(final_rank[candidate_index]) + 1}",
-                f"IoU={iou:.3f} CRS={float(selected_raw[candidate_index]):.4f} support-logit={float(candidate_masked_logits[candidate_index]):+.4f}",
+                f"IoU={iou:.3f} CRS={float(selected_raw[candidate_index]):.4f} mask-logit={float(candidate_masked_logits[candidate_index]):+.4f}",
                 f"drop={float(candidate_drop[candidate_index]):+.4f} imp={float(candidate_importance[candidate_index]):.4f} final={float(selected_weighted[candidate_index]):.4f}",
             ]))
 
@@ -294,8 +298,8 @@ def main():
                 "final_rank": int(final_rank[candidate_index]) + 1,
                 "iou_with_gt": float(iou),
                 "raw_crs": float(selected_raw[candidate_index]),
-                "original_support": float(original_support),
-                "original_support_logit": float(original_logit),
+                "original_support": float(candidate_original_support[candidate_index]),
+                "original_support_logit": float(candidate_original_logits[candidate_index]),
                 "masked_support": float(candidate_masked_support[candidate_index]),
                 "masked_support_logit": float(candidate_masked_logits[candidate_index]),
                 "support_drop_logit": float(candidate_drop[candidate_index]),

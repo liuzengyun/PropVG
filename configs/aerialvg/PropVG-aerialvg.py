@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher+crv"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher-3"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -23,10 +23,17 @@ strict_reproducibility = True
 # True: also use regions[1:] as DETR proposal detection targets.
 use_auxiliary_gt = False
 # True: keep regions[0] as the referring GT and append retained predictions
-# from teacher_trainset.json as proposal-only detection supervision for train.
+# from the configured teacher JSON as proposal-only detection supervision.
 # Validation and test never load teacher predictions.
 teacher = True
+# The teacher file must match the configured training annotation records by
+# sample_id and filename. Validation and test do not read it.
 teacher_annsfile = "data/AerialVG/teacher_trainset.json"
+# Maximum number of extra teacher boxes per training sample after refer-GT
+# deduplication and teacher NMS. 0 uses only the original refer GT; None keeps
+# every available teacher box. The current JSON contains exactly 5 raw boxes
+# per sample, so values above 5 cannot add supervision with this file.
+teacher_max_boxes = 3
 # Teacher predictions overlapping the exact refer GT at or above this IoU are
 # discarded; the original refer GT remains the only target for that instance.
 teacher_dedup_iou = 0.5
@@ -43,7 +50,7 @@ enable_grab=False
 
 # Independent counterfactual candidate verifier. It runs after the original
 # CRS and keeps only the ambiguous raw Top-K proposals for final re-ranking.
-enable_crv = True
+enable_crv = False
 crv_topk = 6
 
 
@@ -80,7 +87,8 @@ data = dict(
                imgsfile="data/AerialVG/images", pipeline=train_pipeline,
                teacher_annsfile=teacher_annsfile if teacher else None,
                teacher_dedup_iou=teacher_dedup_iou,
-               teacher_nms_iou=teacher_nms_iou),
+               teacher_nms_iou=teacher_nms_iou,
+               teacher_max_boxes=teacher_max_boxes),
     val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
              imgsfile="data/AerialVG/images", pipeline=val_pipeline),
     test=dict(type=dataset_type, which_set="test", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
@@ -104,17 +112,11 @@ model = dict(
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0, "crv": 0.5}, MTD={"K": 250},
               enable_grab=enable_grab, enable_crv=enable_crv,
-              crv=dict(topk=crv_topk, verifier_dim=256, grid_size=24, num_heads=8, num_layers=2,
-                       verifier_dropout=0.0,
+              crv=dict(topk=crv_topk, verifier_dim=256, grid_size=24,
+                       num_heads=8, num_layers=2, verifier_dropout=0.0,
                        core_expansion=1.5, feather_expansion=2.0, neutral_mode="mean",
-                       margin=0.2, positive_drop_margin=0.5,
-                       ranking_loss_weight=1.0, fused_ranking_loss_weight=1.0,
-                       final_bce_loss_weight=0.5,
-                       gt_drop_loss_weight=1.0,
-                       fusion_alpha_init=1.0, fusion_alpha_max=2.0,
-                       fusion_temperature=1.0,
-                       positive_iou_threshold=0.5, negative_iou_threshold=0.3,
-                       negative_max_gt_coverage=0.1,
+                       positive_drop_margin=0.5, rank_margin=0.2,
+                       positive_iou_threshold=0.5,
                        detach_inputs=True)),
     post_params={"score_weighted": False, "mask_threshold": 0.5, "score_threshold": 0.7,
                  "with_nms": False, "with_mask": False},
