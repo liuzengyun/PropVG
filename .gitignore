@@ -24,3 +24,4 @@ third/
 *.egg-info
 *.pth
 visualization/
+reports/

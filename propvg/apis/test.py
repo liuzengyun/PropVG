@@ -136,9 +136,9 @@ def aerialvg_box_metrics(pred_bboxes, gt_bboxes):
         # Distributed evaluation may return predictions from different CUDA
         # devices. Metrics are small; compute them on CPU to avoid device
         # mismatch during the final reduction.
-        scores = prediction["scores"].detach().reshape(-1).cpu()
+        scores = prediction.get("ranking_logits", prediction["scores"]).detach().reshape(-1).cpu()
         boxes = prediction["boxes"].detach().cpu()
-        order = scores.argsort(descending=True)
+        order = scores.argsort(descending=True, stable="ranking_logits" in prediction)
         boxes = boxes[order]
         target = torch.as_tensor(target, dtype=boxes.dtype).cpu().reshape(-1, 4)[0]
         lt = torch.maximum(boxes[:, :2], target[:2])

@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher-3"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/0928new-crv"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -17,7 +17,7 @@ dataset_type = "AerialVG"
 max_token = 64
 
 # Fix every controllable Python/NumPy/PyTorch/DataLoader random source.
-strict_reproducibility = True
+strict_reproducibility = False
 
 # False: supervise only regions[0] (the referring target).
 # True: also use regions[1:] as DETR proposal detection targets.
@@ -33,10 +33,10 @@ teacher_annsfile = "data/AerialVG/teacher_trainset.json"
 # deduplication and teacher NMS. 0 uses only the original refer GT; None keeps
 # every available teacher box. The current JSON contains exactly 5 raw boxes
 # per sample, so values above 5 cannot add supervision with this file.
-teacher_max_boxes = 3
+teacher_max_boxes = 2
 # Teacher predictions overlapping the exact refer GT at or above this IoU are
 # discarded; the original refer GT remains the only target for that instance.
-teacher_dedup_iou = 0.5
+teacher_dedup_iou = 0.001
 # Suppress lower-ranked teacher predictions which overlap another retained
 # teacher prediction. This prevents duplicate pseudo targets for one object.
 teacher_nms_iou = 0.5
@@ -48,12 +48,12 @@ freeze_beit3 = False
 
 enable_grab=False
 
-# Independent counterfactual candidate verifier. It runs after the original
-# CRS and keeps only the ambiguous raw Top-K proposals for final re-ranking.
-enable_crv = False
-crv_topk = 6
-
-
+# Independent CRV: all new losses stop at its own scorer/fusion gate.
+# False uses the unchanged CRS ranking and original full-candidate losses.
+enable_crv = True
+crv_topk = 8
+crv_grid_size = 24  # Mask on the largest 144x144 map, then pool for scoring.
+crv_cf_loss_weight = 0.1  # Small paired drop-ranking auxiliary objective.
 
 img_size = 586
 patch_size = 16
@@ -82,7 +82,7 @@ val_pipeline = [
 
 data = dict(
     samples_per_gpu=8,
-    workers_per_gpu=8,
+    workers_per_gpu=16,
     train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_train_odvg.jsonl",
                imgsfile="data/AerialVG/images", pipeline=train_pipeline,
                teacher_annsfile=teacher_annsfile if teacher else None,
@@ -110,14 +110,15 @@ model = dict(
               detr_loss={"criterion": {"loss_class": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0},
                          "matcher": {"cost_class": 1.0, "cost_bbox": 5.0, "cost_giou": 2.0}},
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
-                           "bbox": 0.1, "allbbox": 0.1, "refer": 1.0, "crv": 0.5}, MTD={"K": 250},
+                           "bbox": 0.1, "allbbox": 0.1, "refer": 1.0,
+                           "crv": 0.5}, MTD={"K": 250},
               enable_grab=enable_grab, enable_crv=enable_crv,
-              crv=dict(topk=crv_topk, verifier_dim=256, grid_size=24,
-                       num_heads=8, num_layers=2, verifier_dropout=0.0,
-                       core_expansion=1.5, feather_expansion=2.0, neutral_mode="mean",
-                       positive_drop_margin=0.5, rank_margin=0.2,
-                       positive_iou_threshold=0.5,
-                       detach_inputs=True)),
+              crv=dict(topk=crv_topk, verifier_dim=128, grid_size=crv_grid_size,
+                       num_heads=4, num_layers=2,
+                       core_expansion=1.5, feather_expansion=2.0,
+                       initial_alpha=0.1, max_residual=2.0, drop_temperature=1.0,
+                       cf_loss_weight=crv_cf_loss_weight, rank_margin=0.5,
+                       max_negative_gt_coverage=0.05)),
     post_params={"score_weighted": False, "mask_threshold": 0.5, "score_threshold": 0.7,
                  "with_nms": False, "with_mask": False},
     process_visual=False,

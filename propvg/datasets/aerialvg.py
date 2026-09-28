@@ -15,7 +15,8 @@ from propvg.utils import get_root_logger, is_main
 class AerialVG(Dataset):
     def __init__(self, imgsfile, annsfile, pipeline, which_set="train", max_samples=None,
                  teacher_annsfile=None, teacher_dedup_iou=0.5,
-                 teacher_nms_iou=0.5, teacher_max_boxes=None, **kwargs):
+                 teacher_nms_iou=0.5, teacher_max_boxes=None,
+                 teacher_max10=False, **kwargs):
         if which_set not in ("train", "val", "test"):
             raise ValueError("AerialVG supports train, val, and test splits")
         if teacher_annsfile is not None and which_set != "train":
@@ -26,6 +27,11 @@ class AerialVG(Dataset):
             or teacher_max_boxes < 0
         ):
             raise ValueError("teacher_max_boxes must be a non-negative integer or None")
+        if not isinstance(teacher_max10, bool):
+            raise ValueError("teacher_max10 must be True or False")
+        self.teacher_max10 = teacher_max10
+        self.teacher_area_filtered_boxes = 0
+        self.teacher_area_filtered_samples = 0
         self.which_set = which_set
         self.imgsfile = imgsfile
         self.pipeline = Compose(pipeline)
@@ -125,6 +131,17 @@ class AerialVG(Dataset):
                         refer_area = np.clip(refer_box[2:] - refer_box[:2], 0.0, None).prod()
                         ious = intersection / np.maximum(teacher_area + refer_area - intersection, 1e-6)
                         keep = ious < float(teacher_dedup_iou)
+                        if self.teacher_max10:
+                            # Compare the actual original-pixel supervision
+                            # boxes after clipping teacher boxes to the image.
+                            # Use regions[0], never an auxiliary/teacher GT.
+                            # Exactly 10x is retained; only strictly larger
+                            # boxes are removed, before NMS and count limits.
+                            area_keep = teacher_area <= 10.0 * refer_area
+                            removed = int((~area_keep).sum())
+                            self.teacher_area_filtered_boxes += removed
+                            self.teacher_area_filtered_samples += int(removed > 0)
+                            keep &= area_keep
                         teacher_boxes = [box for box, keep_box in zip(teacher_boxes, keep) if keep_box]
                         teacher_scores = [score for score, keep_box in zip(teacher_scores, keep) if keep_box]
 
@@ -179,6 +196,12 @@ class AerialVG(Dataset):
         self.num_token = 64010
         if is_main():
             get_root_logger().info("AerialVG-%s size: %d", which_set, len(self.samples))
+            if teacher_records is not None and self.teacher_max10:
+                get_root_logger().info(
+                    "Teacher area filter (teacher_max10=True): removed %d boxes "
+                    "larger than 10x refer GT across %d samples before NMS/count limits",
+                    self.teacher_area_filtered_boxes, self.teacher_area_filtered_samples,
+                )
 
     def _set_group_flag(self):
         self.flag = np.asarray([sample["width"] / sample["height"] > 1 for sample in self.samples], dtype=np.uint8)

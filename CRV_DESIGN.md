@@ -1,349 +1,188 @@
-# CRV：基于完整文本的反事实候选重排序
+# CRV：独立空间反事实评分与自适应融合
 
-本文档对应当前 `propvg/models/heads/crv.py`、`propvg/models/heads/REFHead.py` 和 `configs/aerialvg/PropVG-aerialvg.py` 的实际实现。
+更新：2026-09-28。本文件是当前 CRV 的唯一说明；旧 CRV/CFCR 实现、旧文档和旧可视化脚本已从活动代码中移除。删除前的源码保存在 `backups/old_crv_before_independent_20260928.tar.gz`，已有实验、checkpoint 和实验内源码快照没有改动。
 
-## 1. 核心思路
+当前为独立 CRV v2：修复门控被绝对 BCE 压低、tanh 饱和、概率量化排序和 padding 边界问题。v1 修改前的源码备份为 `backups/independent_crv_v1_before_ranking_fix_20260928.tar.gz`。
 
-CRS 回答正向问题：
+## 1. 动机与边界
 
-```text
-候选存在时，它与完整文本有多匹配？
-```
+CRS 进行正向候选—文本匹配，航拍中外观相似的错误目标也可能得高分。CRV 增加一个互补问题：移除候选覆盖的空间视觉证据后，完整文本与剩余场景的匹配是否下降？
 
-CRV（Counterfactual Referent Verifier）位于 CRS 之后，回答互补问题：
+本版保留原 CRS，不复用其评分器、不重新运行检测解码器、不对候选 query token 做删除。独立、轻量的图文匹配网络同时评分原场景和 mask 场景，用两者之差修正原 CRS 得分。所有输入先 detach，CRV 的损失只更新独立网络和融合门控。
 
-```text
-如果把候选对应的视觉证据从场景特征中抹去，完整文本的场景支持度下降多少？
-```
+“对描述重要”不必然等于“定位目标”，mask 参考物体、大框覆盖多个对象、BEiT-3 上下文泄漏以及 mask 分布捷径仍是方法局限。本版按照当前约定不做参考物体保护。它是特征级干预，不应表述为真实像素删除或因果识别保证，也不保证精度提升。
 
-对候选 `i`：
+## 2. 整体数据流与维度
 
-```text
-drop_i = S(original_scene, full_text)
-         - S(mask_candidate_i_scene, full_text)
-```
+B 为 batch，P 为 DETR query 数（AerialVG=256、AerialSense=128），T=64，C=256，K=min(8,N)。N 为进入 CRS 的候选数，Grab 开启时是过滤后数量。以 586×586 输入为例：
 
-`drop_i` 越大，表示候选被删除后文本越难由剩余场景支持。最终仍保留原始 CRS 分数，只把有界反事实差值作为 logit 残差：
+| 步骤 | 张量 | 处理 |
+| --- | --- | --- |
+| 标注加载 | 每条完整 caption + 原始 refer GT | 图像与完整表达式一一对应，regions[0] 是定位目标 |
+| resize/pad | 图像 [B,3,586,586] | 保持比例缩放后右侧/底部 padding；记录有效尺寸 |
+| 分词 | token IDs、文本 padding mask [B,64] | 不拆解描述；超过 max_token 会截断 |
+| BEiT-3 | 图像 tokens [B,1296,768]、文本 [B,64,768] | patch=16，空间格为36×36 |
+| 头部投影 | 图像 [B,512,36,36]、文本 [B,64,256] | 保留原 PropVG 的512通道数据流 |
+| SimFPN | 四层 [B,512,H,W] | H/W=144、72、36、18；检测使用前256通道 |
+| 检测 decoder | 各层 queries [B,P,256] | 原3层 deformable decoder；生成所有 proposal |
+| DetHead | boxes [B,P,4]、类别 [B,P,2] | boxes 为有效 resize 图像内归一化 cxcywh |
+| 可选 Grab | queries [B,N,256]、boxes [B,N,4] | 原过滤、外观和图结构路径不变 |
+| refer_adapter + CRS | logits/scores [B,N,1] | 原评分器和原 loss_refer 保留 |
+| 取 CRS Top-K | indices [B,K]、boxes [B,K,4] | 按原始 CRS logit 稳定排序选取，不回传；其他候选不进入最终排序 |
+| 独立 CRV | 最大检测图 V=[B,256,144,144]、完整文本 [B,64,256] | V、文本、boxes、CRS logits 全部 detach |
+| 场景构造 | 原场景 + K 份 mask 场景 | 训练额外增加精确 refer-GT mask，推理不增加 |
+| 评分前池化 | [B,S,256,24,24] | 在144×144上先 mask，再做有效区域加权池化；S=1+K（训练1+K+1） |
+| CRV 自身投影 | 场景 tokens [B×S,576,128]、文本 [B×S,64,128] | 不是 CRS tokens，无特征对齐或参数共享 |
+| 独立图文交互 | 文本 + 场景汇总 token [B×S,65,128] | 2层 TransformerDecoder，4头，FFN256，dropout=0 |
+| 场景评分 | g(V,L) [B,1]、g(V\i,L) [B,K] | 同一个新评分器，场景互不混合，不用绝对 support sigmoid |
+| 差值 | d_i=g(V,L)-g(V\i,L) [B,K] | 越大表示该候选被删除后匹配下降越大 |
+| 自适应门控 | alpha [B,1] | 每张图一个共享权重，无候选级第二分类器 |
+| 最终输出 | probabilities/logits [B,K,1]、boxes [B,K,4] | 概率用于显示，融合 logit 用于排序；最高分框是定位结果 |
 
-```text
-DETR proposals → CRS scores → CRS Top-K → CRV residual → fused scores
-```
+24×24 只用于控制独立评分器的注意力成本。输入仍是最大144×144特征图，干预也在该尺寸完成。可以修改 `crv_grid_size`，但池化可能稀释小目标；使用最大图不等于评分网络在全部20736个空间点上执行注意力。原 scene 被评分一次，K 个 mask scene 分别评分。没有 Reader、decoder 重放或共享 CRS。
 
-当前不使用候选 ROI 改写文本，不拆分目标词、属性词、关系词或参考物体词，也不读取 AerialVG 的辅助 region 作为 CRV 标签。
+原512通道 neck 和分割模块构建不改；无 mask GT 时仍跳过分割前向与分割损失。没有新矩形伪 mask、没有修改检测框或提案数量。
 
-## 2. 当前输入与尺寸
+## 3. mask 与坐标
 
-当前 AerialVG 配置为 `img_size=586`、`num_queries=256`、`max_token=64`、`crv_topk=6`：
-
-```text
-最大 SimFPN 特征： [B,256,Hf,Wf]，通常约为 [B,256,144,144]
-该层 padding mask：[B,Hf,Wf]
-DETR 候选框：      [B,256,4]，归一化 cxcywh、相对有效 resize 图像
-CRS 分数：          [B,256,1]
-完整文本特征：      [B,64,256]
-文本 padding mask： [B,64]
-训练期 refer GT：  [B,4]，归一化 cxcywh
-```
-
-当前 `enable_grab=False`，因此 CRV 从 PropVG 的 256 个候选中直接选择 CRS Top-6。若以后打开 Grab，CRV 会在 Grab 输出的候选上执行相同流程。
-
-## 3. 候选选择与训练期精确 GT 干预
-
-CRS 原始分数只用于选择 Top-K：
+标注是原图像素 xyxy；Resize 同步缩放标注。检测损失和预测框使用有效 resize 图像尺寸归一化的 cxcywh。CRV 将中心和宽高再乘：
 
 ```text
-indices = topk(raw_crs_score.detach(), K=6)
+ratio = [img_width / pad_width, img_height / pad_height]
 ```
 
-选择索引不可导，CRV 不能通过 Top-K 操作改变哪些候选被选中。
+从而映射至 padded 特征图，不能直接把有效图像归一化坐标当作整张 padded 图坐标。ratio 从元数据获得，不用取整后的有效格数代替。
 
-训练时在 6 个预测候选之外额外加入一次精确 refer GT mask：
+每个通道分别计算当前图像有效区域的空间均值；不跨通道取平均，不包含 padding，也不置零。候选框中心不变：1.5倍范围是全替换核心，1.5至2倍用 smoothstep 羽化，2倍之外不修改。掩码按特征格面积积分，小于一个格的框仍有非零干预。越界部分自然裁剪。
+
+CRV 自己按精确 resize/pad ratio 计算每个格的有效面积权重，边界半格不能当作完整有效格。均值和池化使用该权重；mask 积分裁剪至有效图像范围，再除以格内有效面积得到替换强度。原 DETR/Grab 的有效格 mask 不改，因此基线数据流不受这项修正影响。有效面积处理是对已有特征格的加权近似，不能消除编码器特征已经融合的 padding/上下文信息。
 
 ```text
-训练 intervention：6 个预测候选 + 1 个精确 refer GT
-推理 intervention：6 个预测候选
+V_mask = (1-M) * V + M * mean_valid(V)
 ```
 
-精确 GT 只为 `loss_counterfactual` 提供稳定正监督，不进入最终候选集合，不参与最终输出。验证和测试完全不把 GT 传给 CRV。
+原场景和所有 mask 场景使用相同的原始通道均值；不是每次遮挡后重新计算。padding 不进入均值或匹配。mask 不作用于语言，不使用辅助 regions 的语义标签。
 
-## 4. 坐标、padding 与 feature-level mask
+## 4. 最终加权
 
-预测框和 refer GT 都是相对有效 resize 图像归一化的 `cxcywh`。最大 SimFPN 特征对应的是 pad 后画布，因此先使用有效宽高比例映射：
+CRS 的原始 logit 为 z_i，CRV 差值为 d_i：
 
 ```text
-valid_ratio = [valid_width / padded_width,
-               valid_height / padded_height]
-
-center_on_canvas = center × valid_ratio
-size_on_canvas   = size × valid_ratio
+u_i             = d_i / temperature
+evidence_i      = max_residual * u_i / (1 + abs(u_i))
+alpha          = sigmoid(G(stats))
+final_logit_i  = stopgrad(z_i) + alpha * evidence_i
+final_score_i  = sigmoid(final_logit_i)
 ```
 
-这保证长宽比缩放并 pad 到 `586×586` 后，mask 仍与目标在特征图上的位置一致。
+这是自适应加权残差融合，而不是丢弃 CRS 或两个概率强行平均。CRS 提供基础匹配，CRV 负责候选修正。默认 max_residual=2、temperature=1。每图门控 G 是6→32→1的 MLP；输入为选中 CRS 概率的均值、最高值、Top1/Top2差值、标准差，以及 drop 的平均绝对值和标准差。统计量也 detach，但 G 参数由最终候选排序损失训练。
 
-每个视觉通道在有效图像区域内分别计算空间均值：
+使用 softsign 而不是 tanh：仍有界，但大 drop 的导数按多项式衰减，不会像 tanh 在常见的大值（例如11、12）上变成完全相同的FP32常数。辅助损失也监督变换后的 evidence 差距，不能只让原始 drop 达到 margin 却忽略实际融合区分度。
+
+不把 drop 减去候选均值：这种中心化会让共享的原场景分数代数抵消。本版直接使用原始差值，原场景与 mask 场景都在梯度图中；非线性 evidence 差值一般使原场景也收到排序梯度，但不保证每个输入都具有非零原场景梯度（例如零初始化时各候选导数相同）。没有绝对场景支持度监督，g 不是校准后的概率。
+
+独立场景评分器最后一层零初始化，使初始所有 d_i=0、最终 logit 精确等于选中 CRS logit。alpha 初始为0.1，只是门控初始化，不是固定融合系数；无需阶段训练、预热或 val 搜索。场景网络开始学习后，alpha 才获得有效更新信号。
+
+修正是有界的，因此不能保证改正任意大的 CRS 分数差；Top-K 没有正确框时也不能创造目标框。
+
+门控学习的目标是“有助于正负候选分离”，不是“把每个错误候选的绝对概率压到0”。对于一组合法正负候选，设 `Delta_e = evidence_positive - evidence_negative`，则最终排序损失对 alpha 的导数是 `-sigmoid(margin-final_gap)*Delta_e`。因此 Delta_e>0 时推动 alpha 增大，Delta_e<0 时推动 alpha 减小；不依赖两者的共同分数偏移。多个 pair 求均值后是其综合贡献，不保证 alpha 始终增大，更不强迫无效 CRV 参与。没有阶段训练、val 搜索或人为下限。
+
+## 5. 监督：仅两项新增目标
+
+保留原 `loss_det`、`loss_refer` 和可选 Grab `loss_filter`。原 loss_refer 仍在进入 CRV 前的全部 CRS 候选上计算，不能删除它：CRS 分数被 detach 后，不会从新损失获得梯度。
+
+CRV 标签只使用原始 refer GT，绝不把 teacher 框或其他前景框当 refer GT：
+
+计算标签 IoU 前，把预测框和 GT 裁剪至有效图像边界，与推理 detector_postprocess 的裁剪一致；不是裁剪至 padded 区域。
+
+- IoU>0.5：正候选。
+- IoU=0：负候选。
+- 0<IoU<=0.5（含恰好0.5）：忽略。
+- 原框不相交，但扩张后的 mask 删除超过5%的 refer GT 区域：从可靠负候选中移除。比例按 mask 强度加权，不改变评价 IoU 规则。
+
+L_final：融合 logit 上的正负 pairwise logistic ranking：
 
 ```text
-neutral[b,c] = mean(visual[b,c,valid_pixels])
+softplus(margin - final_logit_positive + final_logit_negative)
 ```
 
-padding 区先用对应通道均值填充。候选区域也使用该通道均值替换，不是置零，也不是把 256 个通道混成一个均值。
+对所有合法正负 pair 求图内均值，再按有效图求均值。没有合法正负双方时，该图为可反向的零，不能凭空监督 alpha。所有正确 proposal 都是正样本，不人为只保留一个，也不让多个正确候选相互竞争。该项替代 v1 的最终 BCE，不是额外增加第三项损失。
 
-软 mask 规则：
-
-- 候选原框到 `1.5×` 框范围：mask=1，完全替换为通道均值；
-- `1.5×` 到 `2.0×`：使用 smoothstep 羽化；
-- `2.0×` 以外：mask=0，保留原特征。
-
-干预先发生在最大空间特征上，然后池化：
+L_cf：同图正负 CRV evidence 的轻量 margin ranking：
 
 ```text
-原特征/逐候选 mask 特征：[B,256,Hf,Wf]
-adaptive average pooling
-→ [B,256,24,24]
-1×1 visual projection
-→ [B,256,24,24]
+max(0, margin - evidence_positive + evidence_negative)
 ```
 
-训练时场景数为 `1+6+1=8`（原场景、6 个候选 mask、1 个 GT mask）；推理时为 `1+6=7`。
-
-## 5. 完整文本与场景评分网络
-
-同一份完整文本用于原场景和所有 mask 场景，不进行候选条件化：
+正集合含 Top-K 正预测框及一份精确 refer-GT 干预；负集合只有 Top-K 的可靠负候选。margin=0.5。先按图内合法 pair 求均值，再按有效图求均值；没有 pair 时为可反向的零。Top-K 没正确预测框时，精确 GT 仍能与可靠负候选提供辅助训练。GT 不成为输出候选。
 
 ```text
-视觉 memory：24×24=576 tokens，每个 token 256 维
-文本 query：  64 text tokens + 1 support token
+loss_crv = 0.5 * (L_final + 0.1 * L_cf)
+total    = 原基线损失 + loss_crv
 ```
 
-视觉 token 加二维正弦位置编码。文本先经过线性投影，然后与一个可学习 support token 拼接。它们进入共享的两层、八头 Transformer Decoder：
+默认新增有效权重：L_final=0.5，L_cf=0.05。日志 `crv_final`/`crv_cf` 是未加权诊断值，不重复加进总 loss。`loss_crv` 是已加权总项。`crv_alpha` 是门控均值，`crv_pairs` 是有合法正负候选、能够训练门控的图像比例（0至1）；没有正框时 GT 干预仍可训练辅助评分，但不能让该图获得虚假的最终排序标签。没有绝对 support BCE、特征对齐或新增第三项损失。
 
-```text
-queries = [support_token; full_text_tokens]  # [65,256]
-memory  = scene_visual_tokens               # [576,256]
-decoded = SharedSceneVerifier(queries, memory)
-support_logit = MLP(decoded_support_token)   # 标量
-```
+## 6. 梯度边界
 
-原场景只计算一次支持度，所有候选共享同一个 `S_orig`。verifier dropout 为 0，原场景和 mask 场景之间不会引入独立 dropout 噪声。
+| 损失 | 作用 |
+| --- | --- |
+| 原 loss_det | 原检测相关参数与主干，保持原逻辑 |
+| 原 loss_refer | 原 CRS、refer_adapter、候选特征生成路径及主干 |
+| 原 Grab loss_filter | 原 Grab/基线相关参数 |
+| L_final | 新独立 CRV 网络 + fusion_gate |
+| L_cf | 新独立 CRV 网络；不直接训练 fusion_gate |
 
-绝对的 `sigmoid(support_logit)` 不是概率监督目标；真正用于训练和融合的是同一评分器产生的 logit 差值 `drop`。
+全部新损失不更新 BEiT-3、SimFPN、检测 decoder、DetHead、Grab、refer_adapter 或 CRS。基线参数和 CRV 参数分别裁剪梯度，避免新损失改变基线裁剪范数。新增模块初始化使用 fork_rng，不改变基线模块初始化；新评分器 dropout=0，不引入配对噪声或额外随机数消耗。
 
-## 6. 训练标签
+这保护基线的直接训练路径，不保证最终融合排序不变；排序变化正是新模块目的。严格训练复现实验仍需相同数据、随机种子、batch、优化器、硬件和确定性设置。
 
-标签只由预测候选与原始 refer GT 的 box IoU 决定：
-
-```text
-IoU > 0.5：       正候选
-IoU = 0：         完全不相交的负候选
-0 < IoU <= 0.5：  忽略
-```
-
-代码使用严格的 `>`，因此恰好 `IoU=0.5` 的候选属于忽略区。评价指标仍按视觉定位标准使用 `IoU>=0.5`。
-
-精确 refer GT intervention 始终作为 `loss_counterfactual` 的正样本。Teacher 框只参与 DETR proposal 检测监督，不替代 refer GT，也不直接进入 CRV 标签。
-
-## 7. `loss_counterfactual`
-
-定义：
-
-```text
-P = Top-K 中所有 IoU>0.5 的候选 + 精确 refer GT intervention
-N = Top-K 中所有 IoU=0 的候选
-d = support_drop_logit
-m_pos  = 0.5
-m_rank = 0.2
-```
-
-### 7.1 正样本差值约束
-
-```text
-L_pos = mean_{p∈P} ReLU(m_pos - d_p)
-```
-
-要求删除真实目标后支持度至少下降 `0.5` logit。
-
-### 7.2 负样本不变约束
-
-```text
-L_neg = mean_{n∈N} SmoothL1(d_n, 0)
-```
-
-要求删除完全不相交的错误候选时，完整文本支持度尽量不变。
-
-### 7.3 正负 pairwise 排序
-
-```text
-L_cf_rank = mean_{p∈P,n∈N} ReLU(m_rank - d_p + d_n)
-```
-
-每个正候选分别与每个负候选比较。多个正确 proposal 之间不使用 softmax，不会互相竞争。
-
-```text
-loss_counterfactual = L_pos + L_neg + L_cf_rank
-```
-
-即使 CRS Top-K 中暂时没有正确 proposal，精确 GT intervention 仍可通过 `L_pos` 和 `L_cf_rank` 训练 CRV。若某项没有有效样本，其值为保持计算图的 0。
-
-该损失不依赖 CRS 分值，只更新 CRV 参数。
-
-## 8. 融合与 `loss_final_rank`
-
-CRV 不使用可学习 alpha，也不在验证集搜索融合系数：
-
-```text
-raw_logit_i = logit(clamp(raw_crs_score_i, 1e-6, 1-1e-6))
-residual_i  = tanh(drop_i)                 # (-1,1)
-final_logit_i = raw_logit_i + residual_i
-final_score_i = sigmoid(final_logit_i)
-```
-
-`tanh` 把 CRV 对单个候选的修正限制在 1 logit 内。support head 最后一层全零初始化，因此初始化时：
-
-```text
-drop = 0
-residual = 0
-final_score = raw_crs_score
-```
-
-最终排序损失直接监督推理使用的 `final_logit`：
-
-```text
-L_final = mean_{p∈P_pred,n∈N} ReLU(m_rank - final_logit_p + final_logit_n)
-```
-
-其中 `P_pred` 只包含 Top-K 中的 `IoU>0.5` 预测候选，不包含额外 GT intervention。没有预测正候选或没有完全不相交负候选时，该样本无法组成 pair，`L_final` 跳过。
-
-## 9. 梯度边界
-
-当前目标是：
-
-```text
-loss_counterfactual → 只更新 CRV
-loss_final_rank     → 只更新 CRV
-```
-
-进入 CRV 前，以下输入全部截断梯度：
-
-```text
-visual       = stopgrad(max_fpn_feature)
-boxes        = stopgrad(predicted_boxes)
-text         = stopgrad(full_text_feature)
-refer_scores = stopgrad(raw_crs_scores)
-```
-
-因此：
-
-- CRV 的两个损失都不能更新 CRS；
-- CRV 也不能更新 `refer_adapter`、Grab、DETR、SimFPN、BEiT-3 或文本特征；
-- CRS 只由原始 PropVG 的 `loss_refer` 训练；
-- 训练和推理都只执行一次 CRS，使用同一套 CRS Top-K 和融合基线；
-- `loss_final_rank` 仍可通过 residual 路径完整训练 CRV 自身。
-
-训练循环把 CRV 参数和其余参数分组裁剪。CRV 自身的大梯度不会通过共同全局范数间接缩小 CRS 或其余 PropVG 参数的梯度。
-
-## 10. 总损失与实际权重
-
-```text
-loss_crv_internal = loss_counterfactual + loss_final_rank
-loss_crv_total    = 0.5 × loss_crv_internal
-
-loss_total = loss_det
-           + loss_refer
-           + loss_filter
-           + loss_mask
-           + loss_crv_total
-```
-
-当前 AerialVG 配置中 `enable_grab=False` 且没有 mask GT，所以 `loss_filter=0`、`loss_mask=0`。
-
-外部 `loss_weight["crv"]=0.5` 同时作用于两个 CRV 损失，但这些梯度只进入 CRV。原始 `loss_refer` 对 CRS 和前面网络的正常训练路径不变。
-
-日志含义：
-
-```text
-loss_crv       = 0.5 × (crv_cf + crv_final_rank)
-crv_cf         = 未乘 0.5 的 loss_counterfactual
-crv_final_rank = 未乘 0.5 的 loss_final_rank
-```
-
-`crv_final_rank=0` 可能表示当前 batch 没有有效正负 pair，也可能表示所有有效 pair 已满足 0.2 margin，不等同于模块没有运行。
-
-## 11. 训练与推理差异
-
-| 项目 | 训练 | 验证/测试 |
-|---|---|---|
-| CRS 前向 | 原始前向一次 | 原始前向一次 |
-| 精确 refer GT mask | 使用，仅训练 CRV | 不使用 |
-| 候选 mask | CRS Top-6 | CRS Top-6 |
-| Teacher/辅助框进入 CRV | 否 | 否 |
-| 输出候选数 | 6（训练预测仅供内部使用） | 6 |
-| 最终排序 | CRS logit + CRV residual | CRS logit + CRV residual |
-
-验证和测试只用 GT 在模型外计算 Top-1 Acc@0.5、Top-5 Acc@0.5 和 top-1 box mIoU，不发生数据泄露。
-
-## 12. 当前配置
+## 7. 训练与评估
 
 ```python
-enable_grab = False
-enable_crv = True
-crv_topk = 6
-
-crv = dict(
-    topk=6,
-    verifier_dim=256,
-    grid_size=24,
-    num_heads=8,
-    num_layers=2,
-    verifier_dropout=0.0,
-    core_expansion=1.5,
-    feather_expansion=2.0,
-    neutral_mode="mean",
-    positive_drop_margin=0.5,
-    rank_margin=0.2,
-    positive_iou_threshold=0.5,
-    detach_inputs=True,
-)
+enable_crv = True     # 新独立 CRV
+enable_crv = False    # 只运行原 CRS 流程
+crv_topk = 8
+crv_grid_size = 24
+crv_cf_loss_weight = 0.1
 ```
 
-当前快速实验还使用：
+AerialVG 配置保持开启；AerialSense 保留原来的 False，需要实验时再改 True。Teacher/Grab、学习率、epoch、图像尺寸、数据划分等设置不因本次变更自动改变。
 
-```text
-train = 官方 val：vg_val_odvg.jsonl + teacher_valset.json
-val   = 官方 test：vg_test_odvg.jsonl
-test  = 官方 test：vg_test_odvg.jsonl
+```bash
+python tools/train.py configs/aerialvg/PropVG-aerialvg.py
+
+# 两卡单次训练；不修改你现有的 dist_train.sh
+CUDA_VISIBLE_DEVICES=2,3 python -m torch.distributed.run --nproc_per_node=2 --master_port=29501 tools/train.py configs/aerialvg/PropVG-aerialvg.py --launcher pytorch
+
+# 单卡验证，并同时输出 CRS / 融合 / CRV-only 三路 CSV
+CUDA_VISIBLE_DEVICES=2 python tools/eval_crv_only.py configs/aerialvg/PropVG-aerialvg.py --checkpoint /path/to/new/top1_best.pth --split val
 ```
 
-这只是加速调试设置，`val` 与 `test` 完全相同，不是规范的最终论文划分；该设置会让基于 val 的模型选择等价于使用 test 选择模型。正式结果应恢复官方 train/val/test 独立划分。
+训练只在 train 用 refer GT 及可选 teacher 检测 GT；val/test 不加载 teacher，CRV 推理调用不传任何 GT。GT 只在模型外计算 Top1 Acc@0.5、Top5 Acc@0.5、box mIoU。三项显示百分数；mIoU 是最高分候选框与 refer GT 的 IoU 平均，不是最佳框 IoU，也不是分割 mIoU。
 
-## 13. 当前保留的限制
+三路评估使用同一候选集合和同一次前向。CRV-only 按原始 drop 排序，CRS-only 按原始 CRS logit 排序，融合按 final_logit 排序；sigmoid 概率只用于显示，不因大 logit 被量化成并列概率而丢失顺序。后处理额外输出 `ranking_logits`，训练验证、三路评估与数据集可视化都会优先使用该字段。真正相同的 logit 用稳定排序处理。关闭 CRV 时保持原概率输出和原排序逻辑。
 
-1. 描述中的参考物体如果进入 Top-K 且与 refer GT 完全不重叠，会被当成负候选；当前按要求不做参考物体保护。
-2. 负候选框自身即使 `IoU=0`，其 `2×` 羽化 mask 仍可能覆盖邻近 refer GT；当前按要求不再使用扩张 mask 覆盖率过滤。
-3. CRV 只能重排 CRS Top-6，正确目标不在 Top-6 时无法找回；当前不做候选去重或扩大 K。
-4. 只使用最大 SimFPN 特征，不融合其他尺度。
-5. support 绝对值未校准为概率，只有 `drop`、residual 和最终融合分数具有训练定义。
-6. Top-5 是融合后 6 个候选中的前 5 个，因此 CRV 可能把原始 CRS 第 5 名与第 6 名互换，Top-5 既可能升也可能降。
-7. 当前各损失对 batch 内所有有效候选或正负 pair 直接求全局平均，因此有效 pair 更多的样本权重也更大，而不是严格的逐图等权。
+CRS-only 不是另训的基线模型。K>=5 时与完整候选集合上的同一 logit 排序一致；与历史概率排序对比时，还要考虑浮点量化并列。K<5 时 Top5 对照受候选截断影响。多卡训练时 val 仍采用原分布式验证流程，最后 test 只在主进程单卡执行；现有分布式 val sampler 的末尾补齐不属于 CRV，本次未改变该逻辑。
 
-## 14. 代码位置与验证
+checkpoint 的 `independent_version=2`。旧 CRV（包括独立v1）与本版训练/评分语义不兼容，版本标记拒绝静默混用。三路评估还会拒绝缺少 CRV 权重的纯基线 checkpoint，避免把随机初始化模块当作训练结果。不要把旧 optimizer/CRV 权重 resume 到这版。使用原 BEiT-3 初始化从新实验训练；如需历史模型，请使用相应实验里的源码快照/删除前备份。
 
-- CRV 核心：`propvg/models/heads/crv.py`
-- CRS/CRV 接入与梯度截断：`propvg/models/heads/REFHead.py`
-- 损失汇总和独立梯度裁剪：`propvg/apis/train.py`
-- 当前配置：`configs/aerialvg/PropVG-aerialvg.py`
-- 三种分数评估：`tools/eval_crv_only.py`
-- 原场景/GT mask/候选 mask 可视化：`tools/visualize_crv_scores.py`
+## 8. 代码入口与功能验证
 
-已完成的代码级验证：
+- `propvg/models/heads/crv.py`：唯一 CRV 类、均值 mask、独立图文网络、门控与两项损失。
+- `propvg/models/heads/REFHead.py`：原 CRS 不变，训练收集 refer GT，推理无 GT，只接最大检测特征。
+- `propvg/apis/train.py`：累加新 loss、分组梯度裁剪、诊断日志。
+- `tools/check_crv.py`：功能、初始化、坐标、监督规则、梯度与 DDP 检查。
+- `tools/smoke_crv.py`：真实数据和 BEiT-3 前向、头部反向、无 GT 推理，不启动正式训练。
+- `tools/eval_crv_only.py`：当前独立 CRV 三路评价，无旧模式兼容。
 
-- Python 编译和 `git diff --check`；
-- 合成 batch 训练、反向和无 GT 推理；
-- `IoU>0.5`、`IoU=0` 和忽略区标签检查；
-- 多个正候选均获得独立 pairwise 梯度；
-- `loss_counterfactual` 不产生 CRS 分数梯度；
-- `loss_final_rank` 不产生 CRS 梯度；
-- CRV 不向视觉特征、候选框或文本输入回传梯度；
-- 初始融合分数严格等于 CRS 分数；
-- 原场景支持度在全部候选之间严格共享。
+当前版本验证结果写入 `reports/independent_crv_v2_*.json`；不把旧v1报告当作本版证据。功能测试不证明 grounding 精度提升，诊断采用 no_grad 主干时也不代表完整训练的显存消耗。检查包括门控正确/错误梯度方向、大 drop 非零梯度、变换后证据差距、精确边界面积、logit 量化并列、后处理及评价、基线梯度隔离与两rank同步。
 
-旧版候选条件文本 CRV 的 checkpoint 与当前结构、监督目标均不同，不能作为当前设计的公平结果；正式比较应重新训练。
+2026-09-28 本版检查结果：
+
+- [CPU 检查](reports/independent_crv_v2_cpu.json)：28项中27项通过，1项两卡检查按预期跳过，无失败。
+- [GPU + 两卡 NCCL 检查](reports/independent_crv_v2_gpu_ddp.json)：28项全部通过；两rank各执行3个优化器步，确认同步。覆盖旧 checkpoint 拒绝和新 checkpoint 单次加载。
+- [AerialVG 真实数据检查](reports/independent_crv_v2_aerialvg_smoke.json)：BEiT-3 前向、真实头部反向、CRV 梯度隔离、验证无 GT 输入均通过；256候选输入，8个输出框。
+- [AerialSense 真实数据检查](reports/independent_crv_v2_aerialsense_smoke.json)：同样通过；128候选输入，8个输出框。只在检查进程临时开启 CRV，不修改配置开关。
+
+两份真实数据检查中的随机初始化候选未命中 refer GT，因此 `crv_pairs=0`、`crv_final=0`，精确 GT 的辅助项仍为非零；这是监督规则的预期结果，不代表门控已学会。未启动正式训练、未保存训练 checkpoint，不能据此声称准确率提升。

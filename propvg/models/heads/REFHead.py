@@ -321,8 +321,8 @@ class CRS(nn.Module):
         )
         return lan_feat_pooler
 
-    def forward(self, query_feat, lan_feat, lan_mask):
-        text_pos_embed = self.position_embedding_1d(lan_feat).unsqueeze(0).repeat(lan_feat.shape[0], 1, 1).cuda()
+    def forward(self, query_feat, lan_feat, lan_mask, return_logits=False):
+        text_pos_embed = self.position_embedding_1d(lan_feat).unsqueeze(0).repeat(lan_feat.shape[0], 1, 1).to(query_feat.device)
         # Word level Attention
         query_embed, proposal_word_attnmap = self.word_attn(
             query=query_feat,
@@ -345,8 +345,11 @@ class CRS(nn.Module):
         )
         query_word_score, query_word_index = similarity_word.max(dim=-1, keepdim=True)
         weight = (self.refer_linear(lan_feat_maxpooling).reshape(lan_feat_maxpooling.size(0), 1, 1)).sigmoid()
-        refer_score = (query_sent_cons_score * weight + query_word_score * (1 - weight)).sigmoid()
+        refer_logit = query_sent_cons_score * weight + query_word_score * (1 - weight)
+        refer_score = refer_logit.sigmoid()
 
+        if return_logits:
+            return refer_score, proposal_word_attnmap, refer_logit
         return refer_score, proposal_word_attnmap
 
 
@@ -526,10 +529,14 @@ class REFHead(nn.Module):
         # query features only; proposal boxes and the original PropVG losses
         # remain unchanged.
         self.grab_binding = GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48)
-        self.crv = (
-            CounterfactualReferentVerifier(hidden_channels=hidden_channels, **(crv or {}))
-            if enable_crv else None
-        )
+        self.crv = None
+        if enable_crv:
+            # Preserve baseline initialization/RNG when the independent branch
+            # is enabled. No decoder, Grab or CRS parameters are shared.
+            with torch.random.fork_rng(devices=[]):
+                self.crv = CounterfactualReferentVerifier(
+                    hidden_channels=hidden_channels, **copy.deepcopy(crv or {})
+                )
         self.dist_head = MTDv2(hidden_channels, MTD["K"])
         self.num_queries = num_queries
         self.refer_class_embed = nn.Linear(hidden_channels, 1 + 1)
@@ -565,7 +572,9 @@ class REFHead(nn.Module):
 
     def prepare_referring_targets(self, valid_indices, refer_index, query_num):
         B = len(valid_indices)
-        result = torch.zeros((B, query_num), dtype=torch.float32).cuda()
+        # Hungarian indices are CPU tensors even when the model is on CUDA.
+        device = self.query_embed.weight.device
+        result = torch.zeros((B, query_num), dtype=torch.float32, device=device)
         for i, (inds, refer_ind) in enumerate(zip(valid_indices, refer_index)):
             query_ind, target_ind = inds
             # find the relative refered query index
@@ -587,6 +596,14 @@ class REFHead(nn.Module):
             x_mask[img_id, :valid_h, :valid_w] = False
         x_pos_embeds = self.position_embedding(x_mask)
         return x_mask, x_pos_embeds
+
+    @staticmethod
+    def _crv_valid_ratios(visual, img_metas):
+        # Use exact resize/pad geometry, not rounded valid-cell counts.
+        return visual.new_tensor([
+            [meta["img_shape"][1] / meta["pad_shape"][1],
+             meta["img_shape"][0] / meta["pad_shape"][0]] for meta in img_metas
+        ])
 
     def forward_train(self, x, targets, cls_feat=None, lan_feat=None, lan_mask=None, img=None):
         device = x.device
@@ -684,7 +701,12 @@ class REFHead(nn.Module):
         refer_query_embed = self.refer_adapter(bound_queries)
 
         # refer_label - sigmoided
-        refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
+        if self.enable_crv:
+            refer_label, proposal_word_attnmap, refer_logits = self.mrsm(
+                refer_query_embed, lan_feat, lan_mask, return_logits=True
+            )
+        else:
+            refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
 
@@ -713,7 +735,7 @@ class REFHead(nn.Module):
             refer_gt_valid = []
             for normalized_targets, refer_index in zip(target_gt, refer_indices):
                 refer_index = torch.as_tensor(refer_index, device=device, dtype=torch.long).flatten()
-                valid_index = refer_index.numel() > 0 and int(refer_index[0]) < len(normalized_targets["boxes"])
+                valid_index = refer_index.numel() > 0 and 0 <= int(refer_index[0]) < len(normalized_targets["boxes"])
                 if valid_index:
                     refer_gt_boxes.append(normalized_targets["boxes"][refer_index[0]])
                 else:
@@ -722,14 +744,11 @@ class REFHead(nn.Module):
             refer_gt_boxes = torch.stack(refer_gt_boxes)
             refer_gt_valid = torch.as_tensor(refer_gt_valid, device=device, dtype=torch.bool)
             crv_output = self.crv(
-                visual=multi_level_feats[0],
-                visual_mask=multi_level_masks[0],
-                boxes=bound_boxes,
-                refer_scores=refer_score,
-                text=lan_feat,
-                text_mask=lan_mask,
-                target_boxes=refer_gt_boxes,
-                target_valid=refer_gt_valid,
+                visual=multi_level_feats[0], visual_mask=multi_level_masks[0],
+                boxes=bound_boxes, refer_scores=refer_score, refer_logits=refer_logits,
+                text=lan_feat, text_mask=lan_mask,
+                valid_ratios=self._crv_valid_ratios(multi_level_feats[0], img_metas),
+                target_boxes=refer_gt_boxes, target_valid=refer_gt_valid,
             )
             crv_indices = crv_output["indices"]
             bound_boxes = gather_candidates(bound_boxes, crv_indices)
@@ -737,21 +756,22 @@ class REFHead(nn.Module):
             refer_score = crv_output["weighted_scores"]
             loss_crv = crv_output["loss"] * self.loss_weight.get("crv", 1.0)
             crv_cf_metric = crv_output["loss_counterfactual"].detach()
-            crv_final_rank_metric = crv_output["loss_final_rank"].detach()
-            extra_dict["crv_original_support_logits"] = crv_output["original_support_logits"].detach()
-            extra_dict["crv_masked_support_logits"] = crv_output["masked_support_logits"].detach()
-            extra_dict["crv_relative_support_scores"] = crv_output["relative_support_scores"].detach()
-            extra_dict["crv_support_drop_logits"] = crv_output["support_drop_logits"].detach()
-            extra_dict["crv_importance_scores"] = crv_output["importance_scores"].detach()
-            extra_dict["crv_fusion_residual_logits"] = crv_output["fusion_residual_logits"].detach()
-            extra_dict["crv_fused_logits"] = crv_output["fused_logits"].detach()
-            extra_dict["crv_gt_support_drop_logits"] = crv_output["gt_support_drop_logits"].detach()
+            crv_final_metric = crv_output["loss_final"].detach()
+            crv_alpha_metric = crv_output["fusion_alpha"].detach().mean()
+            crv_pair_metric = crv_output["valid_pair_images"].float().mean()
+            for name in ("original_support_logits", "masked_support_logits",
+                         "support_drop_logits", "fusion_alpha",
+                         "fusion_residual_logits", "fused_logits", "raw_crs_logits",
+                         "gt_support_drop_logits", "selected_ious"):
+                value = crv_output[name]
+                extra_dict["crv_" + name] = value.detach() if value is not None else None
             extra_dict["crv_selected_indices"] = crv_indices.detach()
-            extra_dict["crv_selected_ious"] = crv_output["selected_ious"].detach()
         else:
             loss_crv = x.sum() * 0.0
             crv_cf_metric = loss_crv.detach()
-            crv_final_rank_metric = loss_crv.detach()
+            crv_final_metric = loss_crv.detach()
+            crv_alpha_metric = loss_crv.detach()
+            crv_pair_metric = loss_crv.detach()
 
         # ! seg loss
         loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"]) if target_mask is not None else x.sum() * 0.0
@@ -781,7 +801,9 @@ class REFHead(nn.Module):
             # Logging-only diagnostics; train.py deliberately excludes them
             # from the summed optimization loss.
             "metric_crv_cf": crv_cf_metric,
-            "metric_crv_final_rank": crv_final_rank_metric,
+            "metric_crv_final": crv_final_metric,
+            "metric_crv_alpha": crv_alpha_metric,
+            "metric_crv_pairs": crv_pair_metric,
         }
 
         pred_dict = {
@@ -789,6 +811,7 @@ class REFHead(nn.Module):
             "pred_class_allobj": selected_classes.detach(),
             "pred_bbox_allobj": bound_boxes.detach(),
             "refer_label": refer_score.detach(),
+            "refer_logits": crv_output["fused_logits"].detach()[..., None] if self.enable_crv else None,
             "att_map": att_map[-1].detach(),
         }
         return loss_dict, pred_dict, extra_dict
@@ -881,30 +904,35 @@ class REFHead(nn.Module):
         refer_query_embed = self.refer_adapter(bound_queries)
 
         # refer_label - sigmoided
-        refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
+        if self.enable_crv:
+            refer_label, proposal_word_attnmap, refer_logits = self.mrsm(
+                refer_query_embed, lan_feat, lan_mask, return_logits=True
+            )
+        else:
+            refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
 
         if self.enable_crv:
+            metas = targets["img_metas"] if targets is not None else [
+                {"img_shape": img.shape[-2:], "pad_shape": img.shape[-2:]}
+                for _ in range(img.shape[0])
+            ]
+            # Intentionally no refer GT, teacher GT, matcher or decoder inputs.
             crv_output = self.crv(
-                visual=multi_level_feats[0],
-                visual_mask=multi_level_masks[0],
-                boxes=bound_boxes,
-                refer_scores=refer_score,
-                text=lan_feat,
-                text_mask=lan_mask,
+                visual=multi_level_feats[0], visual_mask=multi_level_masks[0],
+                boxes=bound_boxes, refer_scores=refer_score, refer_logits=refer_logits,
+                text=lan_feat, text_mask=lan_mask,
+                valid_ratios=self._crv_valid_ratios(multi_level_feats[0], metas),
             )
             crv_indices = crv_output["indices"]
             bound_boxes = gather_candidates(bound_boxes, crv_indices)
             selected_classes = gather_candidates(selected_classes, crv_indices)
             refer_score = crv_output["weighted_scores"]
-            extra_dict["crv_original_support_logits"] = crv_output["original_support_logits"].detach()
-            extra_dict["crv_masked_support_logits"] = crv_output["masked_support_logits"].detach()
-            extra_dict["crv_relative_support_scores"] = crv_output["relative_support_scores"].detach()
-            extra_dict["crv_support_drop_logits"] = crv_output["support_drop_logits"].detach()
-            extra_dict["crv_importance_scores"] = crv_output["importance_scores"].detach()
-            extra_dict["crv_fusion_residual_logits"] = crv_output["fusion_residual_logits"].detach()
-            extra_dict["crv_fused_logits"] = crv_output["fused_logits"].detach()
+            for name in ("original_support_logits", "masked_support_logits",
+                         "support_drop_logits", "fusion_alpha",
+                         "fusion_residual_logits", "fused_logits", "raw_crs_logits"):
+                extra_dict["crv_" + name] = crv_output[name].detach()
             extra_dict["crv_selected_indices"] = crv_indices.detach()
 
         pred_dict = {
@@ -912,6 +940,7 @@ class REFHead(nn.Module):
             "pred_class_allobj": selected_classes.detach(),
             "pred_bbox_allobj": bound_boxes.detach(),
             "refer_label": refer_score.detach(),
+            "refer_logits": crv_output["fused_logits"].detach()[..., None] if self.enable_crv else None,
             "att_map": att_map[-1].detach(),
         }
         return pred_dict, extra_dict

@@ -141,7 +141,8 @@ def main():
     prediction = outputs["pred_bboxes"][0]
     scores = prediction["scores"].detach().reshape(-1).cpu()
     boxes = prediction["boxes"].detach().cpu()
-    order = scores.argsort(descending=True)[: min(args.topk, len(scores))]
+    ranking = prediction.get("ranking_logits", prediction["scores"]).detach().reshape(-1).cpu()
+    order = ranking.argsort(descending=True, stable="ranking_logits" in prediction)[: min(args.topk, len(scores))]
     ranked_scores = scores[order].numpy()
     ranked_boxes = boxes[order].numpy()
 

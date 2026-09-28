@@ -20,15 +20,16 @@ export NCCL_PROTO=Simple
   configs/aerialvg/PropVG-aerialvg.py \
   --launcher pytorch
 
+export CUDA_VISIBLE_DEVICES=0,1,2
 /media/vision/lzy/.conda/envs/propvg/bin/python -m torch.distributed.run \
-  --nproc_per_node=4 \
+  --nproc_per_node=3 \
   --master_port=29500 \
   tools/train.py \
   configs/aerialvg/PropVG-aerialvg.py \
   --launcher pytorch
 
 /media/vision/lzy/.conda/envs/propvg/bin/python -m torch.distributed.run \
-  --nproc_per_node=4 \
+  --nproc_per_node=3 \
   --master_port=29500 \
   tools/train.py \
   configs/aerialvg/PropVG-aerialvg.py \

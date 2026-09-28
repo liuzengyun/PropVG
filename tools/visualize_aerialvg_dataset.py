@@ -101,7 +101,8 @@ def main():
                 boxes = prediction["boxes"].detach().cpu()
                 metric_k = min(5, len(scores))
                 draw_k = min(args.topk, len(scores))
-                order = scores.argsort(descending=True)[: max(metric_k, draw_k)]
+                ranking = prediction.get("ranking_logits", prediction["scores"]).detach().reshape(-1).cpu()
+                order = ranking.argsort(descending=True, stable="ranking_logits" in prediction)[: max(metric_k, draw_k)]
                 ranked_scores = scores[order].numpy()
                 ranked_boxes = boxes[order].numpy()
                 ious = np.asarray([box_iou(box, gt_box) for box in ranked_boxes], dtype=np.float32)

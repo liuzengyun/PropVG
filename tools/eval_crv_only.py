@@ -30,6 +30,8 @@ def box_iou(boxes, target):
 
 
 def summarize(records):
+    if not records[0]:
+        raise ValueError("Cannot evaluate an empty dataset")
     return tuple(100.0 * torch.stack(values).float().mean().item() for values in records)
 
 
@@ -39,11 +41,10 @@ def evaluate(model, loader, crv):
 
     def capture_crv(_module, _args, output):
         captured["drop"] = output["support_drop_logits"].detach()
-        # Recover the selected raw CRS probability exactly from the CRV
-        # fusion identity: fused_logit = raw_crs_logit + residual_logit.
-        captured["crs"] = (
-            output["fused_logits"] - output["fusion_residual_logits"]
-        ).sigmoid().detach()
+        raw_logits = output["raw_crs_logits"]
+        captured["crs"] = raw_logits.sigmoid().detach()
+        captured["crs_logits"] = raw_logits.detach()
+        captured["alpha"] = output.get("fusion_alpha")
 
     hook = crv.register_forward_hook(capture_crv)
     fused_records = ([], [], [])
@@ -52,11 +53,13 @@ def evaluate(model, loader, crv):
     sample_rows = []
     fused_correct_crv_wrong = 0
     fused_wrong_crv_correct = 0
+    crs_wrong_fused_correct = 0
+    crs_correct_fused_wrong = 0
     different_top1 = 0
     sample_count = 0
     model.eval()
     try:
-        for inputs in tqdm(loader, total=len(loader), desc="AerialVG val: fused vs CRV-only", dynamic_ncols=True):
+        for inputs in tqdm(loader, total=len(loader), desc="CRS / fused / independent CRV", dynamic_ncols=True):
             img_metas = inputs["img_metas"].data[0]
             boxes_per_image = inputs["gt_bbox"].data[0]
             targets = [
@@ -79,12 +82,13 @@ def evaluate(model, loader, crv):
                 boxes = prediction["boxes"]
                 target = target.to(boxes.device)
                 ious = box_iou(boxes, target)
-                fused_order = prediction["scores"].reshape(-1).argsort(descending=True)
+                fused_order = prediction.get("ranking_logits", prediction["scores"]).reshape(-1).argsort(descending=True, stable=True)
                 crv_order = drops[image_index].reshape(-1).argsort(descending=True)
-                crs_order = crs_scores[image_index].reshape(-1).argsort(descending=True)
+                crs_order = captured["crs_logits"][image_index].reshape(-1).argsort(descending=True, stable=True)
                 fused_ious = ious[fused_order]
                 crv_ious = ious[crv_order]
                 crs_ious = ious[crs_order]
+                crs_ok = crs_ious[0] >= 0.5
                 fused_ok = fused_ious[0] >= 0.5
                 crv_ok = crv_ious[0] >= 0.5
                 fused_records[0].append(fused_ok.float().cpu())
@@ -98,6 +102,8 @@ def evaluate(model, loader, crv):
                 crs_records[2].append(crs_ious[0].cpu())
                 fused_wrong_crv_correct += int((~fused_ok & crv_ok).item())
                 fused_correct_crv_wrong += int((fused_ok & ~crv_ok).item())
+                crs_wrong_fused_correct += int((~crs_ok & fused_ok).item())
+                crs_correct_fused_wrong += int((crs_ok & ~fused_ok).item())
                 different_top1 += int((fused_order[0] != crv_order[0]).item())
                 meta = img_metas[image_index]
                 sample_rows.append({
@@ -106,11 +112,13 @@ def evaluate(model, loader, crv):
                     "expression": meta.get("expression", ""),
                     "crs_top1_candidate": int(crs_order[0].item()),
                     "crs_top1_score": float(crs_scores[image_index, crs_order[0]].item()),
+                    "crs_top1_logit": float(captured["crs_logits"][image_index, crs_order[0]].item()),
                     "crs_top1_iou": float(crs_ious[0].item()),
                     "crs_top1_correct": int((crs_ious[0] >= 0.5).item()),
                     "crs_top5_correct": int((crs_ious[:5].max() >= 0.5).item()),
                     "fused_top1_candidate": int(fused_order[0].item()),
                     "fused_top1_score": float(prediction["scores"].reshape(-1)[fused_order[0]].item()),
+                    "fusion_alpha": float(captured["alpha"][image_index, 0]) if captured["alpha"] is not None else None,
                     "fused_top1_iou": float(fused_ious[0].item()),
                     "fused_top1_correct": int(fused_ok.item()),
                     "fused_top5_correct": int((fused_ious[:5].max() >= 0.5).item()),
@@ -133,6 +141,8 @@ def evaluate(model, loader, crv):
         "different_top1": different_top1,
         "fused_wrong_crv_correct": fused_wrong_crv_correct,
         "fused_correct_crv_wrong": fused_correct_crv_wrong,
+        "crs_wrong_fused_correct": crs_wrong_fused_correct,
+        "crs_correct_fused_wrong": crs_correct_fused_wrong,
     }
 
 
@@ -156,7 +166,7 @@ def main():
     dataset = build_dataset(getattr(cfg.data, args.split))
     loader = build_dataloader(cfg, dataset)
     model = build_model(cfg.model, word_emb=dataset.word_emb, num_token=dataset.num_token).cuda()
-    load_checkpoint(model, load_from=args.checkpoint, dataset=cfg.dataset)
+    load_checkpoint(model, load_from=args.checkpoint, dataset=cfg.dataset, expected_crv_version=2)
     results = evaluate(model, loader, model.head.crv)
 
     fused = results["fused"]
@@ -170,6 +180,9 @@ def main():
         f"different_top1={results['different_top1']}",
         f"fused_wrong_to_crv_correct={results['fused_wrong_crv_correct']}",
         f"fused_correct_to_crv_wrong={results['fused_correct_crv_wrong']}",
+        f"crs_wrong_to_fused_correct={results['crs_wrong_fused_correct']}",
+        f"crs_correct_to_fused_wrong={results['crs_correct_fused_wrong']}",
+        f"fusion_net_corrections={results['crs_wrong_fused_correct'] - results['crs_correct_fused_wrong']}",
         "CRV-only score: support_drop_logits; CRS is retained only for raw Top-K selection.",
     ]
     report = "\n".join(lines)

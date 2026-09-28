@@ -266,16 +266,25 @@ class MIXRefUniModel_OMG(OneStageModel):
                 height = image_size[0]
                 width = image_size[1]
                 r = detector_postprocess(results_per_image, height, width)
+                rank_logits = pred.get("refer_logits")
+                # New CRV ranks in logit space. Retain sigmoid probabilities
+                # for display/thresholds and leave the disabled path unchanged.
+                rank_logits = rank_logits[ind, :, 0] if rank_logits is not None else None
+                if rank_logits is not None:
+                    kept = results_per_image.pred_boxes.nonempty()
+                    refer_score = refer_pred[ind, :, 0][kept]
+                    rank_logits = rank_logits[kept]
+                else:
+                    refer_score = refer_pred[ind][:, 0]
                 # infomation extract
                 pred_box = r.pred_boxes.tensor
                 det_score = r.scores
-                refer_score = refer_pred[ind][:, 0]
                 score = refer_score
 
                 if self.with_nms:
                     filtered_boxes = copy.deepcopy(pred_box)
                     filtered_scores = copy.deepcopy(score)
-                    filtered_indices = nms(filtered_boxes, filtered_scores, 0.7)
+                    filtered_indices = nms(filtered_boxes, rank_logits if rank_logits is not None else filtered_scores, 0.7)
                     filtered_boxes = filtered_boxes[filtered_indices]
                     filtered_scores = filtered_scores[filtered_indices]
                     nms_indices.append(filtered_indices)
@@ -292,6 +301,10 @@ class MIXRefUniModel_OMG(OneStageModel):
                     }
                 else:
                     cur_predict_dict = {"boxes": pred_box, "scores": score}
+                if rank_logits is not None:
+                    cur_predict_dict["ranking_logits"] = rank_logits
+                    if self.with_nms:
+                        cur_predict_dict["filtered_ranking_logits"] = rank_logits[filtered_indices]
                 parts_list["pred_scores"].append(score.cpu().detach().numpy())
                 parts_list["pred_box_parts"].append(pred_box.cpu().detach().numpy())
                 parts_list["det_scores"].append(det_score.cpu().detach().numpy())

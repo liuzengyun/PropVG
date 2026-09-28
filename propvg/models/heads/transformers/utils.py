@@ -24,6 +24,7 @@ import warnings
 from typing import List
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional
 from torch.nn.init import constant_, xavier_uniform_
 from torch.autograd import Function
