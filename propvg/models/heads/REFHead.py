@@ -315,7 +315,9 @@ class CRS(nn.Module):
                 map(
                     lambda feat, mask: torch.max(feat[mask, :], dim=0, keepdim=True)[0],
                     lan_feat,
-                    ~lan_mask,
+                    # Integer 0/1 masks must become bool before inversion;
+                    # otherwise ~0/~1 are -1/-2 (negative token indices).
+                    ~lan_mask.bool(),
                 )
             )
         )
@@ -757,6 +759,8 @@ class REFHead(nn.Module):
             loss_crv = crv_output["loss"] * self.loss_weight.get("crv", 1.0)
             crv_cf_metric = crv_output["loss_counterfactual"].detach()
             crv_final_metric = crv_output["loss_final"].detach()
+            crv_correct_metric = crv_output["loss_correction"].detach()
+            crv_preserve_metric = crv_output["loss_preservation"].detach()
             crv_alpha_metric = crv_output["fusion_alpha"].detach().mean()
             crv_pair_metric = crv_output["valid_pair_images"].float().mean()
             for name in ("original_support_logits", "masked_support_logits",
@@ -770,6 +774,8 @@ class REFHead(nn.Module):
             loss_crv = x.sum() * 0.0
             crv_cf_metric = loss_crv.detach()
             crv_final_metric = loss_crv.detach()
+            crv_correct_metric = loss_crv.detach()
+            crv_preserve_metric = loss_crv.detach()
             crv_alpha_metric = loss_crv.detach()
             crv_pair_metric = loss_crv.detach()
 
@@ -802,6 +808,8 @@ class REFHead(nn.Module):
             # from the summed optimization loss.
             "metric_crv_cf": crv_cf_metric,
             "metric_crv_final": crv_final_metric,
+            "metric_crv_correct": crv_correct_metric,
+            "metric_crv_preserve": crv_preserve_metric,
             "metric_crv_alpha": crv_alpha_metric,
             "metric_crv_pairs": crv_pair_metric,
         }

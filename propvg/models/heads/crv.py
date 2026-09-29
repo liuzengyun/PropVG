@@ -192,13 +192,45 @@ class CounterfactualReferentVerifier(nn.Module):
         return self.max_residual * F.softsign(drops / self.drop_temperature)
 
     @staticmethod
-    def _pairwise_ranking(logits, positive, negative, margin, smooth=True):
+    def _pairwise_ranking(logits, positive, negative, margin, smooth=False):
         pairs = positive[:, :, None] & negative[:, None, :]
         violations = margin - logits[:, :, None] + logits[:, None, :]
         values = F.softplus(violations) if smooth else F.relu(violations)
         per_image = (values * pairs).sum((1, 2)) / pairs.sum((1, 2)).clamp(min=1)
         usable = pairs.flatten(1).any(1)
         return (per_image * usable).sum() / usable.sum().clamp(min=1)
+
+    def _protected_ranking(self, raw_logits, fused_logits, positive, negative):
+        """Correct legal CRS mistakes; preserve its already-correct winner.
+
+        Gray candidates remain ignored. No labels are fabricated when Top-K
+        misses the target. Stop rewarding improvements once margins are met.
+        """
+        raw_logits = raw_logits.detach()
+        usable = positive.any(1) & negative.any(1)
+        correction_images = usable & negative[:, 0]
+        preservation_images = usable & positive[:, 0]
+        # A masked finite sentinel avoids inf-inf for missing classes; such
+        # rows are excluded below but must still have finite graph zeros.
+        floor = torch.finfo(fused_logits.dtype).min
+        best_positive = fused_logits.masked_fill(~positive, floor).max(1).values
+        hardest_negative = fused_logits.masked_fill(~negative, floor).max(1).values
+        correction = F.relu(self.rank_margin - best_positive + hardest_negative)
+        correction = torch.where(correction_images, correction, torch.zeros_like(correction))
+        # Preserve the original CRS winner, not every positive proposal. For
+        # close baseline pairs retain their original gap; otherwise require
+        # only the normal margin, rather than rewarding ever-larger gaps.
+        base_gap = raw_logits[:, :1] - raw_logits
+        required_gap = base_gap.clamp(min=0, max=self.rank_margin)
+        violations = required_gap - fused_logits[:, :1] + fused_logits
+        preservation = F.relu(violations.masked_fill(~negative, floor).max(1).values)
+        preservation = torch.where(preservation_images, preservation, torch.zeros_like(preservation))
+        active = correction_images | preservation_images
+        denominator = active.sum().clamp(min=1)
+        correction_loss = correction.sum() / denominator
+        preservation_loss = preservation.sum() / denominator
+        return (correction_loss + preservation_loss, correction_loss,
+                preservation_loss, active)
 
     def forward(self, visual, visual_mask, boxes, refer_scores, refer_logits,
                 text, text_mask, valid_ratios, target_boxes=None, target_valid=None):
@@ -252,6 +284,8 @@ class CounterfactualReferentVerifier(nn.Module):
         fused_logits = raw_logits + correction
         zero = (scene_logits.sum() + alpha.sum()) * 0
         loss_final, loss_cf = zero, zero
+        loss_correction, loss_preservation = zero, zero
+        valid_pair_images = torch.zeros(boxes.shape[0], dtype=torch.bool, device=boxes.device)
         positive = negative = selected_ious = gt_drop = None
         if target_boxes is not None:
             selected_ious = self._box_iou(selected_boxes, target_boxes)
@@ -262,11 +296,8 @@ class CounterfactualReferentVerifier(nn.Module):
             gt_coverage = self._rectangle_coverage(target_boxes[:, None], valid_ratios, *visual.shape[-2:])
             overlap = (masks[:, :k] * gt_coverage).sum((2, 3)) / gt_coverage.sum((2, 3)).clamp(min=1e-8)
             negative = negative & (overlap <= self.max_negative_gt_coverage)
-            # Pairwise logistic supervision learns the usefulness of evidence
-            # differences, not absolute probability calibration. For a valid
-            # pair with evidence_pos > evidence_neg, dL/dalpha is negative.
-            loss_final = self._pairwise_ranking(
-                fused_logits, positive, negative, self.rank_margin)
+            loss_final, loss_correction, loss_preservation, valid_pair_images = self._protected_ranking(
+                raw_logits, fused_logits, positive, negative)
             gt_drop = all_drops[:, k:k + 1]
             cf_positive = torch.cat((positive, gt_valid[:, None]), 1)
             cf_negative = torch.cat((negative, torch.zeros_like(gt_valid[:, None])), 1)
@@ -274,8 +305,6 @@ class CounterfactualReferentVerifier(nn.Module):
             # drop margins alone do not ensure a usable post-transform gap.
             loss_cf = self._pairwise_ranking(
                 all_evidence, cf_positive, cf_negative, self.rank_margin, smooth=False)
-        valid_pair_images = ((positive.any(1) & negative.any(1)) if positive is not None else
-                             torch.zeros(boxes.shape[0], dtype=torch.bool, device=boxes.device))
         return dict(
             indices=indices, weighted_scores=fused_logits.sigmoid()[..., None],
             raw_crs_logits=raw_logits, fused_logits=fused_logits, fusion_alpha=alpha,
@@ -285,5 +314,6 @@ class CounterfactualReferentVerifier(nn.Module):
             gt_support_drop_logits=gt_drop, selected_ious=selected_ious,
             positive_candidates=positive, negative_candidates=negative,
             loss_final=loss_final, loss_counterfactual=loss_cf,
+            loss_correction=loss_correction, loss_preservation=loss_preservation,
             loss=loss_final + self.cf_loss_weight * loss_cf + zero,
         )

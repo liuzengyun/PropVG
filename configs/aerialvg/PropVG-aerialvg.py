@@ -28,12 +28,12 @@ use_auxiliary_gt = False
 teacher = True
 # The teacher file must match the configured training annotation records by
 # sample_id and filename. Validation and test do not read it.
-teacher_annsfile = "data/AerialVG/teacher_trainset.json"
+teacher_annsfile = "data/AerialVG/teacher_valset.json"
 # Maximum number of extra teacher boxes per training sample after refer-GT
 # deduplication and teacher NMS. 0 uses only the original refer GT; None keeps
 # every available teacher box. The current JSON contains exactly 5 raw boxes
 # per sample, so values above 5 cannot add supervision with this file.
-teacher_max_boxes = 2
+teacher_max_boxes = 5
 # Teacher predictions overlapping the exact refer GT at or above this IoU are
 # discarded; the original refer GT remains the only target for that instance.
 teacher_dedup_iou = 0.001
@@ -83,13 +83,13 @@ val_pipeline = [
 data = dict(
     samples_per_gpu=8,
     workers_per_gpu=16,
-    train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_train_odvg.jsonl",
+    train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
                imgsfile="data/AerialVG/images", pipeline=train_pipeline,
                teacher_annsfile=teacher_annsfile if teacher else None,
                teacher_dedup_iou=teacher_dedup_iou,
                teacher_nms_iou=teacher_nms_iou,
                teacher_max_boxes=teacher_max_boxes),
-    val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
+    val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
              imgsfile="data/AerialVG/images", pipeline=val_pipeline),
     test=dict(type=dataset_type, which_set="test", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
               imgsfile="data/AerialVG/images", pipeline=val_pipeline),

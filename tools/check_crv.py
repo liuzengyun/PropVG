@@ -59,6 +59,12 @@ class CRVChecks(unittest.TestCase):
     def setUp(self):
         self.crv, self.args = fixture(self.device)
 
+    def force_crs_mistake(self):
+        logits = self.args["refer_logits"].detach().clone()
+        logits[:, 1] = 3.
+        self.args["refer_logits"] = logits.requires_grad_()
+        self.args["refer_scores"] = self.args["refer_logits"].sigmoid()
+
     def test_shapes_and_exact_zero_start(self):
         output = self.crv(**self.args)
         self.assertEqual(tuple(output["weighted_scores"].shape), (2, 8, 1))
@@ -70,6 +76,7 @@ class CRVChecks(unittest.TestCase):
         self.observations["parameter_count_256"] = sum(p.numel() for p in CounterfactualReferentVerifier().parameters())
 
     def test_loss_gradients_only_train_crv(self):
+        self.force_crs_mistake()
         activate(self.crv)
         self.crv(**self.args)["loss"].backward()
         for key in ("visual", "text", "boxes", "refer_logits"):
@@ -79,12 +86,14 @@ class CRVChecks(unittest.TestCase):
         self.assertGreater(float(self.crv.fusion_gate[-1].bias.grad.abs()), 0)
 
     def test_final_loss_trains_scorer_and_gate(self):
+        self.force_crs_mistake()
         activate(self.crv)
         self.crv(**self.args)["loss_final"].backward()
         self.assertTrue(any(p.grad is not None and p.grad.abs().sum() > 0 for p in self.crv.scene_head.parameters()))
         self.assertGreater(float(self.crv.fusion_gate[-1].bias.grad.abs()), 0)
 
     def test_final_loss_trains_original_and_masked_scenes(self):
+        self.force_crs_mistake()
         activate(self.crv)
         original_method = self.crv._match_scenes
         captured = {}
@@ -104,7 +113,7 @@ class CRVChecks(unittest.TestCase):
     def test_gate_rewards_correct_evidence_even_with_positive_common_drop(self):
         positive = torch.tensor([[True, False]], device=self.device)
         negative = ~positive
-        raw = torch.tensor([[8., 7.]], device=self.device)
+        raw = torch.tensor([[8., 8.1]], device=self.device)
         for drops, expected_sign in (([2., 1.], -1), ([1., 2.], 1)):
             alpha_logit = torch.tensor([[-2.]], device=self.device, requires_grad=True)
             alpha = alpha_logit.sigmoid()
@@ -118,6 +127,55 @@ class CRVChecks(unittest.TestCase):
         before = self.crv._pairwise_ranking(raw + alpha * evidence, positive, negative, .5)
         after = self.crv._pairwise_ranking(raw + 3 + alpha * evidence, positive, negative, .5)
         torch.testing.assert_close(before, after)
+
+    def test_satisfied_margin_stops_rewarding_alpha(self):
+        alpha = torch.tensor([[.5]], device=self.device, requires_grad=True)
+        raw = torch.tensor([[2., 1.]], device=self.device)
+        pos = torch.tensor([[True, False]], device=self.device)
+        neg = ~pos
+        loss, correction, preservation, _ = self.crv._protected_ranking(
+            raw, raw + alpha * raw, pos, neg)
+        loss.backward()
+        self.assertEqual(float(loss), 0.)
+        self.assertEqual(float(alpha.grad), 0.)
+
+    def test_preservation_penalizes_damage_but_not_initial_close_gap(self):
+        raw = torch.tensor([[1., .9]], device=self.device)
+        pos = torch.tensor([[True, False]], device=self.device)
+        neg = ~pos
+        initial = self.crv._protected_ranking(raw, raw.clone(), pos, neg)[0]
+        self.assertEqual(float(initial), 0.)
+        alpha = torch.tensor([[.2]], device=self.device, requires_grad=True)
+        fused = raw + alpha * torch.tensor([[-1., 1.]], device=self.device)
+        loss, correction, preservation, _ = self.crv._protected_ranking(raw, fused, pos, neg)
+        loss.backward()
+        self.assertEqual(float(correction), 0.)
+        self.assertGreater(float(preservation), 0.)
+        self.assertGreater(float(alpha.grad), 0.)
+
+    def test_correction_focuses_on_hardest_negative_and_best_positive(self):
+        raw = torch.tensor([[2., 1., .5, 0.]], device=self.device)
+        fused = raw.clone().requires_grad_()
+        pos = torch.tensor([[False, True, False, True]], device=self.device)
+        neg = ~pos
+        loss, correction, preservation, _ = self.crv._protected_ranking(raw, fused, pos, neg)
+        loss.backward()
+        self.assertGreater(float(correction), 0.)
+        self.assertEqual(float(preservation), 0.)
+        torch.testing.assert_close(fused.grad, torch.tensor([[1., -1., 0., 0.]], device=self.device))
+
+    def test_gray_winner_and_missing_positive_have_no_final_supervision(self):
+        raw = torch.tensor([[2., 1., 0.]], device=self.device)
+        for pos in ([False, True, False], [False, False, False]):
+            fused = raw.clone().requires_grad_()
+            loss, _, _, active = self.crv._protected_ranking(
+                raw, fused, torch.tensor([pos], device=self.device),
+                torch.tensor([[False, False, True]], device=self.device))
+            loss.backward()
+            self.assertEqual(float(loss), 0.)
+            self.assertFalse(active.any())
+            self.assertTrue(torch.isfinite(fused.grad).all())
+            self.assertEqual(float(fused.grad.abs().sum()), 0.)
 
     def test_large_drops_keep_gradient_and_aux_checks_actual_evidence(self):
         drops = torch.tensor([[12., 11.]], device=self.device, requires_grad=True)
