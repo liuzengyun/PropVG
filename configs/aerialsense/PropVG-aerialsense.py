@@ -46,12 +46,6 @@ freeze_beit3 = False
 # Optional GrabVG components already implemented in the current model.
 enable_grab = False
 
-# Independent CRV; keep your existing disabled switch for baseline experiments.
-enable_crv = False
-crv_topk = 8
-crv_grid_size = 24
-crv_cf_loss_weight = 0.1
-
 img_size = 586
 patch_size = 16
 img_norm_cfg = dict(
@@ -175,19 +169,9 @@ model = dict(
             bbox=0.1,
             allbbox=0.1,
             refer=1.0,
-            crv=0.5,
         ),
         MTD=dict(K=250),
         enable_grab=enable_grab,
-        enable_crv=enable_crv,
-        crv=dict(
-            topk=crv_topk, verifier_dim=128, grid_size=crv_grid_size,
-            num_heads=4, num_layers=2,
-            core_expansion=1.5, feather_expansion=2.0,
-            initial_alpha=0.1, max_residual=2.0, drop_temperature=1.0,
-            cf_loss_weight=crv_cf_loss_weight, rank_margin=0.5,
-            max_negative_gt_coverage=0.05,
-        ),
     ),
     post_params=dict(
         score_weighted=False,

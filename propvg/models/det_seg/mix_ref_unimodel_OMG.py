@@ -267,8 +267,8 @@ class MIXRefUniModel_OMG(OneStageModel):
                 width = image_size[1]
                 r = detector_postprocess(results_per_image, height, width)
                 rank_logits = pred.get("refer_logits")
-                # New CRV ranks in logit space. Retain sigmoid probabilities
-                # for display/thresholds and leave the disabled path unchanged.
+                # Optional ranking logits preserve precision when provided.
+                # Keep the baseline probability ranking when they are absent.
                 rank_logits = rank_logits[ind, :, 0] if rank_logits is not None else None
                 if rank_logits is not None:
                     kept = results_per_image.pred_boxes.nonempty()

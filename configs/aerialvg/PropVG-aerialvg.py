@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/0928new-crv"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-aerialvg"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -47,13 +47,6 @@ if teacher and use_auxiliary_gt:
 freeze_beit3 = False
 
 enable_grab=False
-
-# Independent CRV: all new losses stop at its own scorer/fusion gate.
-# False uses the unchanged CRS ranking and original full-candidate losses.
-enable_crv = True
-crv_topk = 8
-crv_grid_size = 24  # Mask on the largest 144x144 map, then pool for scoring.
-crv_cf_loss_weight = 0.1  # Small paired drop-ranking auxiliary objective.
 
 img_size = 586
 patch_size = 16
@@ -110,15 +103,8 @@ model = dict(
               detr_loss={"criterion": {"loss_class": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0},
                          "matcher": {"cost_class": 1.0, "cost_bbox": 5.0, "cost_giou": 2.0}},
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
-                           "bbox": 0.1, "allbbox": 0.1, "refer": 1.0,
-                           "crv": 0.5}, MTD={"K": 250},
-              enable_grab=enable_grab, enable_crv=enable_crv,
-              crv=dict(topk=crv_topk, verifier_dim=128, grid_size=crv_grid_size,
-                       num_heads=4, num_layers=2,
-                       core_expansion=1.5, feather_expansion=2.0,
-                       initial_alpha=0.1, max_residual=2.0, drop_temperature=1.0,
-                       cf_loss_weight=crv_cf_loss_weight, rank_margin=0.5,
-                       max_negative_gt_coverage=0.05)),
+                           "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
+              enable_grab=enable_grab),
     post_params={"score_weighted": False, "mask_threshold": 0.5, "score_threshold": 0.7,
                  "with_nms": False, "with_mask": False},
     process_visual=False,

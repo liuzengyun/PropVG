@@ -95,19 +95,13 @@ def load_pretrained_checkpoint(model, finetune_from=None, amp=False, dataset=Non
 
 
 def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimizer=None, scheduler=None,
-                    dataset=None, return_metadata=False, expected_crv_version=None):
+                    dataset=None, return_metadata=False):
     start_epoch, best_d_acc, best_giou, best_oiou = -1, 0.0, 0.0, 0.0
     flag = True
     assert not (resume_from is not None and load_from is not None)
     load_file = resume_from or load_from
     ckpt = torch.load(load_file, map_location=lambda storage, loc: storage.cuda())
     state = ckpt["state_dict"]
-    if expected_crv_version is not None:
-        marker = next((value for key, value in state.items()
-                       if key.endswith("head.crv.independent_version")), None)
-        if marker is None or int(marker) != int(expected_crv_version):
-            raise ValueError("Three-way evaluation requires a trained independent-CRV "
-                             f"v{expected_crv_version} checkpoint, not a baseline-only/older checkpoint")
     if "ema_state_dict" in ckpt:
         ema_state = ckpt["ema_state_dict"]
         if is_paral_state(ema_state) and not is_paral_model(model):
