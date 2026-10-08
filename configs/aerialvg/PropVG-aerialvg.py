@@ -47,6 +47,8 @@ if teacher and use_auxiliary_gt:
 freeze_beit3 = False
 
 enable_grab=False
+# Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
+enable_mask = False
 
 img_size = 586
 patch_size = 16
@@ -104,7 +106,7 @@ model = dict(
                          "matcher": {"cost_class": 1.0, "cost_bbox": 5.0, "cost_giou": 2.0}},
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
-              enable_grab=enable_grab),
+              enable_grab=enable_grab, enable_mask=enable_mask),
     post_params={"score_weighted": False, "mask_threshold": 0.5, "score_threshold": 0.7,
                  "with_nms": False, "with_mask": False},
     process_visual=False,

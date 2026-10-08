@@ -270,12 +270,13 @@ class MIXRefUniModel_OMG(OneStageModel):
                 # Optional ranking logits preserve precision when provided.
                 # Keep the baseline probability ranking when they are absent.
                 rank_logits = rank_logits[ind, :, 0] if rank_logits is not None else None
+                # detector_postprocess clips the shared Boxes object in-place
+                # and removes empty boxes. Apply that same post-clip mask to
+                # referring scores, whether optional logits exist or not.
+                kept = results_per_image.pred_boxes.nonempty()
+                refer_score = refer_pred[ind, :, 0][kept]
                 if rank_logits is not None:
-                    kept = results_per_image.pred_boxes.nonempty()
-                    refer_score = refer_pred[ind, :, 0][kept]
                     rank_logits = rank_logits[kept]
-                else:
-                    refer_score = refer_pred[ind][:, 0]
                 # infomation extract
                 pred_box = r.pred_boxes.tensor
                 det_score = r.scores

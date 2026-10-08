@@ -41,6 +41,12 @@ def evaluate(model, loader):
         outputs = model(**inputs, return_loss=False, with_bbox=True, with_mask=False, rescale=False)
         for prediction, target in zip(outputs["pred_bboxes"], targets):
             ranking = prediction["scores"].reshape(-1).argsort(descending=True)
+            if ranking.numel() == 0:
+                zero = prediction["boxes"].new_tensor(0.0)
+                top1.append(zero)
+                top5.append(zero)
+                top1_iou.append(zero)
+                continue
             ious = box_iou(prediction["boxes"][ranking], target.to(prediction["boxes"].device))
             top1.append((ious[0] >= 0.5).float())
             top5.append((ious[:5].max() >= 0.5).float())

@@ -45,6 +45,8 @@ freeze_beit3 = False
 
 # Optional GrabVG components already implemented in the current model.
 enable_grab = False
+# Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
+enable_mask = False
 
 img_size = 586
 patch_size = 16
@@ -172,6 +174,7 @@ model = dict(
         ),
         MTD=dict(K=250),
         enable_grab=enable_grab,
+        enable_mask=enable_mask,
     ),
     post_params=dict(
         score_weighted=False,

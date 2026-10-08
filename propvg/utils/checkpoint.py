@@ -29,6 +29,60 @@ def de_parallel(state_dict):
     return new_state_dict
 
 
+def _optimizer_parameter_names(model, optimizer):
+    names = {id(parameter): name[7:] if name.startswith("module.") else name
+             for name, parameter in model.named_parameters()}
+    return [[names[id(parameter)] for parameter in group["params"]] for group in optimizer.param_groups]
+
+
+def _load_optimizer_state(model, optimizer, checkpoint, model_state):
+    """Resume across removal of inactive branches without shifting Adam states."""
+    saved = checkpoint["optimizer"]
+    current_names = _optimizer_parameter_names(model, optimizer)
+    saved_names = checkpoint.get("optimizer_param_names")
+    normalize = lambda name: name[7:] if name.startswith("module.") else name
+    if saved_names is not None:
+        saved_names = [[normalize(name) for name in group] for group in saved_names]
+    elif [len(group["params"]) for group in saved["param_groups"]] == [len(group) for group in current_names]:
+        optimizer.load_state_dict(saved)
+        return
+    else:
+        # Older train.py groups parameters by backbone/language/head. Recover
+        # the original order from state_dict, using known parameter names only
+        # (not buffers or repeated state_dict aliases of shared parameters).
+        omitted_owners = {}
+        for prefix, module in model.named_modules():
+            prefix = normalize(prefix)
+            for name in getattr(module, "_omitted_parameter_names", []):
+                full_name = prefix + "." + name if prefix else name
+                omitted_owners[full_name] = prefix + "." if prefix else ""
+        active_names = {name for group in current_names for name in group}
+        legacy_order = [normalize(name) for name in model_state
+                        if normalize(name) in active_names or normalize(name) in omitted_owners]
+        saved_names = []
+        for group in current_names:
+            members = set(group)
+            removed_members = {name for name, owner in omitted_owners.items()
+                               if any(active.startswith(owner) for active in group)}
+            saved_names.append([name for name in legacy_order if name in members or name in removed_members])
+
+    if len(saved_names) != len(current_names) or len(saved["param_groups"]) != len(current_names):
+        raise ValueError("Cannot safely resume optimizer: parameter group layout changed")
+    groups, retained_ids = [], set()
+    for old_group, names, current in zip(saved["param_groups"], saved_names, current_names):
+        if len(names) != len(old_group["params"]):
+            raise ValueError("Cannot recover legacy optimizer parameter names; use --finetune-from instead")
+        current_set = set(current)
+        retained = [(name, index) for name, index in zip(names, old_group["params"]) if name in current_set]
+        if [name for name, _ in retained] != current:
+            raise ValueError("Cannot safely resume optimizer: active parameter order changed")
+        ids = [index for _, index in retained]
+        groups.append(dict(old_group, params=ids))
+        retained_ids.update(ids)
+    optimizer.load_state_dict({"param_groups": groups,
+                               "state": {key: value for key, value in saved["state"].items() if key in retained_ids}})
+
+
 def log_loaded_info(ckpt, load_file, dataset=None):
     logger = get_root_logger()
     log_str = f"loaded checkpoint from {load_file}\n"
@@ -114,7 +168,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
         model.load_state_dict(state, strict=False)
         flag = False
     if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
+        _load_optimizer_state(model, optimizer, ckpt, state)
     if scheduler is not None and "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
     if "amp" in ckpt and amp:
@@ -150,6 +204,7 @@ def save_checkpoint(
         {
             "state_dict": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "optimizer_param_names": _optimizer_parameter_names(model, optimizer),
             "scheduler": scheduler.state_dict(),
             "scheduler_state_is_next_epoch": True,
             "lr": optimizer.param_groups[0]["lr"],

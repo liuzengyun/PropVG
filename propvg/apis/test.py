@@ -140,6 +140,11 @@ def aerialvg_box_metrics(pred_bboxes, gt_bboxes):
         boxes = prediction["boxes"].detach().cpu()
         order = scores.argsort(descending=True, stable="ranking_logits" in prediction)
         boxes = boxes[order]
+        if boxes.shape[0] == 0:
+            top1.append(torch.tensor(0.0))
+            top5.append(torch.tensor(0.0))
+            miou.append(torch.tensor(0.0))
+            continue
         target = torch.as_tensor(target, dtype=boxes.dtype).cpu().reshape(-1, 4)[0]
         lt = torch.maximum(boxes[:, :2], target[:2])
         rb = torch.minimum(boxes[:, 2:], target[2:])

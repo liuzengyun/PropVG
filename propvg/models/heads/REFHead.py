@@ -25,6 +25,7 @@ from .modules import SegBranch
 from .unet_head import SimpleFPN, UnetDecoder
 from propvg.models.losses.segloss import seg_loss
 from .grab_binding import GrabGraphBinding
+from .optional_modules import build_optional_module
 
 
 class GlobalCrossAttention(nn.Module):
@@ -438,13 +439,20 @@ class REFHead(nn.Module):
         detr_loss={},
         MTD={},
         enable_grab=True,
+        enable_mask=True,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
-        self.seg_branch = SegBranch(hidden_channels, upsample_rate=1)
+        self.enable_mask = enable_mask
+        self._omitted_parameter_names = []
+        self.seg_branch = build_optional_module(
+            lambda: SegBranch(hidden_channels, upsample_rate=1), enable_mask,
+            "seg_branch", self._omitted_parameter_names,
+        )
         if "aux" in loss_weight["mask"]:
-            self.seg_branch_aux_list = nn.ModuleList(
-                [SegBranch(hidden_channels // 4 * (2**i), upsample_rate=1) for i in range(4)]
+            self.seg_branch_aux_list = build_optional_module(
+                lambda: nn.ModuleList([SegBranch(hidden_channels // 4 * (2**i), upsample_rate=1) for i in range(4)]),
+                enable_mask, "seg_branch_aux_list", self._omitted_parameter_names,
             )
         self.nt_embed = MLP(
             input_dim=hidden_channels,
@@ -485,7 +493,10 @@ class REFHead(nn.Module):
                 hidden_channels_,
             ],
         )
-        self.unet_decoder = UnetDecoder(hidden_channels, 1)
+        self.unet_decoder = build_optional_module(
+            lambda: UnetDecoder(hidden_channels, 1), enable_mask,
+            "unet_decoder", self._omitted_parameter_names,
+        )
 
         self.detrloss = DETRLoss(
             aux_loss=True,
@@ -526,7 +537,10 @@ class REFHead(nn.Module):
         # GrabVG-style language-conditioned local graph binding.  It refines
         # query features only; proposal boxes and the original PropVG losses
         # remain unchanged.
-        self.grab_binding = GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48)
+        self.grab_binding = build_optional_module(
+            lambda: GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48),
+            enable_grab, "grab_binding", self._omitted_parameter_names,
+        )
         self.dist_head = MTDv2(hidden_channels, MTD["K"])
         self.num_queries = num_queries
         self.refer_class_embed = nn.Linear(hidden_channels, 1 + 1)
@@ -658,9 +672,11 @@ class REFHead(nn.Module):
         outputs_class = torch.stack(outputs_classes)
         outputs_coord = torch.stack(outputs_coords)
 
-        # ! segmentation branch (AerialVG has no mask target, so this branch
-        # is naturally skipped while retaining the original module layout).
+        # AerialVG has no mask target. Optional segmentation-only modules may
+        # be omitted, while the original shared 512-channel neck is unchanged.
         if target_mask is not None:
+            if not self.enable_mask:
+                raise ValueError("Mask targets require head.enable_mask=True")
             pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
             pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
             pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
@@ -804,6 +820,8 @@ class REFHead(nn.Module):
 
         # ! segmentation branch; AerialVG evaluation calls with_mask=False.
         if with_mask:
+            if not self.enable_mask:
+                raise ValueError("Mask inference requires head.enable_mask=True")
             pred_mask = self.unet_decoder(*seg_feat)  # (B, C, H, W)
             pred_segment = self.seg_branch(pred_mask)  # (B, 1, H, W)
             pred_seg = F.interpolate(pred_segment, size=img.shape[-2:], mode="bilinear", align_corners=True)
