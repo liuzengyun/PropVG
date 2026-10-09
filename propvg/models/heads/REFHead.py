@@ -26,6 +26,7 @@ from .unet_head import SimpleFPN, UnetDecoder
 from propvg.models.losses.segloss import seg_loss
 from .grab_binding import GrabGraphBinding
 from .optional_modules import build_optional_module
+from .background_context import BackgroundContextEnhancement
 
 
 class GlobalCrossAttention(nn.Module):
@@ -440,10 +441,13 @@ class REFHead(nn.Module):
         MTD={},
         enable_grab=True,
         enable_mask=True,
+        enable_bcem=False,
+        bcem=None,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
         self.enable_mask = enable_mask
+        self.enable_bcem = enable_bcem
         self._omitted_parameter_names = []
         self.seg_branch = build_optional_module(
             lambda: SegBranch(hidden_channels, upsample_rate=1), enable_mask,
@@ -551,6 +555,15 @@ class REFHead(nn.Module):
             num_layers=3,
         )
         self.query_linear_scoring = nn.Linear(hidden_channels, 1)
+        # Append the optional branch after all legacy initialization so the
+        # baseline's parameters and RNG stream are unchanged when disabled.
+        self.bcem = (BackgroundContextEnhancement(hidden_channels=hidden_channels, **(bcem or {}))
+                     if enable_bcem else None)
+
+    def _enhance_background(self, queries, boxes, visuals, visual_masks, text, text_mask, img_metas):
+        if not self.enable_bcem:
+            return queries, {}
+        return self.bcem(visuals[0], boxes, queries, text, text_mask, img_metas, visual_masks[0])
 
     def prepare_targets(self, targets, img_metas):
         new_targets = []
@@ -697,6 +710,11 @@ class REFHead(nn.Module):
             bound_queries, filter_scores = inter_states[-1], None
             bound_boxes, selected_classes, selected_indices = outputs_coord[-1], outputs_class[-1], None
         refer_query_embed = self.refer_adapter(bound_queries)
+        refer_query_embed, background_info = self._enhance_background(
+            refer_query_embed, bound_boxes, multi_level_feats, multi_level_masks,
+            lan_feat, lan_mask, img_metas,
+        )
+        extra_dict.update(background_info)
         refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
@@ -755,6 +773,9 @@ class REFHead(nn.Module):
 
     def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None, with_mask=True):
         extra_dict = {}
+        img_metas = targets["img_metas"] if targets is not None else [
+            {"img_shape": img.shape[-2:], "pad_shape": img.shape[-2:]} for _ in range(img.shape[0])
+        ]
 
         # all feats embedding to hidden_channels
         img_feat = self.img_embedding(x)
@@ -773,9 +794,7 @@ class REFHead(nn.Module):
         multi_level_masks = []
         multi_level_position_embeddings = []
         for feat in multi_level_feats:
-            img_masks, pos_embed = self.x_mask_pos_enc(feat, targets["img_metas"] if targets is not None else [
-                {"img_shape": img.shape[-2:], "pad_shape": img.shape[-2:]} for _ in range(img.shape[0])
-            ])
+            img_masks, pos_embed = self.x_mask_pos_enc(feat, img_metas)
             multi_level_masks.append(img_masks.to(torch.bool))
             multi_level_position_embeddings.append(pos_embed)
 
@@ -841,6 +860,11 @@ class REFHead(nn.Module):
             bound_queries = inter_states[-1]
             bound_boxes, selected_classes = outputs_coord[-1], outputs_class[-1]
         refer_query_embed = self.refer_adapter(bound_queries)
+        refer_query_embed, background_info = self._enhance_background(
+            refer_query_embed, bound_boxes, multi_level_feats, multi_level_masks,
+            lan_feat, lan_mask, img_metas,
+        )
+        extra_dict.update(background_info)
         refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label

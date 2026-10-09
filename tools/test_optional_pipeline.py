@@ -19,6 +19,8 @@ class OptionalPipelineTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(2)
         cls.options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
+        # These regressions isolate legacy Grab/mask behavior from BCEM.
+        cls.options["enable_bcem"] = False
         cls.options["num_queries"] = 8
 
     def head(self, grab, mask, legacy=False):
