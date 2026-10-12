@@ -318,7 +318,7 @@ class CRS(nn.Module):
                     lan_feat,
                     # Integer 0/1 masks must become bool before inversion;
                     # otherwise ~0/~1 are -1/-2 (negative token indices).
-                    ~lan_mask.bool(),
+                    ~lan_mask,
                 )
             )
         )
