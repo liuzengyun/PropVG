@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-teacher-val+bcem"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-64proposal"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -28,7 +28,7 @@ use_auxiliary_gt = False
 teacher = True
 # The teacher file must match the configured training annotation records by
 # sample_id and filename. Validation and test do not read it.
-teacher_annsfile = "data/AerialVG/teacher_valset.json"
+teacher_annsfile = "data/AerialVG/teacher_trainset.json"
 # Maximum number of extra teacher boxes per training sample after refer-GT
 # deduplication and teacher NMS. 0 uses only the original refer GT; None keeps
 # every available teacher box. The current JSON contains exactly 5 raw boxes
@@ -80,13 +80,13 @@ val_pipeline = [
 data = dict(
     samples_per_gpu=8,
     workers_per_gpu=16,
-    train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
+    train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_train_odvg.jsonl",
                imgsfile="data/AerialVG/images", pipeline=train_pipeline,
                teacher_annsfile=teacher_annsfile if teacher else None,
                teacher_dedup_iou=teacher_dedup_iou,
                teacher_nms_iou=teacher_nms_iou,
                teacher_max_boxes=teacher_max_boxes),
-    val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
+    val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
              imgsfile="data/AerialVG/images", pipeline=val_pipeline),
     test=dict(type=dataset_type, which_set="test", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
               imgsfile="data/AerialVG/images", pipeline=val_pipeline),
@@ -110,12 +110,13 @@ model = dict(
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_bcem=enable_bcem,
-              bcem=dict(context_dim=128,
-                        angular_samples=5, radial_samples=5,
-                        min_valid_points=5, fusion_init=0.1, chunk_size=32,
-                        use_position=False, use_text_attention=True,
-                        use_sparse_selection=True,
-                        use_learnable_fusion=True)),
+              bcem=dict(context_dim=128, num_heads=4,
+                        radial_edges=(0.0, 0.10, 0.25, 0.50, 1.0),
+                        angular_samples=5, radial_samples=2,
+                        min_valid_points=5, context_strength=0.1, chunk_size=32,
+                        use_position=True, use_transitions=True, use_gru=True,
+                        use_text_attention=True, use_sparse_selection=True,
+                        learnable_gate=True, checkpoint_chunks=True)),
     post_params={"score_weighted": False, "mask_threshold": 0.5, "score_threshold": 0.7,
                  "with_nms": False, "with_mask": False},
     process_visual=False,
