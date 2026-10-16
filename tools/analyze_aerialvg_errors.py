@@ -84,9 +84,13 @@ def capture_head(model):
     """Capture existing diagnostics in the SAME forward, then restore method."""
     original = model.head.forward_test
     captured = {}
+    module = getattr(model.head, "bcem", None)
+    hook = (module.register_forward_pre_hook(
+        lambda _, args: captured.update(visual_shape=tuple(args[0].shape[-2:])))
+        if module is not None else None)
     def forward(*args, **kwargs):
-        prediction, extra = original(*args, **kwargs)
         captured.clear()
+        prediction, extra = original(*args, **kwargs)
         captured["boxes"] = prediction["pred_bbox_allobj"].detach().cpu()
         captured["extra"] = {key: value.detach().cpu() for key, value in extra.items()
                              if key.startswith("bcem_") and torch.is_tensor(value)}
@@ -96,6 +100,8 @@ def capture_head(model):
         yield captured
     finally:
         model.head.forward_test = original
+        if hook is not None:
+            hook.remove()
 
 
 def kept_candidate_ids(raw_boxes, meta, post_boxes):
@@ -122,11 +128,12 @@ def background_info(extra, batch_index, candidate_index):
             for name, key in fields.items() if key in extra}
 
 
-def sampling_points(module, raw_box, meta):
+def sampling_points(module, raw_box, meta, feature_shape=None):
     """Reuse the module's actual geometry, in original image coordinates."""
     device = module.sector_rays.device
     sizes = torch.tensor([meta["img_shape"][:2]], dtype=torch.float32, device=device)
-    points = module._sampling_geometry(raw_box.to(device).reshape(1, 1, 4), sizes)[0][0, 0]
+    pads = torch.tensor([meta["pad_shape"][:2]], dtype=torch.float32, device=device)
+    points = module._sampling_geometry(raw_box.to(device).reshape(1, 1, 4), sizes, pads, feature_shape)[0][0, 0]
     scale = np.asarray(meta["scale_factor"]).reshape(-1)
     scale_xy = np.repeat(scale, 2) if scale.size == 1 else scale[:2]
     return points.cpu().numpy() / scale_xy
@@ -152,7 +159,7 @@ def crop(ax, image, box, gt_box, pred_box, title):
     ax.axis("off")
 
 
-def sector_panel(ax, image, box, bg, points, title, direction_angles=None):
+def sector_panel(ax, image, box, bg, points, title, direction_angles=None, sampling_mode="sector"):
     ax.imshow(image)
     draw_box(ax, box, "red")
     if not bg:
@@ -161,6 +168,21 @@ def sector_panel(ax, image, box, bg, points, title, direction_angles=None):
         return
     weights = np.asarray(bg["direction_weights"])
     valid = np.asarray(bg["valid_regions"])
+    if sampling_mode == "ray":
+        for direction in range(len(weights)):
+            strength = weights[direction] / max(weights.max(), 1e-8)
+            path = points[direction].mean(-2)
+            ax.plot(path[:, 0], path[:, 1], color="cyan", linewidth=.5 + strength,
+                    alpha=.15 + .65 * strength)
+            for region, p in enumerate(points[direction]):
+                selected = valid[direction, region] and weights[direction] > 0
+                ax.scatter(p[:, 0], p[:, 1], s=6 + 5 * strength,
+                           c="cyan" if selected else "gray", alpha=.25 + .65 * strength)
+        ax.set_xlim(0, image.shape[1])
+        ax.set_ylim(image.shape[0], 0)
+        ax.set_title(title + "\nactual four-point neighborhoods; intensity = ray weight", fontsize=9)
+        ax.axis("off")
+        return
     # Shading shows selected sectors. The dots are ACTUAL sampling positions;
     # region boundaries are schematic ray-wise fractions, not semantic masks.
     center = (np.asarray(box[:2]) + box[2:]) / 2
@@ -191,7 +213,7 @@ def sector_panel(ax, image, box, bg, points, title, direction_angles=None):
 
 
 def draw_case(record, image, ranked_boxes, ranked_scores, ious, best_box, backgrounds,
-              points, output_dir, direction_names=DIRECTIONS, direction_angles=None):
+              points, output_dir, direction_names=DIRECTIONS, direction_angles=None, sampling_mode="sector"):
     pred_box, gt_box = ranked_boxes[0], np.asarray(record["gt_box"])
     fig, axes = plt.subplots(2, 3, figsize=(17, 11))
     axes[0, 0].imshow(image)
@@ -203,9 +225,9 @@ def draw_case(record, image, ranked_boxes, ranked_scores, ious, best_box, backgr
     crop(axes[0, 1], image, gt_box, gt_box, pred_box, "GT target and surrounding context")
     crop(axes[0, 2], image, pred_box, gt_box, pred_box,
          "Top1 prediction: IoU={:.3f}".format(record["top1_iou"]))
-    sector_panel(axes[1, 0], image, pred_box, backgrounds[0], points[0], "Top1 background", direction_angles)
+    sector_panel(axes[1, 0], image, pred_box, backgrounds[0], points[0], "Top1 background", direction_angles, sampling_mode)
     sector_panel(axes[1, 1], image, best_box, backgrounds[1], points[1],
-                 "Best-IoU proposal background (CRS rank {})".format(record["best_iou_rank"]), direction_angles)
+                 "Best-IoU proposal background (CRS rank {})".format(record["best_iou_rank"]), direction_angles, sampling_mode)
     ax = axes[1, 2]
     ticks = np.arange(len(direction_names) + 1)
     for k, (bg, label, color) in enumerate(zip(backgrounds, ("Top1", "Best IoU"), ("tomato", "steelblue"))):
@@ -216,7 +238,7 @@ def draw_case(record, image, ranked_boxes, ranked_scores, ious, best_box, backgr
     ax.set_yticklabels(tuple(direction_names) + ("null",))
     ax.set_xlim(0, 1)
     ax.invert_yaxis()
-    ax.set_xlabel("Sparse sector selection weight")
+    ax.set_xlabel("Sparse {} selection weight".format("ray" if sampling_mode == "ray" else "sector"))
     if backgrounds[0]:
         ax.legend()
         desc = " | ".join("{}: gate={:.3f}, residual ratio={:.3f}".format(label, bg["gate"][0], bg["residual_ratio"][0])
@@ -273,8 +295,8 @@ code{overflow-wrap:anywhere}</style><h1>BCEM 预测与错误案例</h1>
 <p>范围：%s。<b>部分样本结果不能替代全量评估指标。</b></p>
 <p>模型：<code>%s</code></p><div class="note">绿色是真实框，红色是预测框，橙色是其他 Top5 候选。
 “候选覆盖不足”表示所有输出候选的 IoU 均小于 0.5；“排序错误”表示存在合格候选但 Top1 排错。
-背景图比较预测候选与最佳 IoU 候选，显示真实采样位置、扇区选择权重和融合门控。
-扇区着色是权重的几何示意，不是像素级注意力；边缘候选以实际采样点为准。
+背景图比较预测候选与最佳 IoU 候选，显示真实采样位置、路径选择权重和融合门控。
+射线模式显示实际四点邻域，线条亮度表示路径权重；扇区模式的着色是几何示意，不是像素级注意力。
 门控不是正确概率，注意力及残差比例也不能单独证明背景导致了错误。灰点表示所在区域无效。
 单击大图可放大；下面的五格图用于检查小目标外观。</div>%s%s
 <script>function filter(kind){document.querySelectorAll('article').forEach(el=>el.style.display=kind==='all'||el.dataset.kind===kind?'':'none')}</script></html>''' % (
@@ -336,6 +358,7 @@ def main():
     del ckpt, state
     model.to(device).eval()
     module = getattr(model.head, "bcem", None)
+    sampling_mode = module.sampling_mode if module is not None else None
     direction_names = module.direction_names if module is not None else DIRECTIONS
     direction_angles = module.sector_angles.detach().cpu().numpy() if module is not None else None
     if model.with_nms:
@@ -368,9 +391,10 @@ def main():
                               prediction_background=bg[0], best_iou_background=bg[1])
                 if saved < args.max_images and len(order) and (args.include_correct or not record["top1_correct_at_0.5"]):
                     image = plt.imread(meta["filename"])
-                    points = [sampling_points(module, raw_boxes[int(kept[ci])], meta) for ci in (order[0], best)] if bg[0] else [None, None]
+                    points = [sampling_points(module, raw_boxes[int(kept[ci])], meta, captured.get("visual_shape"))
+                              for ci in (order[0], best)] if bg[0] else [None, None]
                     draw_case(record, image, boxes[order], scores[order], ious[order], boxes[best], bg, points,
-                              output_dir, direction_names, direction_angles)
+                              output_dir, direction_names, direction_angles, sampling_mode)
                     saved += 1
                 records.append(record)
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -385,7 +409,11 @@ def main():
                "failure_counts": dict(Counter(r["failure_type"] for r in records)),
                "checkpoint": str(Path(args.checkpoint).resolve()), "config": str(Path(args.config).resolve()),
                "device": str(device), "checkpoint_metadata": metadata, "directions": direction_names,
-               "num_sectors": len(direction_names) if module is not None else None,
+               "num_sectors": len(direction_names) if sampling_mode == "sector" else None,
+               "num_paths": len(direction_names) if module is not None else None,
+               "sampling_mode": sampling_mode,
+               "num_rays": module.num_rays if sampling_mode == "ray" else None,
+               "ray_lateral_offset": module.ray_lateral_offset if sampling_mode == "ray" else None,
                "sector_angles_radians": direction_angles.tolist() if direction_angles is not None else None,
                "notes": "Weights are observational diagnostics, not causal attribution. GT is never supplied to inference."}
     (output_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")

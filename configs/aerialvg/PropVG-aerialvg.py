@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-4sectors"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -51,7 +51,11 @@ enable_grab=False
 enable_mask = False
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
 enable_bcem = True
-# Angular sectors; 8 preserves the original model's sampling and direction order.
+# New experiments use ray neighborhoods; old archived configs default to sectors.
+bcem_sampling_mode = "ray"
+bcem_num_rays = 16
+bcem_ray_lateral_offset = 0.5  # half-width in highest-resolution feature-cell units
+# Used only by sector mode; 8 reproduces the original direction order.
 bcem_num_sectors = 4
 
 img_size = 586
@@ -113,9 +117,12 @@ model = dict(
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_bcem=enable_bcem,
               bcem=dict(context_dim=128, num_heads=4, num_sectors=bcem_num_sectors,
+                        sampling_mode=bcem_sampling_mode, num_rays=bcem_num_rays,
+                        ray_lateral_offset=bcem_ray_lateral_offset,
                         radial_edges=(0.0, 0.10, 0.25, 0.50, 1.0),
                         angular_samples=5, radial_samples=2,
-                        min_valid_points=5, context_strength=0.1, chunk_size=32,
+                        min_valid_points=2 if bcem_sampling_mode == "ray" else 5,
+                        context_strength=0.1, chunk_size=32,
                         use_position=True, use_transitions=True, use_gru=True,
                         use_text_attention=True, use_sparse_selection=True,
                         learnable_gate=True, checkpoint_chunks=True)),

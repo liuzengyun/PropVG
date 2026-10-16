@@ -1,8 +1,9 @@
-"""Sector/radial context, ordered transitions and gated residual enhancement.
+"""Ray/sector context, ordered transitions and gated residual enhancement.
 
 Geometry uses the valid image and detached normalized cxcywh boxes. Each ray
 extends from the candidate boundary to its own image-edge intersection. Region
-pooling is midpoint quadrature, not a dense segmentation or pure-background mask.
+pooling uses area quadrature in sector mode and a four-point mean in ray mode.
+Neither mode is a dense segmentation or pure-background mask.
 """
 import math
 
@@ -13,10 +14,10 @@ from torch.utils.checkpoint import checkpoint
 
 
 class BackgroundContextEnhancement(nn.Module):
-    """Configurable sectors, four radial regions and recurrent transitions.
+    """Configurable paths, radial observations and recurrent transitions.
 
     Original text reads all valid evidence. Evidence relevance is grouped by
-    sector before sparsemax; a zero-valued null option permits no background.
+    path before sparsemax; a zero-valued null option permits no background.
     The candidate remains a residual identity, never a concatenation-MLP output.
     """
 
@@ -27,15 +28,18 @@ class BackgroundContextEnhancement(nn.Module):
 
     def __init__(self, hidden_channels=256, context_dim=128, num_heads=4,
                  radial_edges=(0., .1, .25, .5, 1.), angular_samples=5,
-                 radial_samples=2, min_valid_points=5, context_strength=.1,
+                 radial_samples=2, min_valid_points=None, context_strength=.1,
                  chunk_size=32, use_position=True, use_transitions=True,
                  use_gru=True, use_text_attention=True, use_sparse_selection=True,
-                 learnable_gate=True, checkpoint_chunks=True, num_sectors=8):
+                 learnable_gate=True, checkpoint_chunks=True, num_sectors=8,
+                 sampling_mode="sector", num_rays=16, ray_lateral_offset=.5):
         super().__init__()
+        if sampling_mode not in ("sector", "ray"):
+            raise ValueError("sampling_mode must be 'sector' or 'ray'")
         for name, value in (("hidden_channels", hidden_channels), ("context_dim", context_dim),
                             ("num_heads", num_heads), ("angular_samples", angular_samples),
                             ("radial_samples", radial_samples), ("chunk_size", chunk_size),
-                            ("num_sectors", num_sectors)):
+                            ("num_sectors", num_sectors), ("num_rays", num_rays)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(name + " must be a positive integer")
         if context_dim % num_heads:
@@ -45,26 +49,38 @@ class BackgroundContextEnhancement(nn.Module):
                 or edges[0] != 0. or edges[-1] != 1.
                 or any(a >= b for a, b in zip(edges, edges[1:]))):
             raise ValueError("radial_edges must strictly increase from 0 to 1 with at least two regions")
+        if sampling_mode == "ray" and radial_samples != 2:
+            raise ValueError("ray mode uses exactly two radial positions and two lateral offsets per region")
+        if isinstance(ray_lateral_offset, bool) or not math.isfinite(ray_lateral_offset) or ray_lateral_offset <= 0:
+            raise ValueError("ray_lateral_offset must be finite and positive (feature-cell units)")
+        num_points = 4 if sampling_mode == "ray" else angular_samples * radial_samples
+        if min_valid_points is None:
+            min_valid_points = 2 if sampling_mode == "ray" else 5
         if (isinstance(min_valid_points, bool) or not isinstance(min_valid_points, int)
-                or not 1 <= min_valid_points <= angular_samples * radial_samples):
+                or not 1 <= min_valid_points <= num_points):
             raise ValueError("min_valid_points must fit inside each radial region's sampling grid")
         if not math.isfinite(context_strength) or context_strength < 0:
             raise ValueError("context_strength must be finite and nonnegative")
         self.hidden_channels = hidden_channels
         self.context_dim = context_dim
         self.num_heads = num_heads
-        self.num_sectors = self.num_directions = num_sectors
+        self.sampling_mode = sampling_mode
+        self.num_rays = num_rays
+        self.ray_lateral_offset = float(ray_lateral_offset)
+        # num_sectors remains an internal grouping alias for legacy consumers.
+        path_count = num_rays if sampling_mode == "ray" else num_sectors
+        self.num_sectors = self.num_directions = path_count
         self.num_regions = len(edges) - 1
-        self.num_nodes = num_sectors * self.num_regions
+        self.num_nodes = path_count * self.num_regions
         self.use_position = bool(use_position)
         self.use_transitions = bool(use_transitions)
         self.use_gru = bool(use_gru and use_transitions)
-        self.num_transitions = num_sectors * (self.num_regions - 1) if self.use_transitions else 0
+        self.num_transitions = path_count * (self.num_regions - 1) if self.use_transitions else 0
         self.evidence_per_sector = self.num_regions + (self.num_regions - 1 if self.use_transitions else 0)
         self.angular_samples = angular_samples
         # Samples per radial region, rather than per complete sector.
         self.radial_samples = radial_samples
-        self.num_points = angular_samples * radial_samples
+        self.num_points = num_points
         self.min_valid_points = min_valid_points
         self.context_strength = float(context_strength)
         self.chunk_size = chunk_size
@@ -73,7 +89,7 @@ class BackgroundContextEnhancement(nn.Module):
         self.learnable_gate = bool(learnable_gate)
         self.checkpoint_chunks = bool(checkpoint_chunks)
 
-        if num_sectors == 8:
+        if sampling_mode == "sector" and num_sectors == 8:
             # Preserve the historical ordering AND floating-point construction.
             # Reordering to clockwise changes the old checkpoint's reductions.
             angles = torch.tensor([-math.pi / 2, math.pi / 2, math.pi, 0,
@@ -82,17 +98,20 @@ class BackgroundContextEnhancement(nn.Module):
             angular_width = math.pi / 4
         else:
             # Image y increases downwards: start at up, then move clockwise.
-            centers = [-math.pi / 2 + 2 * math.pi * index / num_sectors for index in range(num_sectors)]
+            centers = [-math.pi / 2 + 2 * math.pi * index / path_count for index in range(path_count)]
             angles = torch.tensor(centers, dtype=torch.float32)
-            angular_width = 2 * math.pi / num_sectors
+            angular_width = 2 * math.pi / path_count
             compass = {0.: "right", 45.: "lower_right", 90.: "down", 135.: "lower_left",
                        180.: "left", 225.: "upper_left", 270.: "up", 315.: "upper_right"}
             self.direction_names = tuple(compass.get(round(math.degrees(angle) % 360, 6) % 360,
-                                                    f"sector_{index}") for index, angle in enumerate(centers))
+                                                    f"{sampling_mode}_{index}") for index, angle in enumerate(centers))
         # Geometry is reconstructed from config, never added to old state_dicts.
         self.register_buffer("sector_angles", angles, persistent=False)
-        offsets = ((torch.arange(angular_samples) + .5) / angular_samples - .5) * angular_width
-        sub_angles = angles[:, None] + offsets[None]
+        if sampling_mode == "sector":
+            offsets = ((torch.arange(angular_samples) + .5) / angular_samples - .5) * angular_width
+            sub_angles = angles[:, None] + offsets[None]
+        else:
+            sub_angles = angles[:, None]
         self.register_buffer("sector_rays", torch.stack((sub_angles.cos(), sub_angles.sin()), -1), persistent=False)
         edge_tensor = torch.tensor(edges, dtype=torch.float32)
         self.register_buffer("radial_edges", edge_tensor, persistent=False)
@@ -145,7 +164,9 @@ class BackgroundContextEnhancement(nn.Module):
         xx = torch.arange(w, device=visual.device)[None, None, :]
         return (yy >= valid_h[:, None, None]) | (xx >= valid_w[:, None, None])
 
-    def _sampling_geometry(self, boxes, image_sizes):
+    def _sampling_geometry(self, boxes, image_sizes, pad_sizes=None, feature_shape=None):
+        if self.sampling_mode == "ray":
+            return self._ray_sampling_geometry(boxes, image_sizes, pad_sizes, feature_shape)
         boxes = boxes.detach().float()
         image_xy = image_sizes.flip(-1)[:, None]
         centers = boxes[..., :2] * image_xy
@@ -174,8 +195,47 @@ class BackgroundContextEnhancement(nn.Module):
         region_width = region_width.expand_as(distance).permute(0, 1, 2, 4, 3, 5).reshape(shape)
         return points, area_weights, centers, sizes, bounds, region_width
 
+    def _ray_sampling_geometry(self, boxes, image_sizes, pad_sizes, feature_shape):
+        """Four anchors per stage: two axial positions x two lateral offsets.
+
+        Width is fixed in feature-cell units, independent of radial distance.
+        Pooling weights are uniform before validity masking, not sector areas.
+        """
+        if pad_sizes is None or feature_shape is None:
+            raise ValueError("ray geometry requires pad_sizes and the sampled feature_shape")
+        boxes = boxes.detach().float()
+        image_xy = image_sizes.flip(-1)[:, None]
+        centers = boxes[..., :2] * image_xy
+        sizes = boxes[..., 2:].clamp(min=0) * image_xy
+        bounds = torch.cat((centers - sizes / 2, centers + sizes / 2), -1)
+        rays = self.sector_rays[:, 0].float()
+        exit_distance = ((sizes / 2)[:, :, None] / rays.abs().clamp(min=1e-7)[None, None]).min(-1).values
+        axis_distance = torch.where(rays[None, None] > 0,
+                                    image_xy[:, :, None] - centers[:, :, None], centers[:, :, None])
+        image_exit = torch.where(rays.abs()[None, None] > 1e-7,
+                                 axis_distance / rays.abs().clamp(min=1e-7)[None, None],
+                                 torch.full_like(axis_distance, float("inf"))).min(-1).values
+        span = (image_exit - exit_distance).clamp(min=0)
+        distance = exit_distance[..., None, None] + span[..., None, None] * self.radial_fractions.float()
+        axial = centers[:, :, None, None, None] + distance[..., None] * rays[None, None, :, None, None]
+        # Use an isotropic image-space offset even if the feature canvas is rectangular.
+        cell_size = (pad_sizes.float() / pad_sizes.new_tensor(feature_shape, dtype=torch.float32)).min(-1).values
+        delta = self.ray_lateral_offset * cell_size
+        normal = torch.stack((-rays[:, 1], rays[:, 0]), -1)
+        signs = boxes.new_tensor([-1., 1.])
+        lateral = (delta[:, None, None, None, None, None, None]
+                   * normal[None, None, :, None, None, None]
+                   * signs[None, None, None, None, None, :, None])
+        b, n = boxes.shape[:2]
+        shape = (b, n, self.num_directions, self.num_regions, 4)
+        points = (axial.unsqueeze(-2) + lateral).reshape(*shape, 2)
+        weights = (span > 0)[..., None, None].expand(shape).float()
+        region_width = (span[..., None] * self.radial_edges.diff().float())[..., None].expand(shape)
+        return points, weights, centers, sizes, bounds, region_width
+
     def _sample_sectors(self, visual, boxes, image_sizes, pad_sizes, visual_mask):
-        points, area_weights, centers, sizes, bounds, region_width = self._sampling_geometry(boxes, image_sizes)
+        points, area_weights, centers, sizes, bounds, region_width = self._sampling_geometry(
+            boxes, image_sizes, pad_sizes, visual.shape[-2:])
         b, n = boxes.shape[:2]
         image_xy = image_sizes.flip(-1)
         inside_image = ((points >= 0) & (points < image_xy[:, None, None, None, None])).all(-1)
