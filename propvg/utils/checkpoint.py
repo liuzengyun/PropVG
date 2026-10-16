@@ -1,6 +1,8 @@
 import torch
 import shutil
+import os
 import os.path as osp
+import re
 from propvg.utils import is_main
 from .logger import get_root_logger
 import copy
@@ -192,9 +194,25 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
     return result
 
 
+def _prune_epoch_checkpoints(work_dir, max_keep_ckpts):
+    """Keep the highest numbered epoch snapshots; never remove named best/latest."""
+    snapshots = []
+    with os.scandir(work_dir) as entries:
+        for entry in entries:
+            match = re.fullmatch(r"epoch_(\d+)\.pth", entry.name)
+            if match and entry.is_file(follow_symlinks=False):
+                snapshots.append((int(match.group(1)), entry.path))
+    for _, path in sorted(snapshots)[:-max_keep_ckpts]:
+        os.remove(path)
+
+
 def save_checkpoint(
-    work_dir, interval, model, optimizer, scheduler, checkpoint, save_key_metric={"Det": "F1score", "Seg": "gIoU"}
+    work_dir, interval, model, optimizer, scheduler, checkpoint,
+    save_key_metric={"Det": "F1score", "Seg": "gIoU"}, max_keep_ckpts=0,
 ):
+    """Save latest/best plus periodic snapshots; 0 disables snapshot pruning."""
+    if isinstance(max_keep_ckpts, bool) or not isinstance(max_keep_ckpts, int) or max_keep_ckpts < 0:
+        raise ValueError("max_keep_ckpts must be a nonnegative integer")
     epoch = checkpoint["epoch"] + 1
     logger = get_root_logger()
     use_fp16 = checkpoint.pop("use_fp16", False)
@@ -218,7 +236,7 @@ def save_checkpoint(
     if is_main():
         logger.info(f"saved epoch {epoch} checkpoint at {latest_path}")
     if interval > 0 and epoch % interval == 0:
-        torch.save(checkpoint, osp.join(work_dir, f"epoch_{epoch}.pth"))
+        shutil.copyfile(latest_path, osp.join(work_dir, f"epoch_{epoch}.pth"))
     if checkpoint[save_key_metric["Det"]] > checkpoint["best_{}".format(save_key_metric["Det"])]:
         shutil.copyfile(latest_path, det_best_path)
         if is_main():
@@ -228,3 +246,6 @@ def save_checkpoint(
         shutil.copyfile(latest_path, segm_best_path)
         if is_main():
             logger.info(f"saved epoch {epoch} checkpoint at {segm_best_path}")
+    # Prune only after all current snapshots and best checkpoints save successfully.
+    if interval > 0 and epoch % interval == 0 and max_keep_ckpts > 0:
+        _prune_epoch_checkpoints(work_dir, max_keep_ckpts)

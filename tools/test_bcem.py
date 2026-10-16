@@ -54,6 +54,88 @@ class BCEMTests(unittest.TestCase):
         torch.testing.assert_close(area[0, 0, 0, 0, 4], torch.tensor(11. * 4.))
         torch.testing.assert_close(area[0, 0, 3, 0, 4] / area[0, 0, 0, 0, 4], torch.tensor(4.))
 
+    def test_default_eight_preserves_historical_angles_order_and_state_dict(self):
+        torch.manual_seed(29)
+        default = self.module().eval()
+        torch.manual_seed(29)
+        explicit = self.module(num_sectors=8).eval()
+        angles = torch.tensor([-math.pi / 2, math.pi / 2, math.pi, 0,
+                               -3 * math.pi / 4, -math.pi / 4, 3 * math.pi / 4, math.pi / 4])
+        offsets = ((torch.arange(5) + .5) / 5 - .5) * (math.pi / 4)
+        rays = torch.stack(((angles[:, None] + offsets).cos(), (angles[:, None] + offsets).sin()), -1)
+        torch.testing.assert_close(default.sector_rays, rays, rtol=0, atol=0)
+        self.assertEqual(default.direction_names, ("up", "down", "left", "right", "upper_left",
+                                                   "upper_right", "lower_left", "lower_right"))
+        for key in default.state_dict():
+            torch.testing.assert_close(default.state_dict()[key], explicit.state_dict()[key], rtol=0, atol=0)
+        self.assertNotIn("sector_angles", default.state_dict())
+        self.assertNotIn("sector_rays", default.state_dict())
+        explicit.load_state_dict(default.state_dict(), strict=True)
+        args = self.inputs()
+        with torch.no_grad():
+            expected, a = default(*args)
+            actual, b = explicit(*args)
+        torch.testing.assert_close(expected, actual, rtol=0, atol=0)
+        for key in a:
+            torch.testing.assert_close(a[key], b[key], rtol=0, atol=0)
+
+    def test_configurable_sector_geometry_shapes_gradients_and_empty_candidates(self):
+        args = self.inputs(batch=1, count=3)
+        old_state = self.module().state_dict()
+        for count in (1, 2, 3, 4, 6, 12, 16):
+            with self.subTest(num_sectors=count):
+                model = self.module(num_sectors=count)
+                # Parameters are shared across sectors; their names/shapes stay fixed.
+                model.load_state_dict(old_state, strict=True)
+                self.assertEqual(model.num_directions, count)
+                self.assertEqual(model.num_nodes, count * 4)
+                self.assertEqual(model.num_transitions, count * 3)
+                self.assertEqual(len(model.direction_names), count)
+                expected_angles = torch.tensor([-math.pi / 2 + 2 * math.pi * i / count for i in range(count)])
+                torch.testing.assert_close(model.sector_angles, expected_angles, rtol=0, atol=0)
+                offset = ((torch.arange(5) + .5) / 5 - .5) * (2 * math.pi / count)
+                rays = torch.stack(((expected_angles[:, None] + offset).cos(),
+                                    (expected_angles[:, None] + offset).sin()), -1)
+                torch.testing.assert_close(model.sector_rays, rays, rtol=0, atol=0)
+                points, *_ = model._sampling_geometry(args[1], torch.tensor([[80., 100.]]))
+                self.assertEqual(points.shape, (1, 3, count, 4, 10, 2))
+                self.assertTrue(((points >= 0) & (points < torch.tensor([100., 80.]))).all())
+                output, info = model(*args)
+                self.assertEqual(info['bcem_direction_weights'].shape, (1, 3, count))
+                self.assertEqual(info['bcem_valid_regions'].shape, (1, 3, count, 4))
+                self.assertEqual(info['bcem_valid_transitions'].shape, (1, 3, count, 3))
+                self.assertEqual(info['bcem_text_sector_attention'].shape, (1, 3, 7, count))
+                torch.testing.assert_close(info['bcem_direction_weights'].sum(-1, keepdim=True)
+                                           + info['bcem_null_weight'], torch.ones(1, 3, 1))
+                self.assertTrue(torch.isfinite(output).all())
+                output.square().mean().backward()
+                for name in ('visual_projection.weight', 'text_projection.weight', 'transition_gru.weight_ih',
+                             'gate.0.weight', 'environment_projection.weight'):
+                    grad = dict(model.named_parameters())[name].grad
+                    self.assertIsNotNone(grad, name)
+                    self.assertTrue(torch.isfinite(grad).all(), name)
+                    self.assertGreater(grad.abs().sum().item(), 0, name)
+                empty = list(args)
+                empty[1], empty[2] = args[1][:, :0], args[2][:, :0]
+                _, info = model(*empty)
+                self.assertEqual(info['bcem_direction_weights'].shape, (1, 0, count))
+                self.assertEqual(info['bcem_valid_regions'].shape, (1, 0, count, 4))
+                self.assertEqual(info['bcem_text_sector_attention'].shape, (1, 0, 7, count))
+
+    def test_nondefault_sector_ablations_masking_and_checkpointing(self):
+        args = self.inputs(batch=1, count=3)
+        for options in (dict(use_transitions=False), dict(use_gru=False), dict(use_position=False),
+                        dict(use_text_attention=False), dict(checkpoint_chunks=True)):
+            model = self.module(num_sectors=4, **options)
+            result, _ = model(*args)
+            result.square().mean().backward()
+            self.assertTrue(torch.isfinite(result).all())
+        masked = list(args)
+        masked[4] = torch.ones_like(args[4])
+        result, info = self.module(num_sectors=12)(*masked)
+        torch.testing.assert_close(result, args[2], rtol=0, atol=0)
+        self.assertEqual(info['bcem_direction_weights'].count_nonzero(), 0)
+
     def test_subrays_contiguously_cover_their_own_rectangular_image_intersection(self):
         model = self.module()
         points, _, _, _, bounds, _ = model._sampling_geometry(
@@ -470,7 +552,8 @@ class BCEMTests(unittest.TestCase):
     def test_invalid_settings_fail_early(self):
         for options in (dict(radial_edges=(0., .2, .1, 1.)), dict(radial_edges=(.1, .5, 1.)),
                         dict(radial_edges=(0., .5, .9)), dict(num_heads=3), dict(angular_samples=True),
-                        dict(min_valid_points=11), dict(context_strength=-1)):
+                        dict(min_valid_points=11), dict(context_strength=-1), dict(num_sectors=0),
+                        dict(num_sectors=-4), dict(num_sectors=True), dict(num_sectors=4.5)):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 self.module(**options)
 
@@ -483,7 +566,8 @@ class BCEMHeadIntegrationTests(unittest.TestCase):
         # currently selects a baseline run.
         cls.options["enable_bcem"] = True
         cls.options["num_queries"] = 8
-        cls.options["bcem"].update(context_dim=16, chunk_size=3)
+        # Legacy regression checks must not inherit the user's ablation count.
+        cls.options["bcem"].update(context_dim=16, chunk_size=3, num_sectors=8)
 
     def inputs(self):
         torch.manual_seed(572)
@@ -493,6 +577,23 @@ class BCEMHeadIntegrationTests(unittest.TestCase):
         kwargs = dict(cls_feat=torch.zeros(1, 768), lan_feat=torch.randn(1, 8, 768),
                       lan_mask=torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]]), img=torch.zeros(1, 3, 128, 128))
         return x, targets, kwargs
+
+    def test_configured_sector_count_reaches_head_training_and_inference(self):
+        for count in (4, 12):
+            with self.subTest(num_sectors=count):
+                options = copy.deepcopy(self.options)
+                options['bcem']['num_sectors'] = count
+                head = build_head(options)
+                x, targets, kwargs = self.inputs()
+                losses, _, train_info = head.forward_train(x, targets, **kwargs)
+                sum(losses.values()).backward()
+                self.assertEqual(train_info['bcem_direction_weights'].shape, (1, 8, count))
+                self.assertTrue(torch.isfinite(head.bcem.transition_gru.weight_ih.grad).all())
+                head.eval()
+                with torch.no_grad():
+                    prediction, info = head.forward_test(x, targets=targets, with_mask=False, **kwargs)
+                self.assertEqual(prediction['refer_label'].shape, (1, 8, 1))
+                self.assertEqual(info['bcem_valid_regions'].shape, (1, 8, count, 4))
 
     def test_enabled_branch_trains_and_reaches_crs_in_train_and_test(self):
         torch.manual_seed(103)

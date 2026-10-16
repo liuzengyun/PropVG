@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-64proposal"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-4sectors"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -51,6 +51,8 @@ enable_grab=False
 enable_mask = False
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
 enable_bcem = True
+# Angular sectors; 8 preserves the original model's sampling and direction order.
+bcem_num_sectors = 4
 
 img_size = 586
 patch_size = 16
@@ -110,7 +112,7 @@ model = dict(
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_bcem=enable_bcem,
-              bcem=dict(context_dim=128, num_heads=4,
+              bcem=dict(context_dim=128, num_heads=4, num_sectors=bcem_num_sectors,
                         radial_edges=(0.0, 0.10, 0.25, 0.50, 1.0),
                         angular_samples=5, radial_samples=2,
                         min_valid_points=5, context_strength=0.1, chunk_size=32,
@@ -131,4 +133,7 @@ optimizer_config = dict(type="Adam", lr=lr, lr_vis_enc=0.00004, lr_lan_enc=lr,
 scheduler_config = dict(type="MultiStepLRWarmUp", warmup_epochs=2, decay_steps=[24, 32], decay_ratio=0.1, max_epoch=36)
 log_interval = 50
 start_save_checkpoint = 0
+# Keep the last 10 epoch snapshots, plus top1_best.pth and latest.pth.
+save_interval = 1
+max_keep_ckpts = 10
 # finetune_from = "PropVG-grefcoco.pth"

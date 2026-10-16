@@ -392,6 +392,7 @@ def main_worker(cfg):
                     scheduler,
                     saved_info,
                     save_key_metric={"Det": save_compare_det, "Seg": save_compare_seg},
+                    max_keep_ckpts=cfg.get("max_keep_ckpts", 0),
                 )
             if cfg.dataset == "GRefCOCO":
                 best_F1score = max(F1score, best_F1score)

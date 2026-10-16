@@ -13,7 +13,7 @@ from torch.utils.checkpoint import checkpoint
 
 
 class BackgroundContextEnhancement(nn.Module):
-    """Eight sectors, four radial regions and three recurrent transitions each.
+    """Configurable sectors, four radial regions and recurrent transitions.
 
     Original text reads all valid evidence. Evidence relevance is grouped by
     sector before sparsemax; a zero-valued null option permits no background.
@@ -30,11 +30,12 @@ class BackgroundContextEnhancement(nn.Module):
                  radial_samples=2, min_valid_points=5, context_strength=.1,
                  chunk_size=32, use_position=True, use_transitions=True,
                  use_gru=True, use_text_attention=True, use_sparse_selection=True,
-                 learnable_gate=True, checkpoint_chunks=True):
+                 learnable_gate=True, checkpoint_chunks=True, num_sectors=8):
         super().__init__()
         for name, value in (("hidden_channels", hidden_channels), ("context_dim", context_dim),
                             ("num_heads", num_heads), ("angular_samples", angular_samples),
-                            ("radial_samples", radial_samples), ("chunk_size", chunk_size)):
+                            ("radial_samples", radial_samples), ("chunk_size", chunk_size),
+                            ("num_sectors", num_sectors)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(name + " must be a positive integer")
         if context_dim % num_heads:
@@ -52,12 +53,13 @@ class BackgroundContextEnhancement(nn.Module):
         self.hidden_channels = hidden_channels
         self.context_dim = context_dim
         self.num_heads = num_heads
+        self.num_sectors = self.num_directions = num_sectors
         self.num_regions = len(edges) - 1
-        self.num_nodes = 8 * self.num_regions
+        self.num_nodes = num_sectors * self.num_regions
         self.use_position = bool(use_position)
         self.use_transitions = bool(use_transitions)
         self.use_gru = bool(use_gru and use_transitions)
-        self.num_transitions = 8 * (self.num_regions - 1) if self.use_transitions else 0
+        self.num_transitions = num_sectors * (self.num_regions - 1) if self.use_transitions else 0
         self.evidence_per_sector = self.num_regions + (self.num_regions - 1 if self.use_transitions else 0)
         self.angular_samples = angular_samples
         # Samples per radial region, rather than per complete sector.
@@ -71,10 +73,25 @@ class BackgroundContextEnhancement(nn.Module):
         self.learnable_gate = bool(learnable_gate)
         self.checkpoint_chunks = bool(checkpoint_chunks)
 
-        angles = torch.tensor([-math.pi / 2, math.pi / 2, math.pi, 0,
-                               -3 * math.pi / 4, -math.pi / 4,
-                               3 * math.pi / 4, math.pi / 4], dtype=torch.float32)
-        offsets = ((torch.arange(angular_samples) + .5) / angular_samples - .5) * (math.pi / 4)
+        if num_sectors == 8:
+            # Preserve the historical ordering AND floating-point construction.
+            # Reordering to clockwise changes the old checkpoint's reductions.
+            angles = torch.tensor([-math.pi / 2, math.pi / 2, math.pi, 0,
+                                   -3 * math.pi / 4, -math.pi / 4,
+                                   3 * math.pi / 4, math.pi / 4], dtype=torch.float32)
+            angular_width = math.pi / 4
+        else:
+            # Image y increases downwards: start at up, then move clockwise.
+            centers = [-math.pi / 2 + 2 * math.pi * index / num_sectors for index in range(num_sectors)]
+            angles = torch.tensor(centers, dtype=torch.float32)
+            angular_width = 2 * math.pi / num_sectors
+            compass = {0.: "right", 45.: "lower_right", 90.: "down", 135.: "lower_left",
+                       180.: "left", 225.: "upper_left", 270.: "up", 315.: "upper_right"}
+            self.direction_names = tuple(compass.get(round(math.degrees(angle) % 360, 6) % 360,
+                                                    f"sector_{index}") for index, angle in enumerate(centers))
+        # Geometry is reconstructed from config, never added to old state_dicts.
+        self.register_buffer("sector_angles", angles, persistent=False)
+        offsets = ((torch.arange(angular_samples) + .5) / angular_samples - .5) * angular_width
         sub_angles = angles[:, None] + offsets[None]
         self.register_buffer("sector_rays", torch.stack((sub_angles.cos(), sub_angles.sin()), -1), persistent=False)
         edge_tensor = torch.tensor(edges, dtype=torch.float32)
@@ -151,7 +168,7 @@ class BackgroundContextEnhancement(nn.Module):
         region_width = span[..., None, None] * widths[:, None]
         area_weights = distance * region_width
         b, n = boxes.shape[:2]
-        shape = (b, n, 8, self.num_regions, self.num_points)
+        shape = (b, n, self.num_sectors, self.num_regions, self.num_points)
         points = points.permute(0, 1, 2, 4, 3, 5, 6).reshape(*shape, 2)
         area_weights = area_weights.permute(0, 1, 2, 4, 3, 5).reshape(shape)
         region_width = region_width.expand_as(distance).permute(0, 1, 2, 4, 3, 5).reshape(shape)
@@ -170,8 +187,8 @@ class BackgroundContextEnhancement(nn.Module):
         sampled = F.grid_sample(visual.float(), grid, mode="bilinear", padding_mode="zeros", align_corners=False)
         support = F.grid_sample((~visual_mask[:, None]).float(), grid,
                                 mode="bilinear", padding_mode="zeros", align_corners=False)
-        sampled = sampled.squeeze(-1).transpose(1, 2).reshape(b, n, 8, self.num_regions, self.num_points, self.context_dim)
-        support = support.reshape(b, n, 8, self.num_regions, self.num_points)
+        sampled = sampled.squeeze(-1).transpose(1, 2).reshape(b, n, self.num_sectors, self.num_regions, self.num_points, self.context_dim)
+        support = support.reshape(b, n, self.num_sectors, self.num_regions, self.num_points)
         center_valid = ((centers >= 0) & (centers <= image_xy[:, None])).all(-1)
         point_valid = inside_image & ~inside_box & (support >= 1 - 1e-6) & (area_weights > 0)
         point_valid &= ((sizes > 0).all(-1) & center_valid)[:, :, None, None, None]
@@ -189,7 +206,7 @@ class BackgroundContextEnhancement(nn.Module):
         boundary_distance = (delta.clamp(min=0).norm(dim=-1) * weights).sum(-1, keepdim=True) / short
         physical_width = (region_width * weights).sum(-1, keepdim=True) / short
         absolute = centroid / image_xy[:, None, None, None]
-        box_scale = (sizes / image_xy[:, None])[:, :, None, None].expand(-1, -1, 8, self.num_regions, -1)
+        box_scale = (sizes / image_xy[:, None])[:, :, None, None].expand(-1, -1, self.num_sectors, self.num_regions, -1)
         coverage = counts.float() / self.num_points
         # dx/S, dy/S, distance/S, width/S, x/W, y/H, box_w/W, box_h/H, coverage.
         position = torch.cat((relative, boundary_distance, physical_width, absolute,
@@ -339,13 +356,13 @@ class BackgroundContextEnhancement(nn.Module):
                 torch.cat(parts, 1) for parts in zip(*chunks)]
         else:
             context = queries.new_empty(b, 0, self.context_dim)
-            weights = dense = queries.new_empty(b, 0, 8)
-            token_attention = queries.new_empty(b, 0, text.shape[1], 8)
+            weights = dense = queries.new_empty(b, 0, self.num_sectors)
+            token_attention = queries.new_empty(b, 0, text.shape[1], self.num_sectors)
             null = null_dense = queries.new_empty(b, 0, 1)
             token_null = queries.new_empty(b, 0, text.shape[1], 1)
-            regions = torch.empty(b, 0, 8, self.num_regions, dtype=torch.bool, device=queries.device)
+            regions = torch.empty(b, 0, self.num_sectors, self.num_regions, dtype=torch.bool, device=queries.device)
             transitions = regions[..., :self.num_regions - 1] if self.use_transitions else regions[..., :0]
-            coverage = queries.new_empty(b, 0, 8, self.num_regions)
+            coverage = queries.new_empty(b, 0, self.num_sectors, self.num_regions)
         valid_sectors = regions.any(-1)
         can_use = valid_sectors.any(-1) & text_valid.any(-1)[:, None] & (weights.sum(-1) > 0)
         enhanced, gate = self._fuse_context(context, queries, sentence, can_use)
