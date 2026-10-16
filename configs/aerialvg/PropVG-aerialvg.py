@@ -51,10 +51,9 @@ enable_grab=False
 enable_mask = False
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
 enable_bcem = True
-# New experiments use ray neighborhoods; old archived configs default to sectors.
+# New experiments sample four points per stage directly on each ray.
 bcem_sampling_mode = "ray"
-bcem_num_rays = 16
-bcem_ray_lateral_offset = 0.5  # half-width in highest-resolution feature-cell units
+bcem_num_rays = 8
 # Used only by sector mode; 8 reproduces the original direction order.
 bcem_num_sectors = 4
 
@@ -118,9 +117,8 @@ model = dict(
               enable_bcem=enable_bcem,
               bcem=dict(context_dim=128, num_heads=4, num_sectors=bcem_num_sectors,
                         sampling_mode=bcem_sampling_mode, num_rays=bcem_num_rays,
-                        ray_lateral_offset=bcem_ray_lateral_offset,
                         radial_edges=(0.0, 0.10, 0.25, 0.50, 1.0),
-                        angular_samples=5, radial_samples=2,
+                        angular_samples=5, radial_samples=4 if bcem_sampling_mode == "ray" else 2,
                         min_valid_points=2 if bcem_sampling_mode == "ray" else 5,
                         context_strength=0.1, chunk_size=32,
                         use_position=True, use_transitions=True, use_gru=True,

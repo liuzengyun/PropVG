@@ -1,4 +1,4 @@
-"""CPU checks for four-point ray neighborhoods and legacy-sector compatibility."""
+"""CPU checks for four on-ray points and legacy sampling compatibility."""
 import copy
 import os
 import unittest
@@ -27,32 +27,43 @@ class BCEMRayTests(unittest.TestCase):
                 torch.tensor([[0, 0, 0, 0, 1, 1, 1]]),
                 [dict(img_shape=(80, 100), pad_shape=(100, 100))]]
 
-    def test_four_points_at_quarter_three_quarter_positions_on_both_sides(self):
+    def test_four_points_are_distinct_midpoints_directly_on_the_ray(self):
         model = self.module(num_rays=4)
         sizes = torch.tensor([[100., 200.]])
         boxes = torch.tensor([[[.5, .5, .2, .2]]], requires_grad=True)
         points, weights, _, _, _, widths = model._sampling_geometry(boxes, sizes, sizes, (20, 40))
         self.assertEqual(points.shape, (1, 1, 4, 4, 4, 2))
-        torch.testing.assert_close(points[0, 0, 0, 0], torch.tensor([[97.5, 39.], [102.5, 39.],
-                                                                  [97.5, 37.], [102.5, 37.]]))
-        torch.testing.assert_close(points[0, 0, 1, 0], torch.tensor([[122., 47.5], [122., 52.5],
-                                                                  [126., 47.5], [126., 52.5]]))
+        torch.testing.assert_close(points[0, 0, 0, 0], torch.tensor([[100., 39.5], [100., 38.5],
+                                                                  [100., 37.5], [100., 36.5]]))
+        torch.testing.assert_close(points[0, 0, 1, 0], torch.tensor([[121., 50.], [123., 50.],
+                                                                  [125., 50.], [127., 50.]]))
         torch.testing.assert_close(weights, torch.ones_like(weights), rtol=0, atol=0)
         torch.testing.assert_close(widths[0, 0, 0, :, 0], torch.tensor([4., 6., 10., 20.]))
         self.assertFalse(points.requires_grad)
         self.assertEqual(model.min_valid_points, 2)
         self.assertEqual(model.direction_names, ("up", "right", "down", "left"))
 
-    def test_lateral_width_is_fixed_feature_scale_and_radial_spacing_increases(self):
+    def test_zero_lateral_displacement_and_increasing_radial_spacing(self):
         model = self.module(num_rays=16)
         sizes = torch.tensor([[100., 200.]])
         points = model._sampling_geometry(torch.tensor([[[.5, .5, .2, .2]]]), sizes, sizes, (20, 40))[0]
-        pairs = points.reshape(1, 1, 16, 4, 2, 2, 2)
-        separation = (pairs[..., 1, :] - pairs[..., 0, :]).norm(dim=-1)
-        torch.testing.assert_close(separation, torch.full_like(separation, 5.))
-        axial = pairs.mean(-2)
-        spacing = (axial[0, 0, 0].reshape(8, 2)[1:] - axial[0, 0, 0].reshape(8, 2)[:-1]).norm(dim=-1)
-        self.assertTrue((spacing[1:] > spacing[:-1]).all())
+        rays = model.sector_rays[:, 0]
+        normal = torch.stack((-rays[:, 1], rays[:, 0]), -1)
+        lateral = ((points - torch.tensor([100., 50.])) * normal[None, None, :, None, None]).sum(-1)
+        torch.testing.assert_close(lateral, torch.zeros_like(lateral), rtol=0, atol=2e-5)
+        axial = points[0, 0, 0].reshape(16, 2)
+        spacing = (axial[1:] - axial[:-1]).norm(dim=-1)
+        self.assertTrue((spacing[1:] + 1e-5 >= spacing[:-1]).all())
+        self.assertGreater(spacing[-1], spacing[0])
+        self.assertEqual(model.radial_samples, 4)
+        self.assertEqual(model.ray_lateral_offset, 0)
+
+    def test_archived_positive_offset_preserves_legacy_neighborhood(self):
+        model = self.module(num_rays=4, ray_lateral_offset=.5, radial_samples=2)
+        sizes = torch.tensor([[100., 200.]])
+        points = model._sampling_geometry(torch.tensor([[[.5, .5, .2, .2]]]), sizes, sizes, (20, 40))[0]
+        torch.testing.assert_close(points[0, 0, 0, 0], torch.tensor([[97.5, 39.], [102.5, 39.],
+                                                                  [97.5, 37.], [102.5, 37.]]))
 
     def test_padding_and_feature_canvas_preserve_physical_sampling(self):
         model = self.module(num_rays=8)
@@ -80,18 +91,17 @@ class BCEMRayTests(unittest.TestCase):
 
     def test_border_points_are_masked_without_clamping_and_threshold_is_respected(self):
         args = self.inputs(count=1)
-        args[1] = torch.tensor([[[.02, .02, .2, .2]]])
+        args[1] = torch.tensor([[[.5, .027, .12, .001]]])
         args[5] = [dict(img_shape=(100, 100), pad_shape=(100, 100))]
         model = self.module(num_rays=4)
         _, info = model(*args)
-        torch.testing.assert_close(info['bcem_region_coverage'][0, 0, 1], torch.full((4,), .5))
-        self.assertTrue(info['bcem_valid_regions'][0, 0, 1].all())
-        self.assertFalse(info['bcem_valid_regions'][0, 0, 0].any())
+        torch.testing.assert_close(info['bcem_region_coverage'][0, 0, 0, 0], torch.tensor(.5))
+        self.assertTrue(info['bcem_valid_regions'][0, 0, 0, 0])
+        self.assertFalse(info['bcem_valid_regions'][0, 0, 0, 1:].any())
         strict = self.module(num_rays=4, min_valid_points=3)
         strict.load_state_dict(model.state_dict(), strict=True)
-        output, info = strict(*args)
-        self.assertFalse(info['bcem_valid_regions'].any())
-        torch.testing.assert_close(output, args[2], rtol=0, atol=0)
+        _, info = strict(*args)
+        self.assertFalse(info['bcem_valid_regions'][0, 0, 0].any())
 
     def test_counts_gradients_evidence_and_state_dict_across_ray_counts(self):
         old = BackgroundContextEnhancement(hidden_channels=16, context_dim=8).state_dict()
@@ -181,7 +191,7 @@ class BCEMRayTests(unittest.TestCase):
 
     def test_ray_settings_fail_early(self):
         for options in (dict(num_rays=0), dict(num_rays=True), dict(radial_samples=3),
-                        dict(ray_lateral_offset=0), dict(ray_lateral_offset=-1),
+                        dict(radial_samples=2), dict(ray_lateral_offset=-1),
                         dict(ray_lateral_offset=float('nan')), dict(min_valid_points=5),
                         dict(sampling_mode='unknown')):
             with self.subTest(options=options), self.assertRaises(ValueError):

@@ -180,7 +180,7 @@ def sector_panel(ax, image, box, bg, points, title, direction_angles=None, sampl
                            c="cyan" if selected else "gray", alpha=.25 + .65 * strength)
         ax.set_xlim(0, image.shape[1])
         ax.set_ylim(image.shape[0], 0)
-        ax.set_title(title + "\nactual four-point neighborhoods; intensity = ray weight", fontsize=9)
+        ax.set_title(title + "\nactual sampling points; intensity = ray weight", fontsize=9)
         ax.axis("off")
         return
     # Shading shows selected sectors. The dots are ACTUAL sampling positions;
@@ -296,7 +296,7 @@ code{overflow-wrap:anywhere}</style><h1>BCEM 预测与错误案例</h1>
 <p>模型：<code>%s</code></p><div class="note">绿色是真实框，红色是预测框，橙色是其他 Top5 候选。
 “候选覆盖不足”表示所有输出候选的 IoU 均小于 0.5；“排序错误”表示存在合格候选但 Top1 排错。
 背景图比较预测候选与最佳 IoU 候选，显示真实采样位置、路径选择权重和融合门控。
-射线模式显示实际四点邻域，线条亮度表示路径权重；扇区模式的着色是几何示意，不是像素级注意力。
+射线模式显示实际采样点，线条亮度表示路径权重；扇区模式的着色是几何示意，不是像素级注意力。
 门控不是正确概率，注意力及残差比例也不能单独证明背景导致了错误。灰点表示所在区域无效。
 单击大图可放大；下面的五格图用于检查小目标外观。</div>%s%s
 <script>function filter(kind){document.querySelectorAll('article').forEach(el=>el.style.display=kind==='all'||el.dataset.kind===kind?'':'none')}</script></html>''' % (

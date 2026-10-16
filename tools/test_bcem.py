@@ -568,7 +568,7 @@ class BCEMHeadIntegrationTests(unittest.TestCase):
         cls.options["num_queries"] = 8
         # Legacy regression checks must not inherit the user's ablation count.
         cls.options["bcem"].update(context_dim=16, chunk_size=3, num_sectors=8,
-                                   sampling_mode="sector", min_valid_points=5)
+                                   sampling_mode="sector", min_valid_points=5, radial_samples=2)
 
     def inputs(self):
         torch.manual_seed(572)

@@ -28,14 +28,18 @@ class BackgroundContextEnhancement(nn.Module):
 
     def __init__(self, hidden_channels=256, context_dim=128, num_heads=4,
                  radial_edges=(0., .1, .25, .5, 1.), angular_samples=5,
-                 radial_samples=2, min_valid_points=None, context_strength=.1,
+                 radial_samples=None, min_valid_points=None, context_strength=.1,
                  chunk_size=32, use_position=True, use_transitions=True,
                  use_gru=True, use_text_attention=True, use_sparse_selection=True,
                  learnable_gate=True, checkpoint_chunks=True, num_sectors=8,
-                 sampling_mode="sector", num_rays=16, ray_lateral_offset=.5):
+                 sampling_mode="sector", num_rays=16, ray_lateral_offset=0.):
         super().__init__()
         if sampling_mode not in ("sector", "ray"):
             raise ValueError("sampling_mode must be 'sector' or 'ray'")
+        if isinstance(ray_lateral_offset, bool) or not math.isfinite(ray_lateral_offset) or ray_lateral_offset < 0:
+            raise ValueError("ray_lateral_offset must be finite and nonnegative")
+        if radial_samples is None:
+            radial_samples = 4 if sampling_mode == "ray" and ray_lateral_offset == 0 else 2
         for name, value in (("hidden_channels", hidden_channels), ("context_dim", context_dim),
                             ("num_heads", num_heads), ("angular_samples", angular_samples),
                             ("radial_samples", radial_samples), ("chunk_size", chunk_size),
@@ -49,10 +53,9 @@ class BackgroundContextEnhancement(nn.Module):
                 or edges[0] != 0. or edges[-1] != 1.
                 or any(a >= b for a, b in zip(edges, edges[1:]))):
             raise ValueError("radial_edges must strictly increase from 0 to 1 with at least two regions")
-        if sampling_mode == "ray" and radial_samples != 2:
-            raise ValueError("ray mode uses exactly two radial positions and two lateral offsets per region")
-        if isinstance(ray_lateral_offset, bool) or not math.isfinite(ray_lateral_offset) or ray_lateral_offset <= 0:
-            raise ValueError("ray_lateral_offset must be finite and positive (feature-cell units)")
+        expected_radial_samples = 4 if ray_lateral_offset == 0 else 2
+        if sampling_mode == "ray" and radial_samples != expected_radial_samples:
+            raise ValueError("ray mode requires 4 on-ray radial samples; legacy lateral offsets require 2")
         num_points = 4 if sampling_mode == "ray" else angular_samples * radial_samples
         if min_valid_points is None:
             min_valid_points = 2 if sampling_mode == "ray" else 5
@@ -196,12 +199,12 @@ class BackgroundContextEnhancement(nn.Module):
         return points, area_weights, centers, sizes, bounds, region_width
 
     def _ray_sampling_geometry(self, boxes, image_sizes, pad_sizes, feature_shape):
-        """Four anchors per stage: two axial positions x two lateral offsets.
+        """Four on-ray midpoint samples per stage.
 
-        Width is fixed in feature-cell units, independent of radial distance.
+        Explicit positive offsets preserve archived four-point neighborhood runs.
         Pooling weights are uniform before validity masking, not sector areas.
         """
-        if pad_sizes is None or feature_shape is None:
+        if self.ray_lateral_offset > 0 and (pad_sizes is None or feature_shape is None):
             raise ValueError("ray geometry requires pad_sizes and the sampled feature_shape")
         boxes = boxes.detach().float()
         image_xy = image_sizes.flip(-1)[:, None]
@@ -218,17 +221,20 @@ class BackgroundContextEnhancement(nn.Module):
         span = (image_exit - exit_distance).clamp(min=0)
         distance = exit_distance[..., None, None] + span[..., None, None] * self.radial_fractions.float()
         axial = centers[:, :, None, None, None] + distance[..., None] * rays[None, None, :, None, None]
-        # Use an isotropic image-space offset even if the feature canvas is rectangular.
-        cell_size = (pad_sizes.float() / pad_sizes.new_tensor(feature_shape, dtype=torch.float32)).min(-1).values
-        delta = self.ray_lateral_offset * cell_size
-        normal = torch.stack((-rays[:, 1], rays[:, 0]), -1)
-        signs = boxes.new_tensor([-1., 1.])
-        lateral = (delta[:, None, None, None, None, None, None]
-                   * normal[None, None, :, None, None, None]
-                   * signs[None, None, None, None, None, :, None])
         b, n = boxes.shape[:2]
         shape = (b, n, self.num_directions, self.num_regions, 4)
-        points = (axial.unsqueeze(-2) + lateral).reshape(*shape, 2)
+        if self.ray_lateral_offset == 0:
+            points = axial
+        else:
+            # Compatibility only: keep the former neighborhood geometry exact.
+            cell_size = (pad_sizes.float() / pad_sizes.new_tensor(feature_shape, dtype=torch.float32)).min(-1).values
+            delta = self.ray_lateral_offset * cell_size
+            normal = torch.stack((-rays[:, 1], rays[:, 0]), -1)
+            signs = boxes.new_tensor([-1., 1.])
+            lateral = (delta[:, None, None, None, None, None, None]
+                       * normal[None, None, :, None, None, None]
+                       * signs[None, None, None, None, None, :, None])
+            points = (axial.unsqueeze(-2) + lateral).reshape(*shape, 2)
         weights = (span > 0)[..., None, None].expand(shape).float()
         region_width = (span[..., None] * self.radial_edges.diff().float())[..., None].expand(shape)
         return points, weights, centers, sizes, bounds, region_width
