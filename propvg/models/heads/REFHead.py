@@ -26,6 +26,7 @@ from .unet_head import SimpleFPN, UnetDecoder
 from propvg.models.losses.segloss import seg_loss
 from .grab_binding import GrabGraphBinding
 from .optional_modules import build_optional_module
+from .counterfactual_refinement import CounterfactualRefinement
 from .background_context import BackgroundContextEnhancement
 
 
@@ -443,11 +444,14 @@ class REFHead(nn.Module):
         enable_mask=True,
         enable_bcem=False,
         bcem=None,
+        enable_crv=False,
+        crv=None,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
         self.enable_mask = enable_mask
         self.enable_bcem = enable_bcem
+        self.enable_crv = enable_crv
         self._omitted_parameter_names = []
         self.seg_branch = build_optional_module(
             lambda: SegBranch(hidden_channels, upsample_rate=1), enable_mask,
@@ -559,6 +563,36 @@ class REFHead(nn.Module):
         # baseline's parameters and RNG stream are unchanged when disabled.
         self.bcem = (BackgroundContextEnhancement(hidden_channels=hidden_channels, **(bcem or {}))
                      if enable_bcem else None)
+        self.crv = None
+        if enable_crv:
+            options = dict(crv or {})
+            seed = options.pop("init_seed", 1717)
+            # Seed only the CPU generator and restore it afterwards. Do not
+            # torch.manual_seed here: that would also reset CUDA generators.
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(seed)
+                self.crv = CounterfactualRefinement(hidden_channels=hidden_channels, **options)
+
+    def _score_referring(self, query, text, text_mask):
+        if self.enable_crv:
+            return self.mrsm(query, text, text_mask, return_logits=True)
+        score, attention = self.mrsm(query, text, text_mask)
+        return score, attention, None
+
+    @staticmethod
+    def _crv_refer_gt(targets, img_metas):
+        result = []
+        for boxes, meta in zip(targets["bbox"], img_metas):
+            indices = meta["refer_target_index"]
+            if len(indices) > 1:
+                raise ValueError("CRV requires a single referring target per sample")
+            if not len(indices):
+                result.append(None)
+                continue
+            height, width = meta["img_shape"][:2]
+            box = boxes[indices[0]].detach().reshape(4)
+            result.append(box / box.new_tensor([width, height, width, height]))
+        return result
 
     def _enhance_background(self, queries, boxes, visuals, visual_masks, text, text_mask, img_metas):
         if not self.enable_bcem:
@@ -715,7 +749,7 @@ class REFHead(nn.Module):
             lan_feat, lan_mask, img_metas,
         )
         extra_dict.update(background_info)
-        refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
+        refer_label, proposal_word_attnmap, refer_logits = self._score_referring(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
 
@@ -762,6 +796,18 @@ class REFHead(nn.Module):
             "loss_filter": loss_filter * 0.5,
         }
 
+        ranking_priority = None
+        if self.enable_crv:
+            refer_score, ranking_priority, crv_losses, crv_info = self.crv(
+                multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
+                refer_label, refer_logits, img_metas, self._crv_refer_gt(targets, img_metas),
+            )
+            loss_dict.update(crv_losses)
+            for key in ("alpha", "active", "uncertainty", "corrected", "harmed", "reachable", "rejected_negatives",
+                        "rank_changed", "group_count"):
+                loss_dict["metric_crv_" + key] = crv_info["crv_" + key]
+            extra_dict.update(crv_info)
+
         pred_dict = {
             "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
             "pred_class_allobj": selected_classes.detach(),
@@ -769,6 +815,8 @@ class REFHead(nn.Module):
             "refer_label": refer_score.detach(),
             "att_map": att_map[-1].detach(),
         }
+        if ranking_priority is not None:
+            pred_dict["ranking_priority"] = ranking_priority.detach()
         return loss_dict, pred_dict, extra_dict
 
     def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None, with_mask=True):
@@ -858,16 +906,25 @@ class REFHead(nn.Module):
             )
         else:
             bound_queries = inter_states[-1]
-            bound_boxes, selected_classes = outputs_coord[-1], outputs_class[-1]
+            bound_boxes, selected_classes, selected_indices = outputs_coord[-1], outputs_class[-1], None
         refer_query_embed = self.refer_adapter(bound_queries)
         refer_query_embed, background_info = self._enhance_background(
             refer_query_embed, bound_boxes, multi_level_feats, multi_level_masks,
             lan_feat, lan_mask, img_metas,
         )
         extra_dict.update(background_info)
-        refer_label, proposal_word_attnmap = self.mrsm(refer_query_embed, lan_feat, lan_mask)
+        refer_label, proposal_word_attnmap, refer_logits = self._score_referring(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
+
+        ranking_priority = None
+        if self.enable_crv:
+            # No GT (including targets['bbox']) is read during inference.
+            refer_score, ranking_priority, _, crv_info = self.crv(
+                multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
+                refer_label, refer_logits, img_metas,
+            )
+            extra_dict.update(crv_info)
 
         pred_dict = {
             "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
@@ -876,4 +933,6 @@ class REFHead(nn.Module):
             "refer_label": refer_score.detach(),
             "att_map": att_map[-1].detach(),
         }
+        if ranking_priority is not None:
+            pred_dict["ranking_priority"] = ranking_priority.detach()
         return pred_dict, extra_dict

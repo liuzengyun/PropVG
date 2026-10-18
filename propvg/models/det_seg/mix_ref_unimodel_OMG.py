@@ -266,7 +266,7 @@ class MIXRefUniModel_OMG(OneStageModel):
                 height = image_size[0]
                 width = image_size[1]
                 r = detector_postprocess(results_per_image, height, width)
-                rank_logits = pred.get("refer_logits")
+                rank_logits = pred.get("ranking_priority", pred.get("refer_logits"))
                 # Optional ranking logits preserve precision when provided.
                 # Keep the baseline probability ranking when they are absent.
                 rank_logits = rank_logits[ind, :, 0] if rank_logits is not None else None

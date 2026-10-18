@@ -40,7 +40,8 @@ def evaluate(model, loader):
         inputs = extract_data(inputs)
         outputs = model(**inputs, return_loss=False, with_bbox=True, with_mask=False, rescale=False)
         for prediction, target in zip(outputs["pred_bboxes"], targets):
-            ranking = prediction["scores"].reshape(-1).argsort(descending=True)
+            ranking = prediction.get("ranking_logits", prediction["scores"]).reshape(-1).argsort(
+                descending=True, stable="ranking_logits" in prediction)
             if ranking.numel() == 0:
                 zero = prediction["boxes"].new_tensor(0.0)
                 top1.append(zero)

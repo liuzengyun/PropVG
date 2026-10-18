@@ -37,6 +37,21 @@ def _optimizer_parameter_names(model, optimizer):
     return [[names[id(parameter)] for parameter in group["params"]] for group in optimizer.param_groups]
 
 
+def _validate_crv_checkpoint(model, state):
+    """Do not silently evaluate an enabled but randomly initialized CRV."""
+    base = model.module if hasattr(model, "module") else model
+    head = getattr(base, "head", None)
+    crv = getattr(head, "crv", None)
+    if crv is None or not hasattr(crv, "schema_version"):
+        return
+    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
+    expected = {"head.crv." + name for name in crv.state_dict()}
+    version = normalized.get("head.crv.schema_version")
+    if not expected.issubset(normalized) or version is None or int(version) != int(crv.schema_version):
+        raise ValueError("Enabled CRV requires a complete compatible CRV checkpoint. "
+                         "To start CRV training from a baseline, use --finetune-from instead of --load-from/--resume-from.")
+
+
 def _load_optimizer_state(model, optimizer, checkpoint, model_state):
     """Resume across removal of inactive branches without shifting Adam states."""
     saved = checkpoint["optimizer"]
@@ -164,6 +179,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
             ema_state = de_parallel(ema_state)
     if is_paral_state(state) and not is_paral_model(model):
         state = de_parallel(state)
+    _validate_crv_checkpoint(model, state)
     try:
         model.load_state_dict(state, strict=True)
     except:

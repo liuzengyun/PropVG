@@ -12,6 +12,7 @@ work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays"
 # Select the AerialVG-specific validation branch in the training runner.
 dataset = "AerialVG"
 dataset_type = "AerialVG"
+start_test = 22  # 1-based: test each epoch from 22, using the same GPUs as val; None/<=0 disables.
 # Maximum observed AerialVG caption length is 55 SentencePiece tokens;
 # 64 leaves room for BEiT3 BOS/EOS tokens without truncation.
 max_token = 64
@@ -49,11 +50,16 @@ freeze_beit3 = False
 enable_grab=False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
+# Independent post-CRS refinement. False preserves the previous experiment.
+enable_crv = False
+crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
+crv_grid_size = 24  # Intervene at full feature resolution, then pool for scoring.
+crv_uncertainty_threshold = 0.6  # Only grouped entropy above this enables refinement.
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
 enable_bcem = True
 # New experiments sample four points per stage directly on each ray.
 bcem_sampling_mode = "ray"
-bcem_num_rays = 8
+bcem_num_rays = 16
 # Used only by sector mode; 8 reproduces the original direction order.
 bcem_num_sectors = 4
 
@@ -114,6 +120,17 @@ model = dict(
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
+              enable_crv=enable_crv,
+              crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
+                       scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=2,
+                       inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
+                       uncertainty_temperature=1.0, gate_initial_probability=0.02,
+                       uncertainty_threshold=crv_uncertainty_threshold,
+                       base_temperature=1.0, cf_temperature=1.0,  # Fixed; gate reads entropy only.
+                       negative_gt_coverage=0.01, gt_loss_weight=0.1,
+                       cf_loss_weight=0.1, fusion_loss_weight=1.0,
+                       positive_margin=1.0, pair_margin=0.5, ranking_margin=0.5,
+                       safety_margin=0.5, safety_weight=2.0, repair_weight=2.0),
               enable_bcem=enable_bcem,
               bcem=dict(context_dim=128, num_heads=4, num_sectors=bcem_num_sectors,
                         sampling_mode=bcem_sampling_mode, num_rays=bcem_num_rays,
@@ -142,3 +159,4 @@ start_save_checkpoint = 0
 save_interval = 1
 max_keep_ckpts = 10
 # finetune_from = "PropVG-grefcoco.pth"
+resume_from = '/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays/20261016_201026/epoch_32.pth'

@@ -43,6 +43,19 @@ def set_random_seed(seed, deterministic=False, strict=False):
         torch.use_deterministic_algorithms(True, warn_only=True)
 
 
+def clip_training_gradients(model, max_norm):
+    """CRV gradients must not change the norm used to clip the base model."""
+    base_model = model.module if hasattr(model, "module") else model
+    crv = getattr(getattr(base_model, "head", base_model), "crv", None)
+    if crv is None:
+        return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+    crv_parameters = list(crv.parameters())
+    crv_ids = {id(parameter) for parameter in crv_parameters}
+    base_parameters = [parameter for parameter in model.parameters() if id(parameter) not in crv_ids]
+    torch.nn.utils.clip_grad_norm_(base_parameters, max_norm)
+    return torch.nn.utils.clip_grad_norm_(crv_parameters, max_norm)
+
+
 def train_model(epoch, cfg, model, optimizer, loader):
     model.train()
 
@@ -55,6 +68,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
     end = time.time()
 
     loss_det_list, loss_mask_list, loss_label_nt_list, loss_refer_list, loss_filter_list = [], [], [], [], []
+    crv_history = {}
     for batch, inputs in enumerate(loader):
         data_time = time.time() - end
         if not cfg.distributed:
@@ -68,6 +82,15 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss_refer = losses.pop("loss_refer", torch.tensor([0.0], device=device))
         loss_filter = losses.pop("loss_filter", torch.tensor([0.0], device=device))
         loss = loss_det + loss_mask + loss_label_nt + loss_refer + loss_filter
+        crv_values = {}
+        if "loss_crv_cf" in losses:
+            for key in ("loss_crv_cf", "loss_crv_fusion"):
+                value = losses.pop(key)
+                loss = loss + value
+                crv_values[key] = value.detach()
+            for key in ("alpha", "active", "uncertainty", "corrected", "harmed", "reachable", "rejected_negatives",
+                        "rank_changed", "group_count"):
+                crv_values["crv_" + key] = losses.pop("metric_crv_" + key).detach()
         # loss = loss_det
         optimizer.zero_grad()
         if cfg.use_fp16:
@@ -76,7 +99,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
         else:
             loss.backward()
         if cfg.grad_norm_clip:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_norm_clip)
+            clip_training_gradients(model, cfg.grad_norm_clip)
         optimizer.step()
 
         if cfg.distributed:
@@ -90,6 +113,10 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss_label_nt_list.append(loss_label_nt.item())
         loss_refer_list.append(loss_refer.item())
         loss_filter_list.append(loss_filter.item())
+        for key, value in crv_values.items():
+            if cfg.distributed:
+                value = reduce_mean(value)
+            crv_history.setdefault(key, []).append(value.item())
 
         if is_main():
             if (batch + 1) % cfg.log_interval == 0 or batch + 1 == batches:
@@ -103,6 +130,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
                     + f"loss_refer: {sum(loss_refer_list) / len(loss_refer_list):.4f}, "
                     + f"loss_filter: {sum(loss_filter_list) / len(loss_filter_list):.4f}, "
                     + f"lr: {optimizer.param_groups[0]['lr']:.6f}, "
+                    + "".join(f"{key}: {sum(values) / len(values):.4f}, " for key, values in crv_history.items())
                 )
 
                 wandb.log(
@@ -113,6 +141,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
                         "loss_refer": sum(loss_refer_list) / len(loss_refer_list),
                         "loss_filter": sum(loss_filter_list) / len(loss_filter_list),
                         "lr": optimizer.param_groups[0]["lr"],
+                        **{key: sum(values) / len(values) for key, values in crv_history.items()},
                     }
                 )
 

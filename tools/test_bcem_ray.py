@@ -199,6 +199,7 @@ class BCEMRayTests(unittest.TestCase):
 
     def test_current_config_reaches_crs_in_training_and_inference(self):
         options = copy.deepcopy(Config.fromfile('configs/aerialvg/PropVG-aerialvg.py').model.head)
+        options['enable_crv'] = False  # This test covers BCEM, not post-CRS refinement.
         options.update(enable_bcem=True, num_queries=8)
         options['bcem'].update(sampling_mode='ray', num_rays=16, min_valid_points=2, context_dim=16)
         head = build_head(options)

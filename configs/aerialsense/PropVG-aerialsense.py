@@ -12,6 +12,7 @@ work_dir = "/media/vision/lzy/PropVG/work_dir/aerialsense/PropVG-aerialsense"
 # same one-expression/one-referred-box visual-grounding format.
 dataset = "AerialVG"
 dataset_type = "AerialVG"
+start_test = 22  # 1-based: test each epoch from 22, using the same GPUs as val; None/<=0 disables.
 max_token = 64
 
 # New source-stratified, scene-grouped 75/25 split (seed 6666).
@@ -47,6 +48,11 @@ freeze_beit3 = False
 enable_grab = False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
+# Independent post-CRS refinement; disabled to retain the previous pipeline.
+enable_crv = False
+crv_topk = 5
+crv_grid_size = 24
+crv_uncertainty_threshold = 0.6  # Only grouped entropy above this enables refinement.
 
 img_size = 586
 patch_size = 16
@@ -175,6 +181,17 @@ model = dict(
         MTD=dict(K=250),
         enable_grab=enable_grab,
         enable_mask=enable_mask,
+        enable_crv=enable_crv,
+        crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
+                 scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=2,
+                 inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
+                 uncertainty_temperature=1.0, gate_initial_probability=0.02,
+                 uncertainty_threshold=crv_uncertainty_threshold,
+                 base_temperature=1.0, cf_temperature=1.0,  # Fixed; gate reads entropy only.
+                 negative_gt_coverage=0.01, gt_loss_weight=0.1,
+                 cf_loss_weight=0.1, fusion_loss_weight=1.0,
+                 positive_margin=1.0, pair_margin=0.5, ranking_margin=0.5,
+                 safety_margin=0.5, safety_weight=2.0, repair_weight=2.0),
     ),
     post_params=dict(
         score_weighted=False,

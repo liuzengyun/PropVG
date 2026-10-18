@@ -3,10 +3,13 @@ import argparse
 import os
 import os.path as osp
 import shutil
+import random
 
 # Must be configured before CUDA creates a cuBLAS handle.
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
+import numpy as np
+import torch
 import torch.distributed as dist
 
 import mmcv
@@ -63,6 +66,71 @@ def parse_args():
     )
     args = parser.parse_args()
     return args
+
+
+class EpochTestMonitor:
+    """Optional current-epoch test logging, isolated from val model selection."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.context = None
+
+    def due(self, epoch):
+        if self.cfg.dataset != "AerialVG":
+            return False
+        start = self.cfg.get("start_test", None)
+        if start is None:
+            return False
+        if isinstance(start, bool) or not isinstance(start, int):
+            raise ValueError("start_test must be an integer epoch (1-based), or None to disable")
+        return start > 0 and epoch + 1 >= start
+
+    def _evaluate(self, epoch, model):
+        base_model = model.module if hasattr(model, "module") else model
+        # Just like val: retain DDP and rank-local DataContainer scattering for
+        # distributed evaluation; single-GPU evaluation uses the bare model.
+        eval_model = model if self.cfg.distributed else base_model
+        mode_root = model if isinstance(model, torch.nn.Module) else base_model
+        modes = [(module, module.training) for module in mode_root.modules()]
+        iteration = getattr(base_model, "iter", None)
+        python_rng, numpy_rng = random.getstate(), np.random.get_state()
+        device = next(base_model.parameters()).device
+        devices = [device.index] if device.type == "cuda" else []
+        try:
+            # Extra test loading/inference must not advance training RNGs or
+            # leave the live training model in a different mode/counter state.
+            with torch.random.fork_rng(devices=devices):
+                if self.context is None:
+                    test_cfg = self.cfg.copy()
+                    test_dataset = build_dataset(test_cfg.data.test)
+                    self.context = test_cfg, build_dataloader(test_cfg, test_dataset)
+                test_cfg, test_loader = self.context
+                if is_main():
+                    logger = get_root_logger()
+                    logger.info(
+                        "Epoch [%d]: evaluating CURRENT model on test with %d GPU(s), same as val "
+                        "(logging only; val selects best).",
+                        epoch + 1, self.cfg.world_size if self.cfg.distributed else 1,
+                    )
+                top1, top5, miou = evaluate_model(f"test_epoch_{epoch + 1}", test_cfg, eval_model, test_loader)
+                if is_main():
+                    logger.info(
+                        "Epoch [%d] test (current model): Top-1 Acc@0.5: %.2f%%, Top-5 Acc@0.5: %.2f%%, box mIoU: %.2f%%",
+                        epoch + 1, top1, top5, miou,
+                    )
+        finally:
+            random.setstate(python_rng)
+            np.random.set_state(numpy_rng)
+            for module, training in modes:
+                module.training = training
+            if iteration is not None:
+                base_model.iter = iteration
+
+    def run(self, epoch, model):
+        if self.due(epoch):
+            # Every training rank participates in the same evaluator/collectives
+            # as val. No rank-zero-only inference or separate waiting group.
+            self._evaluate(epoch, model)
 
 
 def main_worker(cfg):
@@ -221,6 +289,7 @@ def main_worker(cfg):
                     "final best-checkpoint testing will require a new best epoch.",
                     cfg.resume_from,
                 )
+    epoch_test_monitor = EpochTestMonitor(cfg)
     for epoch in range(start_epoch + 1, cfg.scheduler_config.max_epoch):
         start_time = time.time()
         train_model(epoch, cfg, model, optimizer, dataloaders[0])
@@ -419,6 +488,11 @@ def main_worker(cfg):
                 best_mIoU = max(mIoU, best_mIoU)
                 best_oIoU = max(oIoU, best_oIoU)
                 best_d_acc = max(d_acc, best_d_acc)
+
+        # Diagnostic test results never enter saved_info, best-val metrics or
+        # directory naming. Run every epoch from start_test, independently of
+        # the original validation interval and checkpoint-saving schedule.
+        epoch_test_monitor.run(epoch, model)
 
         if cfg.distributed:
             dist.barrier()
