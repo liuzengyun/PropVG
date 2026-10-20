@@ -51,8 +51,10 @@ enable_mask = False
 # Independent post-CRS refinement; disabled to retain the previous pipeline.
 enable_crv = False
 crv_topk = 5
-crv_grid_size = 24
+crv_crop_size = 48  # Candidate-centered crop in feature cells, not image pixels.
+crv_grid_size = 24  # Pool matched original/masked crops after the intervention.
 crv_uncertainty_threshold = 0.6  # Only grouped entropy above this enables refinement.
+crv_start_epoch = 22  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
 img_size = 586
 patch_size = 16
@@ -182,15 +184,16 @@ model = dict(
         enable_grab=enable_grab,
         enable_mask=enable_mask,
         enable_crv=enable_crv,
-        crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
+        crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size, crop_size=crv_crop_size,
+                 start_epoch=crv_start_epoch,
                  scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=2,
                  inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
                  uncertainty_temperature=1.0, gate_initial_probability=0.02,
                  uncertainty_threshold=crv_uncertainty_threshold,
-                 base_temperature=1.0, cf_temperature=1.0,  # Fixed; gate reads entropy only.
+                 cf_temperature=1.0,  # Independent CRV ranking only; fusion uses raw CRS logits.
                  negative_gt_coverage=0.01, gt_loss_weight=0.1,
                  cf_loss_weight=0.1, fusion_loss_weight=1.0,
-                 positive_margin=1.0, pair_margin=0.5, ranking_margin=0.5,
+                 positive_margin=1.0, ranking_margin=0.5,
                  safety_margin=0.5, safety_weight=2.0, repair_weight=2.0),
     ),
     post_params=dict(

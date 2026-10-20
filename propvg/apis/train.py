@@ -89,7 +89,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
                 loss = loss + value
                 crv_values[key] = value.detach()
             for key in ("alpha", "active", "uncertainty", "corrected", "harmed", "reachable", "rejected_negatives",
-                        "rank_changed", "group_count"):
+                        "rank_changed", "group_count", "ready"):
                 crv_values["crv_" + key] = losses.pop("metric_crv_" + key).detach()
         # loss = loss_det
         optimizer.zero_grad()

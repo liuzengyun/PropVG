@@ -231,8 +231,9 @@ class EpochTestMonitorTests(unittest.TestCase):
                     return None
                 return self.generic_visit(node)
         current = RemoveOptionalMonitor().visit(worker(Path(runner.__file__).read_text()))
+        reference = RemoveOptionalMonitor().visit(worker(previous))
         self.assertEqual(ast.dump(current, include_attributes=False),
-                         ast.dump(worker(previous), include_attributes=False))
+                         ast.dump(reference, include_attributes=False))
 
 
 if __name__ == "__main__":

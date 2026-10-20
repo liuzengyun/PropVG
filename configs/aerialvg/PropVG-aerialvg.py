@@ -5,14 +5,13 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-crv-val"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
 # Select the AerialVG-specific validation branch in the training runner.
 dataset = "AerialVG"
 dataset_type = "AerialVG"
-start_test = 22  # 1-based: test each epoch from 22, using the same GPUs as val; None/<=0 disables.
 # Maximum observed AerialVG caption length is 55 SentencePiece tokens;
 # 64 leaves room for BEiT3 BOS/EOS tokens without truncation.
 max_token = 64
@@ -29,7 +28,7 @@ use_auxiliary_gt = False
 teacher = True
 # The teacher file must match the configured training annotation records by
 # sample_id and filename. Validation and test do not read it.
-teacher_annsfile = "data/AerialVG/teacher_trainset.json"
+teacher_annsfile = "data/AerialVG/teacher_valset.json"
 # Maximum number of extra teacher boxes per training sample after refer-GT
 # deduplication and teacher NMS. 0 uses only the original refer GT; None keeps
 # every available teacher box. The current JSON contains exactly 5 raw boxes
@@ -51,15 +50,17 @@ enable_grab=False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
 # Independent post-CRS refinement. False preserves the previous experiment.
-enable_crv = False
+enable_crv = True
 crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
-crv_grid_size = 24  # Intervene at full feature resolution, then pool for scoring.
-crv_uncertainty_threshold = 0.6  # Only grouped entropy above this enables refinement.
+crv_crop_size = 48  # Candidate-centered crop in feature cells, not image pixels.
+crv_grid_size = 24  # Pool each matched original/masked 48x48 crop to this grid.
+crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
+crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = True
+enable_bcem = False
 # New experiments sample four points per stage directly on each ray.
 bcem_sampling_mode = "ray"
-bcem_num_rays = 16
+bcem_num_rays = 8
 # Used only by sector mode; 8 reproduces the original direction order.
 bcem_num_sectors = 4
 
@@ -91,13 +92,13 @@ val_pipeline = [
 data = dict(
     samples_per_gpu=8,
     workers_per_gpu=16,
-    train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_train_odvg.jsonl",
+    train=dict(type=dataset_type, which_set="train", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
                imgsfile="data/AerialVG/images", pipeline=train_pipeline,
                teacher_annsfile=teacher_annsfile if teacher else None,
                teacher_dedup_iou=teacher_dedup_iou,
                teacher_nms_iou=teacher_nms_iou,
                teacher_max_boxes=teacher_max_boxes),
-    val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
+    val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
              imgsfile="data/AerialVG/images", pipeline=val_pipeline),
     test=dict(type=dataset_type, which_set="test", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
               imgsfile="data/AerialVG/images", pipeline=val_pipeline),
@@ -121,15 +122,16 @@ model = dict(
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_crv=enable_crv,
-              crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
+              crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size, crop_size=crv_crop_size,
+                       start_epoch=crv_start_epoch,
                        scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=2,
                        inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
                        uncertainty_temperature=1.0, gate_initial_probability=0.02,
                        uncertainty_threshold=crv_uncertainty_threshold,
-                       base_temperature=1.0, cf_temperature=1.0,  # Fixed; gate reads entropy only.
+                       cf_temperature=1.0,  # Independent CRV ranking only; fusion uses raw CRS logits.
                        negative_gt_coverage=0.01, gt_loss_weight=0.1,
                        cf_loss_weight=0.1, fusion_loss_weight=1.0,
-                       positive_margin=1.0, pair_margin=0.5, ranking_margin=0.5,
+                       positive_margin=1.0, ranking_margin=0.5,
                        safety_margin=0.5, safety_weight=2.0, repair_weight=2.0),
               enable_bcem=enable_bcem,
               bcem=dict(context_dim=128, num_heads=4, num_sectors=bcem_num_sectors,
@@ -159,4 +161,5 @@ start_save_checkpoint = 0
 save_interval = 1
 max_keep_ckpts = 10
 # finetune_from = "PropVG-grefcoco.pth"
-resume_from = '/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays/20261016_201026/epoch_32.pth'
+# resume_from = '/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays/20261018_112107/epoch_35.pth'
+start_test = 27  # 1-based: test each epoch from 27, using the same GPUs as val; None/<=0 disables.

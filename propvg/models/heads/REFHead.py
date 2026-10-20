@@ -801,10 +801,11 @@ class REFHead(nn.Module):
             refer_score, ranking_priority, crv_losses, crv_info = self.crv(
                 multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
                 refer_label, refer_logits, img_metas, self._crv_refer_gt(targets, img_metas),
+                epoch=targets.get("epoch"),
             )
             loss_dict.update(crv_losses)
             for key in ("alpha", "active", "uncertainty", "corrected", "harmed", "reachable", "rejected_negatives",
-                        "rank_changed", "group_count"):
+                        "rank_changed", "group_count", "ready"):
                 loss_dict["metric_crv_" + key] = crv_info["crv_" + key]
             extra_dict.update(crv_info)
 
