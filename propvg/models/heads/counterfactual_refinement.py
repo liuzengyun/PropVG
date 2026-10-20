@@ -1,4 +1,4 @@
-"""Entropy-routed counterfactual refinement with paired local scene crops."""
+"""Entropy-routed counterfactual refinement over complete visual scenes."""
 import math
 
 import torch
@@ -19,7 +19,7 @@ def pairwise_iou(boxes, targets):
 
 
 class SceneTextScorer(nn.Module):
-    """Shared scene/text support score, before and after local intervention."""
+    """Shared full-scene/text support score, before and after intervention."""
     def __init__(self, channels, dim=128, heads=4, layers=2):
         super().__init__()
         self.visual = nn.Conv2d(channels, dim, 1, bias=False)
@@ -76,7 +76,7 @@ class SceneTextScorer(nn.Module):
 
 
 class CounterfactualRefinement(nn.Module):
-    def __init__(self, hidden_channels=256, topk=5, uncertainty_topn=5, grid_size=24, crop_size=48,
+    def __init__(self, hidden_channels=256, topk=5, uncertainty_topn=5, grid_size=24, crop_size=None,
                  scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
                  inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
                  uncertainty_temperature=1.0, uncertainty_threshold=0.6, gate_initial_probability=0.02,
@@ -88,8 +88,8 @@ class CounterfactualRefinement(nn.Module):
         super().__init__()
         if min(topk, uncertainty_topn, grid_size, chunk_size, scorer_layers) < 1:
             raise ValueError("CRV candidate counts, grid, chunks and layers must be positive")
-        if isinstance(crop_size, bool) or not isinstance(crop_size, int) or crop_size < grid_size:
-            raise ValueError("CRV crop_size must be an integer at least as large as grid_size")
+        if crop_size is not None:
+            raise ValueError("Full-scene CRV requires crop_size=None; remove the legacy local-crop setting")
         if not 1 <= inner_scale < outer_scale:
             raise ValueError("CRV requires 1 <= inner_scale < outer_scale")
         if not 0 < duplicate_iou <= 1 or not 0 <= negative_gt_coverage <= 1:
@@ -105,7 +105,6 @@ class CounterfactualRefinement(nn.Module):
         if scorer_dim % scorer_heads or scorer_dim % 2:
             raise ValueError("CRV scorer_dim must be even and divisible by scorer_heads")
         self.topk, self.uncertainty_topn, self.grid_size = topk, uncertainty_topn, grid_size
-        self.crop_size = crop_size
         self.chunk_size = chunk_size
         self.inner_scale, self.outer_scale, self.duplicate_iou = inner_scale, outer_scale, duplicate_iou
         self.uncertainty_temperature = uncertainty_temperature
@@ -116,7 +115,7 @@ class CounterfactualRefinement(nn.Module):
         self.ranking_margin, self.safety_margin = ranking_margin, safety_margin
         self.safety_weight, self.repair_weight = safety_weight, repair_weight
         self.scorer = SceneTextScorer(hidden_channels, scorer_dim, scorer_heads, scorer_layers)
-        self.register_buffer("schema_version", torch.tensor(8, dtype=torch.long))
+        self.register_buffer("schema_version", torch.tensor(9, dtype=torch.long))
         # Saved with checkpoints so validation/evaluation before the scheduled
         # start cannot accidentally use a randomly initialized CRV branch.
         self.register_buffer("last_training_epoch", torch.tensor(0, dtype=torch.long))
@@ -209,55 +208,31 @@ class CounterfactualRefinement(nn.Module):
         entropy = -(relative * relative.clamp(min=1e-8).log()).sum(1) / counts.clamp(min=2).log()
         return entropy.clamp(0, 1), counts
 
-    def crop_origins(self, boxes_xyxy, feature, meta):
-        """Integer (x,y) origins on the padded feature map, not image pixels."""
-        ih, iw = meta["img_shape"][:2]
-        ph, pw = meta["pad_shape"][:2]
-        height, width = feature.shape[-2:]
-        centers = (boxes_xyxy[:, :2] + boxes_xyxy[:, 2:]) / 2
-        centers = centers * centers.new_tensor((iw * width / pw, ih * height / ph))
-        return (centers - self.crop_size / 2).floor().long()
-
-    def crop_support(self, origins, feature):
-        """Actual intervention footprint, including truncation by a local crop."""
-        height, width = feature.shape[-2:]
-        yy = torch.arange(height, device=feature.device)[None, :, None]
-        xx = torch.arange(width, device=feature.device)[None, None, :]
-        x, y = origins[:, 0, None, None], origins[:, 1, None, None]
-        return (xx >= x) & (xx < x + self.crop_size) & (yy >= y) & (yy < y + self.crop_size)
-
     @staticmethod
     def image_mean(projected, valid):
         """Cache the full valid-image mean, not a candidate crop's mean."""
         v = valid[:, None].to(projected.dtype)
         return (projected * v).sum((-1, -2), keepdim=True) / v.sum((-1, -2), keepdim=True).clamp(min=1.)
 
-    def pooled_scenes(self, projected, valid, masks, origins, owners=None, mean=None):
-        """Matched original/masked C x C crops, then valid-aware G x G pooling.
+    def pooled_original(self, projected, valid):
+        """One original full-scene grid, validity and fill mean per image."""
+        v = valid[:, None].to(projected.dtype)
+        denominator = F.adaptive_avg_pool2d(v, self.grid_size)
+        original = F.adaptive_avg_pool2d(projected * v, self.grid_size) / denominator.clamp(min=1e-8)
+        return original, denominator, self.image_mean(projected, valid)
 
-        Owners allow independent candidates from different images in one batch.
-        No full-scene baseline is used or shared across different local windows.
+    def pooled_interventions(self, projected, valid, masks, owners, original, denominator, mean):
+        """Full-resolution mean replacement, then valid-aware full-scene pooling.
+
+        Linearity reuses the original pooled grid. Only this chunk's weighted
+        features are materialized; there is no crop or intervention size cap.
         """
-        if valid.ndim == 2:
-            valid = valid[None]
         if owners is None:
-            owners = origins.new_zeros(len(origins))
-        if mean is None:
-            mean = self.image_mean(projected, valid)
-        height, width = projected.shape[-2:]
-        offset = torch.arange(self.crop_size, device=projected.device)
-        yy = origins[:, 1, None, None] + offset[None, :, None]
-        xx = origins[:, 0, None, None] + offset[None, None, :]
-        inside = (yy >= 0) & (yy < height) & (xx >= 0) & (xx < width)
-        yy, xx = yy.clamp(0, height - 1), xx.clamp(0, width - 1)
-        local = projected.permute(0, 2, 3, 1)[owners[:, None, None], yy, xx].permute(0, 3, 1, 2)
-        local_valid = (valid[owners[:, None, None], yy, xx] & inside)[:, None].to(projected.dtype)
-        local_masks = masks[torch.arange(len(masks), device=masks.device)[:, None, None], yy, xx]
-        masked = local + (mean[owners] - local) * local_masks[:, None]
-        denominator = F.adaptive_avg_pool2d(local_valid, self.grid_size)
-        normalize = lambda scenes: (F.adaptive_avg_pool2d(scenes * local_valid, self.grid_size)
-                                     / denominator.clamp(min=1e-8)) * (denominator > 0)
-        return normalize(local), normalize(masked), denominator
+            owners = masks.new_zeros(len(masks), dtype=torch.long)
+        masks = (masks * valid[owners])[:, None].to(projected.dtype)
+        weighted = F.adaptive_avg_pool2d(projected[owners] * masks, self.grid_size)
+        pooled_masks = F.adaptive_avg_pool2d(masks, self.grid_size)
+        return original[owners] + (mean[owners] * pooled_masks - weighted) / denominator[owners].clamp(min=1e-8)
 
     def fusion(self, base, drops, entropy):
         base = base.detach()
@@ -332,41 +307,32 @@ class CounterfactualRefinement(nn.Module):
         if routed:
             active_valid = valid_images[routed]
             projected = self.scorer.visual(visual[routed])
-            fill_mean = self.image_mean(projected, active_valid)
-            all_masks, all_origins, all_owners = [], [], []
+            original, pooled_valid, fill_mean = self.pooled_original(projected, active_valid)
+            all_masks, all_owners = [], []
             offset = 0
             for owner, bi in enumerate(routed):
                 indices = order[bi, :self.topk]
                 gt = refer_gt[bi] if self.training and refer_gt is not None else None
-                crop_boxes = clipped_boxes[bi, indices]
+                intervention_boxes = clipped_boxes[bi, indices]
                 if gt is not None:
                     gt = gt.detach().to(visual).clamp(0, 1)
-                    crop_boxes = torch.cat((crop_boxes, gt[None]))
-                masks = self.intervention_masks(crop_boxes, visual[bi], img_metas[bi], valid_images[bi])
-                origins = self.crop_origins(crop_boxes, visual[bi], img_metas[bi])
-                masks = masks * self.crop_support(origins, visual[bi])
+                    intervention_boxes = torch.cat((intervention_boxes, gt[None]))
+                masks = self.intervention_masks(intervention_boxes, visual[bi], img_metas[bi], valid_images[bi])
                 count = len(masks)
-                contexts[bi] = (owner, offset, count, gt, masks, origins)
+                contexts[bi] = (owner, offset, count, gt, masks)
                 all_masks.append(masks)
-                all_origins.append(origins)
                 all_owners.append(order.new_full((count,), owner))
                 offset += count
-            masks, origins, owners = torch.cat(all_masks), torch.cat(all_origins), torch.cat(all_owners)
-            # Every candidate has its OWN original crop paired with the masked
-            # version of the SAME window. Cross-image batching only saves calls.
-            originals, interventions, valid_crops = [], [], []
+            masks, owners = torch.cat(all_masks), torch.cat(all_owners)
+            interventions = []
             for start in range(0, len(masks), self.chunk_size):
                 end = start + self.chunk_size
-                original, masked, crop_valid = self.pooled_scenes(
-                    projected, active_valid, masks[start:end], origins[start:end],
-                    owners=owners[start:end], mean=fill_mean)
-                originals.append(original)
-                interventions.append(masked)
-                valid_crops.append(crop_valid)
-            scenes = torch.cat((torch.cat(originals), torch.cat(interventions)))
-            pooled_valid = torch.cat(valid_crops)
-            scene_valid = torch.cat((pooled_valid, pooled_valid))
-            scene_owners = torch.cat((owners, owners))
+                interventions.append(self.pooled_interventions(
+                    projected, active_valid, masks[start:end], owners[start:end], original, pooled_valid, fill_mean))
+            # Each image contributes exactly ONE original scene; all its masked
+            # scenes retain the same complete spatial domain and validity mask.
+            scenes = torch.cat((original, torch.cat(interventions)))
+            scene_owners = torch.cat((torch.arange(len(routed), device=owners.device), owners))
             active_text, active_text_mask = text[routed], text_mask[routed]
             prepared = self.scorer.prepare_text(active_text, active_text_mask)
             positions = self.scorer.spatial_positions(self.grid_size, self.grid_size, scenes)
@@ -377,16 +343,16 @@ class CounterfactualRefinement(nn.Module):
                 end = start + self.chunk_size
                 selected = scene_owners[start:end]
                 encoded.append(self.scorer(
-                    scenes[start:end], scene_valid[start:end], active_text[selected], active_text_mask[selected],
+                    scenes[start:end], pooled_valid[selected], active_text[selected], active_text_mask[selected],
                     prepared_text=tuple(value[selected] for value in prepared), positions=positions))
             encoded = torch.cat(encoded)
-            original_support = encoded[:len(masks)]
-            masked_support = encoded[len(masks):]
+            original_support = encoded[:len(routed)]
+            masked_support = encoded[len(routed):]
             # Identical scenes must have exactly zero drops, even if different
             # GEMM batch shapes introduce tiny floating-point differences.
-            masked_support = torch.where(masks.flatten(1).any(1), masked_support, original_support)
-            for bi, (_owner, offset, count, *_rest) in contexts.items():
-                supports[bi] = (original_support[offset:offset + count], masked_support[offset:offset + count])
+            masked_support = torch.where(masks.flatten(1).any(1), masked_support, original_support[owners])
+            for bi, (owner, offset, count, *_rest) in contexts.items():
+                supports[bi] = (original_support[owner].expand(count), masked_support[offset:offset + count])
         cf_terms, fusion_terms, alphas, active, entropies = [], [], [], [], []
         changed, group_counts = [], []
         corrected, harmed, reachable, rejected = [], [], [], []
@@ -411,7 +377,7 @@ class CounterfactualRefinement(nn.Module):
                         values.append(base.new_zeros(()))
                 sample_details.append({"indices": indices, "skipped": True})
                 continue
-            _, _, _, gt, masks, origins = contexts[bi]
+            _, _, _, gt, masks = contexts[bi]
             original_support, masked_support = supports[bi]
             importance = self.support_drop(original_support, masked_support)
             drops = importance[:len(indices)]
@@ -438,7 +404,6 @@ class CounterfactualRefinement(nn.Module):
             cf_terms.append(cf)
             fusion_terms.append(fusion)
             sample_details.append({"indices": indices, "skipped": False,
-                                   "crop_origins": origins[:len(indices)].detach(),
                                    "original_support": original_support[:len(indices)].detach(),
                                    "masked_support": masked_support[:len(indices)].detach(),
                                    "importance": drops.detach(),

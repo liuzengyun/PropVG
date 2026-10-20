@@ -52,8 +52,7 @@ enable_mask = False
 # Independent post-CRS refinement. False preserves the previous experiment.
 enable_crv = True
 crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
-crv_crop_size = 48  # Candidate-centered local crop in feature cells, not image pixels.
-crv_grid_size = 24  # Pool matched original/masked local crops to this scoring grid.
+crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
 crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
@@ -122,7 +121,7 @@ model = dict(
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_crv=enable_crv,
-              crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size, crop_size=crv_crop_size,
+              crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
                        start_epoch=crv_start_epoch,
                        scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
                        inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,

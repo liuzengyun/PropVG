@@ -36,9 +36,10 @@ class CRVTests(unittest.TestCase):
                 torch.randn(1, 6, 16), torch.tensor([[0, 0, 0, 0, 1, 1]]), scores,
                 torch.logit(scores), [dict(img_shape=(80, 100), pad_shape=(100, 100))]]
 
-    def pooled_scenes(self, model, projected, valid, masks, origins):
-        masks = masks * valid * model.crop_support(origins, projected[0])
-        return model.pooled_scenes(projected, valid, masks, origins)
+    def pooled_scenes(self, model, projected, valid, masks):
+        original, denominator, mean = model.pooled_original(projected, valid[None])
+        masked = model.pooled_interventions(projected, valid[None], masks, None, original, denominator, mean)
+        return original.expand(len(masks), -1, -1, -1), masked, denominator.expand(len(masks), -1, -1, -1)
 
     def test_uncertainty_distinguishes_examples_and_duplicate_boxes(self):
         model = self.module()
@@ -57,7 +58,7 @@ class CRVTests(unittest.TestCase):
         self.assertEqual(repeated_entropy.item(), 0)
 
     def test_mask_geometry_padding_and_per_channel_mean(self):
-        model = self.module(grid_size=24, crop_size=24)
+        model = self.module(grid_size=24)
         args = self.inputs()
         valid = torch.ones(24, 24, dtype=torch.bool)
         valid[19:] = False
@@ -72,120 +73,97 @@ class CRVTests(unittest.TestCase):
         torch.testing.assert_close(mask[0][inner], torch.ones_like(mask[0][inner]))
         self.assertEqual(mask[0][outer].count_nonzero(), 0)
         self.assertEqual(mask[0][~valid].count_nonzero(), 0)
-        _, scene, _ = self.pooled_scenes(model, feature, valid, mask, torch.tensor([[0, 0]]))
+        _, scene, _ = self.pooled_scenes(model, feature, valid, mask)
         expected = (feature * valid).sum((-1, -2)) / valid.sum()
         for channel in (0, 1):
             torch.testing.assert_close(scene[0, channel][inner], expected[0, channel].expand_as(scene[0, channel][inner]))
         self.assertNotEqual(expected[0, 0].item(), expected[0, 1].item())
 
     def test_projection_commutes_with_full_resolution_mean_replacement(self):
-        model = self.module(crop_size=24)
+        model = self.module()
         visual, mask, boxes, *_ = self.inputs()
         valid = ~mask[0]
         masks = model.intervention_masks(model.clipped_boxes(boxes[0, :2]), visual[0],
                                          dict(img_shape=(80, 100), pad_shape=(100, 100)), valid)
         projected = model.scorer.visual(visual)
-        _, actual, _ = self.pooled_scenes(model, projected, valid, masks, torch.zeros(2, 2, dtype=torch.long))
+        _, actual, _ = self.pooled_scenes(model, projected, valid, masks)
         mean = (visual * valid).sum((-1, -2), keepdim=True) / valid.sum()
         modified = visual * (1 - masks[:, None]) + mean * masks[:, None]
         expected = model.scorer.visual(modified)
         expected = torch.nn.functional.adaptive_avg_pool2d(expected, 6)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
-    def test_local_crops_equal_full_resolution_intervention_then_matched_crop_pooling(self):
-        model = self.module(grid_size=24, crop_size=48)
+    def test_full_scene_pooling_matches_full_resolution_mean_intervention(self):
+        model = self.module(grid_size=24)
         visual = torch.arange(2 * 144 * 144.).reshape(1, 2, 144, 144)
         valid = torch.ones(144, 144, dtype=torch.bool)
         valid[110:] = False
         masks = torch.zeros(2, 144, 144)
         masks[0, 42:54, 52:64] = 1
         masks[1, 90:100, 80:92] = .4
-        origins = torch.tensor([[24, 24], [60, 70]])
-        original, masked, support = self.pooled_scenes(model, visual, valid, masks, origins)
+        original, masked, support = self.pooled_scenes(model, visual, valid, masks)
         mean = (visual * valid).sum((-1, -2), keepdim=True) / valid.sum()
-        footprint = masks * model.crop_support(origins, visual[0]) * valid
+        footprint = masks * valid
         full = visual * (1 - footprint[:, None]) + mean * footprint[:, None]
-        for i, (x, y) in enumerate(origins.tolist()):
-            crop_valid = valid[y:y + 48, x:x + 48][None, None].float()
-            denominator = torch.nn.functional.avg_pool2d(crop_valid, 2)
-            expected_original = torch.nn.functional.avg_pool2d(
-                visual[:, :, y:y + 48, x:x + 48] * crop_valid, 2) / denominator.clamp(min=1e-8)
-            expected_masked = torch.nn.functional.avg_pool2d(
-                full[i:i + 1, :, y:y + 48, x:x + 48] * crop_valid, 2) / denominator.clamp(min=1e-8)
-            torch.testing.assert_close(original[i:i + 1], expected_original)
-            torch.testing.assert_close(masked[i:i + 1], expected_masked)
-            torch.testing.assert_close(support[i:i + 1], denominator)
+        denominator = torch.nn.functional.adaptive_avg_pool2d(valid[None, None].float(), 24)
+        expected_original = torch.nn.functional.adaptive_avg_pool2d(visual * valid, 24) / denominator.clamp(min=1e-8)
+        expected_masked = torch.nn.functional.adaptive_avg_pool2d(full * valid, 24) / denominator.clamp(min=1e-8)
+        torch.testing.assert_close(original, expected_original.expand_as(original))
+        torch.testing.assert_close(masked, expected_masked)
+        torch.testing.assert_close(support, denominator.expand_as(support))
         self.assertEqual(original.shape, (2, 2, 24, 24))
         self.assertFalse(torch.allclose(mean[0, :, 0, 0], visual[:, :, 24:72, 24:72].mean((-1, -2))[0]))
 
-    def test_crop_geometry_padding_edges_and_outside_evidence(self):
-        model = self.module(grid_size=24, crop_size=48)
-        feature = torch.ones(1, 2, 144, 144)
-        meta = dict(img_shape=(80, 100), pad_shape=(100, 100))
-        boxes = torch.tensor([[.4, .4, .6, .6], [0., 0., 0., 0.], [1., 1., 1., 1.]])
-        origins = model.crop_origins(boxes, feature[0], meta)
-        self.assertEqual(origins.tolist(), [[48, 33], [-24, -24], [120, 91]])
-        support = model.crop_support(origins, feature[0])
-        self.assertEqual(support[0].sum().item(), 48 * 48)
-        self.assertEqual(support[1].sum().item(), 24 * 24)
+    def test_intervention_and_context_are_not_truncated_to_48_cells(self):
+        model = self.module(grid_size=24)
+        feature = torch.arange(2 * 144 * 144.).reshape(1, 2, 144, 144)
+        meta = dict(img_shape=(100, 100), pad_shape=(100, 100))
         valid = torch.ones(144, 144, dtype=torch.bool)
-        original, masked, pooled_valid = self.pooled_scenes(model, feature, valid, torch.ones(3, 144, 144), origins)
-        torch.testing.assert_close(original, masked)
-        self.assertEqual(pooled_valid[1].count_nonzero().item(), 12 * 12)
-        torch.testing.assert_close(original[1, :, :12], torch.zeros_like(original[1, :, :12]))
-        # Outside evidence must not enter the original local crop.
+        boxes = torch.tensor([[.1, .1, .9, .9], [0., 0., 0., 0.]])
+        masks = model.intervention_masks(boxes, feature[0], meta, valid)
+        self.assertEqual(masks[0, 10, 10].item(), 1)
+        self.assertEqual(masks[1].count_nonzero().item(), 0)
+        original, masked, pooled_valid = self.pooled_scenes(model, feature, valid, masks)
+        mean = feature.mean((-1, -2), keepdim=True)
+        torch.testing.assert_close(masked[:1], mean.expand(1, 2, 24, 24))
+        torch.testing.assert_close(masked[1:], original[1:])
+        self.assertEqual(pooled_valid[1].count_nonzero().item(), 24 * 24)
+        # Evidence far outside the former candidate crop belongs to the scene.
         changed = feature.clone()
         changed[:, :, :24] = 10000
-        other, _, _ = self.pooled_scenes(model, changed, valid, torch.zeros(3, 144, 144), origins)
-        torch.testing.assert_close(other[0], original[0], rtol=0, atol=0)
-        self.assertFalse(torch.allclose(other[1], other[0]))
-        # GT coverage uses the cropped footprint, not an unseen expanded mask.
+        other, _, _ = self.pooled_scenes(model, changed, valid, torch.zeros(2, 144, 144))
+        self.assertFalse(torch.allclose(other[0], original[0]))
+        torch.testing.assert_close(other[0], other[1])
+        # Coverage accounts for the complete expanded intervention, not a crop.
         gt = torch.tensor([.8, .5, .9, .6])
-        coverage = model.gt_coverage(support[:1].float(), gt, feature[0], meta)
-        self.assertEqual(coverage.item(), 0)
+        coverage = model.gt_coverage(masks[:1], gt, feature[0], meta)
+        torch.testing.assert_close(coverage, torch.ones(1))
 
-    def test_each_local_original_is_paired_only_with_its_own_intervention(self):
+    def test_common_original_is_shared_across_all_interventions(self):
         model = self.module()
-        original = torch.randn(4, requires_grad=True)
+        original = torch.randn((), requires_grad=True)
         masked = torch.randn(4, requires_grad=True)
         actual = model.support_drop(original, masked)
         torch.testing.assert_close(actual, original - masked)
         zero = model.support_drop(original, original)
         torch.testing.assert_close(zero, torch.zeros_like(zero), rtol=0, atol=1e-6)
         actual[0].backward()
-        self.assertGreater(original.grad[0].abs().sum().item(), 0)
-        self.assertEqual(original.grad[1:].count_nonzero().item(), 0)
+        self.assertGreater(original.grad.abs().sum().item(), 0)
         self.assertEqual(masked.grad[1:].count_nonzero().item(), 0)
 
-    def test_batched_crops_match_padded_reference_and_gradients(self):
+    def test_full_scene_pooling_matches_nondivisible_reference_and_gradients(self):
         for height, width in ((25, 29), (19, 23)):
-            model = self.module(grid_size=6, crop_size=13)
+            model = self.module(grid_size=6)
             visual = torch.randn(2, 3, height, width, requires_grad=True)
             valid = torch.ones(2, height, width, dtype=torch.bool)
             valid[0, -4:] = False
             valid[1, :, -3:] = False
             owners = torch.tensor([0, 1, 0, 1])
-            origins = torch.tensor([[-4, -3], [7, 4], [20, 17], [-3, 18]])
-            masks = torch.rand(4, height, width) * valid[owners] * model.crop_support(origins, visual[0])
-            mean = model.image_mean(visual, valid)
-            original, actual, denominator = model.pooled_scenes(visual, valid, masks, origins, owners=owners, mean=mean)
+            masks = torch.rand(4, height, width) * valid[owners]
+            original, denominator, mean = model.pooled_original(visual, valid)
+            actual = model.pooled_interventions(visual, valid, masks, owners, original, denominator, mean)
             full = visual[owners] + (mean[owners] - visual[owners]) * masks[:, None]
-            size = model.crop_size
-            pad = (size,) * 4
-            padded = torch.nn.functional.pad(full, pad)
-            padded_original = torch.nn.functional.pad(visual[owners], pad)
-            padded_valid = torch.nn.functional.pad(valid[owners, None].float(), pad)
-            expected, expected_original = [], []
-            for i, (x, y) in enumerate(origins.tolist()):
-                region = (slice(i, i + 1), slice(None), slice(y + size, y + 2 * size), slice(x + size, x + 2 * size))
-                crop_valid = padded_valid[region]
-                denom = torch.nn.functional.adaptive_avg_pool2d(crop_valid, 6)
-                normalize = lambda values: torch.nn.functional.adaptive_avg_pool2d(values * crop_valid, 6) / denom.clamp(min=1e-8)
-                expected.append(normalize(padded[region]))
-                expected_original.append(normalize(padded_original[region]))
-                torch.testing.assert_close(denominator[i:i + 1], denom)
-            expected = torch.cat(expected)
-            torch.testing.assert_close(original, torch.cat(expected_original))
+            expected = torch.nn.functional.adaptive_avg_pool2d(full * valid[owners, None], 6) / denominator[owners].clamp(min=1e-8)
             torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
             actual_grad, = torch.autograd.grad(actual.square().sum(), visual, retain_graph=True)
             expected_grad, = torch.autograd.grad(expected.square().sum(), visual)
@@ -212,7 +190,7 @@ class CRVTests(unittest.TestCase):
             torch.testing.assert_close(entropy[bi], expected)
             self.assertEqual(counts[bi].item(), len(kept))
 
-    def test_cross_image_batching_caches_text_and_preserves_local_pairs(self):
+    def test_cross_image_batching_caches_text_and_scores_one_original_per_image(self):
         model = self.module(chunk_size=8).train()
         args = self.inputs()
         args = [value.repeat(3, *([1] * (value.ndim - 1))) if torch.is_tensor(value)
@@ -230,7 +208,7 @@ class CRVTests(unittest.TestCase):
                 probabilities, priority, losses, info = model(*args, refer_gt=gt)
         finally:
             hook.remove()
-        self.assertEqual(encoded, [8, 8, 8])  # Two routed images, each with 2*(5+1) scenes.
+        self.assertEqual(encoded, [8, 6])  # Two routed images, each with 1+5+1 scenes.
         self.assertEqual(text_cache.call_count, 1)
         self.assertEqual(positions.call_count, 1)
         self.assertEqual(projection.call_count, 1)
@@ -270,36 +248,45 @@ class CRVTests(unittest.TestCase):
             else:
                 torch.testing.assert_close(parameter.grad, other.grad, rtol=1e-4, atol=2e-6)
 
-    def test_crop_size_validation(self):
-        for value in (0, -1, True, 3, 48.5):
+    def test_legacy_local_crop_setting_is_rejected(self):
+        for value in (0, -1, True, 3, 48, 48.5):
             with self.assertRaisesRegex(ValueError, "crop_size"):
                 self.module(crop_size=value)
 
-    def test_144_feature_forward_scores_six_matched_local_pairs(self):
-        model = self.module(hidden_channels=256, grid_size=24, crop_size=48, chunk_size=2).train()
+    def test_configs_use_48_full_scene_grid(self):
+        for filename in ("configs/aerialvg/PropVG-aerialvg.py", "configs/aerialsense/PropVG-aerialsense.py"):
+            config = Config.fromfile(filename)
+            self.assertEqual(config.crv_grid_size, 48)
+            self.assertEqual(config.model.head.crv.grid_size, 48)
+            self.assertNotIn("crop_size", config.model.head.crv)
+
+    def test_144_feature_forward_scores_48_grids_with_one_original_and_six_interventions(self):
+        model = self.module(hidden_channels=256, scorer_dim=128, grid_size=48, chunk_size=2).train()
         args = self.inputs()
         args[0] = torch.randn(1, 256, 144, 144, requires_grad=True)
         args[1] = torch.zeros(1, 144, 144, dtype=torch.bool)
         args[1][:, 116:] = True
-        args[3] = torch.randn(1, 6, 256, requires_grad=True)
+        args[3] = torch.randn(1, 64, 256, requires_grad=True)
+        args[4] = torch.zeros(1, 64, dtype=torch.bool)
+        args[4][:, 18:] = True
         gt = torch.tensor([.09, .45, .15, .55])
         encoded = []
         hook = model.scorer.register_forward_pre_hook(lambda _, inputs: encoded.append(inputs[0].shape))
         try:
-            with patch.object(model, "pooled_scenes", wraps=model.pooled_scenes) as pooling:
+            with patch.object(model, "pooled_interventions", wraps=model.pooled_interventions) as pooling:
                 probabilities, _, losses, info = model(*args, refer_gt=[gt])
         finally:
             hook.remove()
-        # Five predicted-box pairs + one exact-GT pair, not a shared full scene.
+        # One full-scene original, five predicted-box masks and one exact GT.
         self.assertEqual(pooling.call_count, 3)
-        self.assertEqual(encoded, [torch.Size([2, 16, 24, 24])] * 6)
-        origins = torch.cat([call.args[3] for call in pooling.call_args_list])
+        self.assertEqual(encoded, [torch.Size([2, 128, 48, 48])] * 3 + [torch.Size([1, 128, 48, 48])])
+        masks = torch.cat([call.args[2] for call in pooling.call_args_list])
         boxes = torch.cat((model.clipped_boxes(args[2][0, :5]), gt[None]))
-        torch.testing.assert_close(origins, model.crop_origins(boxes, args[0][0], args[7][0]))
+        torch.testing.assert_close(masks, model.intervention_masks(boxes, args[0][0], args[7][0], ~args[1][0]))
         details = info["crv_samples"][0]
-        torch.testing.assert_close(details["crop_origins"], origins[:5])
+        self.assertNotIn("crop_origins", details)
         self.assertEqual(details["original_support"].shape, (5,))
-        self.assertGreater(details["original_support"].unique().numel(), 1)
+        torch.testing.assert_close(details["original_support"], details["original_support"][:1].expand(5))
         torch.testing.assert_close(details["drops"], details["original_support"] - details["masked_support"])
         expected = details["base_logits"] + info["crv_alpha"] * details["drops"]
         torch.testing.assert_close(details["fused_logits"], expected)
@@ -457,14 +444,18 @@ class CRVTests(unittest.TestCase):
         self.assertLess(original.grad[0].item(), 0)
         self.assertGreater(masked.grad[0].item(), 0)
 
-    def test_local_original_support_receives_candidate_ranking_gradients(self):
+    def test_common_original_cancels_in_ranking_but_receives_anchor_gradients(self):
         model = self.module()
         masked = torch.randn(4, requires_grad=True)
-        original = torch.randn(4, requires_grad=True)
+        original = torch.randn((), requires_grad=True)
         loss = model.localization_loss(model.support_drop(original, masked), torch.tensor([.8, 0., 0., .2]))
         loss.backward()
-        self.assertGreater(original.grad.abs().sum().item(), 0)
-        torch.testing.assert_close(original.grad, -masked.grad)
+        torch.testing.assert_close(original.grad, torch.zeros_like(original), rtol=0, atol=1e-6)
+        original = torch.tensor(0., requires_grad=True)
+        loss, _ = model.counterfactual_loss(model.support_drop(original, torch.zeros(2)),
+                                           torch.tensor([.8, 0.]), torch.zeros(2))
+        loss.backward()
+        self.assertLess(original.grad.item(), 0)
 
     def test_direct_localization_uses_multiple_positives_and_ignores_unreachable_samples(self):
         model = self.module()
@@ -731,7 +722,7 @@ class CRVTests(unittest.TestCase):
         _validate_crv_checkpoint(model, {"module." + key: value for key, value in state.items()})
         with self.assertRaisesRegex(ValueError, "compatible CRV checkpoint"):
             _validate_crv_checkpoint(model, {})
-        for version in (1, 2, 3, 4, 5, 6, 7):
+        for version in (1, 2, 3, 4, 5, 6, 7, 8):
             with self.assertRaisesRegex(ValueError, "compatible CRV checkpoint"):
                 _validate_crv_checkpoint(model, dict(state, **{"head.crv.schema_version": torch.tensor(version)}))
         model.head.crv = None
