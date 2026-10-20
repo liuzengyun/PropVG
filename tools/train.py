@@ -29,7 +29,9 @@ from propvg.utils import (
     is_main,
     init_dist,
 )
-import wandb
+from propvg.utils.experiment_tracking import (
+    initialize_tracking, set_tracking_context, log_metrics, log_summary, finish_tracking,
+)
 
 import warnings
 
@@ -147,8 +149,8 @@ def main_worker(cfg):
         source_dir = osp.abspath(osp.join(osp.dirname(__file__), "..", "propvg"))
         backup_dir = osp.join(cfg.work_dir, "propvg")
         shutil.copytree(source_dir, backup_dir, dirs_exist_ok=True)
-        wandb.init(project="propvg-seg-offline", tags=[cfg.tag_name], name=cfg.wandb_name, mode="offline")
         logger = get_root_logger(log_file=osp.join(cfg.work_dir, str(cfg.timestamp) + "_train_log.txt"))
+        initialize_tracking(cfg, logger)
         logger.info(cfg.pretty_text)
         cfg.dump(osp.join(cfg.work_dir, f"{cfg.timestamp}_" + osp.basename(cfg.config)))
 
@@ -184,6 +186,11 @@ def main_worker(cfg):
     # cfg.model.box_threshold = cfg.score_threshold
     model = build_model(cfg.model, word_emb=datasets[0].word_emb, num_token=datasets[0].num_token)
     model = model.cuda()
+    if is_main():
+        log_summary({"model/parameters": sum(p.numel() for p in model.parameters()),
+                     "model/trainable_parameters": sum(p.numel() for p in model.parameters() if p.requires_grad),
+                     "data/train_samples": len(datasets[0]),
+                     **{"data/" + name + "_samples": len(dataset) for name, dataset in zip(items, datasets[1:])}})
     train_params = [
         {
             "params": [p for n, p in model.named_parameters() if "vis_enc" in n and p.requires_grad],
@@ -291,6 +298,7 @@ def main_worker(cfg):
                 )
     epoch_test_monitor = EpochTestMonitor(cfg)
     for epoch in range(start_epoch + 1, cfg.scheduler_config.max_epoch):
+        set_tracking_context(epoch=epoch + 1, global_step=epoch * len(dataloaders[0]))
         start_time = time.time()
         train_model(epoch, cfg, model, optimizer, dataloaders[0])
         # Save the scheduler state for the *next* epoch. This keeps resumed LR
@@ -299,6 +307,7 @@ def main_worker(cfg):
         this_epoch_train_time = int(time.time() - start_time)
         if is_main():
             logger.info("this_epoch_train_time={}m-{}s".format(this_epoch_train_time // 60, this_epoch_train_time % 60))
+            log_metrics({"epoch/train_seconds": this_epoch_train_time})
 
         if epoch % cfg.evaluate_interval == 0 and epoch >= cfg.start_evaluate_epoch:
             F1score, Nacc_rec, gIoU, cIoU = 0, 0, 0, 0
@@ -331,6 +340,9 @@ def main_worker(cfg):
                     rIoU += set_rIoU
                 elif cfg.dataset == "AerialVG":
                     d_acc, top5_acc, mIoU = evaluate_model(_prefix, cfg, model, _loader)
+                    if best_aerialvg_metrics is None or d_acc > best_aerialvg_metrics[0]:
+                        log_summary({"best/epoch": epoch + 1, "best/val_top1_acc": d_acc,
+                                     "best/val_top5_at_top1": top5_acc, "best/val_miou_at_top1": mIoU})
                     if best_aerialvg_metrics is None or d_acc > best_aerialvg_metrics[0]:
                         best_aerialvg_metrics = (d_acc, top5_acc, mIoU)
                 elif (
@@ -379,6 +391,12 @@ def main_worker(cfg):
                 )
                 total_time = int(time.time() - begin_time)
                 logger.info("total_time={}m-{}s".format(total_time // 60, total_time % 60))
+                log_metrics({"epoch/train_and_val_seconds": this_epoch_total_time,
+                             "time/total_seconds": total_time})
+                if best_aerialvg_metrics is not None:
+                    log_metrics({"best/val_top1_acc": best_aerialvg_metrics[0],
+                                 "best/val_top5_at_top1": best_aerialvg_metrics[1],
+                                 "best/val_miou_at_top1": best_aerialvg_metrics[2]})
 
             if is_main() and epoch >= cfg.start_save_checkpoint:
                 if cfg.dataset == "GRefCOCO":
@@ -493,6 +511,9 @@ def main_worker(cfg):
         # directory naming. Run every epoch from start_test, independently of
         # the original validation interval and checkpoint-saving schedule.
         epoch_test_monitor.run(epoch, model)
+        if is_main():
+            log_metrics({"epoch/seconds_including_test_and_checkpoint": time.time() - start_time,
+                         "time/total_seconds": time.time() - begin_time})
 
         if cfg.distributed:
             dist.barrier()
@@ -512,7 +533,9 @@ def main_worker(cfg):
             raise FileNotFoundError(f"Best AerialVG checkpoint not found: {best_checkpoint}")
 
         eval_model = model.module if hasattr(model, "module") else model
-        load_checkpoint(eval_model, load_from=best_checkpoint, dataset=cfg.dataset)
+        # Reuse metadata from the EXISTING load: never read the large file twice.
+        loaded_best = load_checkpoint(eval_model, load_from=best_checkpoint, dataset=cfg.dataset, return_metadata=True)
+        log_metrics({"checkpoint_epoch": int(loaded_best[-1]["epoch"]) + 1})
 
         single_gpu_cfg = cfg.copy()
         single_gpu_cfg.distributed = False
@@ -522,6 +545,12 @@ def main_worker(cfg):
         test_loader = build_dataloader(single_gpu_cfg, test_dataset)
         logger.info("Evaluating best-val checkpoint on AerialVG-test with one GPU: %s", best_checkpoint)
         test_aerialvg_metrics = evaluate_model("test", single_gpu_cfg, eval_model, test_loader)
+        log_summary({"test_best/top1_acc": test_aerialvg_metrics[0], "test_best/top5_acc": test_aerialvg_metrics[1],
+                     "test_best/box_miou": test_aerialvg_metrics[2],
+                     "best/epoch": int(loaded_best[-1]["epoch"]) + 1,
+                     "best/val_top1_acc": best_aerialvg_metrics[0],
+                     "best/val_top5_at_top1": best_aerialvg_metrics[1],
+                     "best/val_miou_at_top1": best_aerialvg_metrics[2]})
 
         val_top1, val_top5, val_miou = best_aerialvg_metrics
         test_top1, test_top5, test_miou = test_aerialvg_metrics
@@ -534,8 +563,9 @@ def main_worker(cfg):
             if osp.exists(final_work_dir):
                 raise FileExistsError(f"Cannot rename work directory: destination already exists: {final_work_dir}")
             os.rename(cfg.work_dir, final_work_dir)
+        log_summary({"experiment/final_work_dir": final_work_dir})
 
-    wandb.finish()
+    finish_tracking()
 
 
 def main():
@@ -559,7 +589,6 @@ def main():
     cfg.launcher = args.launcher
     cfg.config = args.config
     cfg.debug = args.debug
-    cfg.wandb_name = "-".join(cfg.work_dir.split("/")[3:-1])
     cfg.tag_name = "-".join(cfg.work_dir.split("/")[3:-2])
     cfg.score_threshold = cfg.model.post_params["score_threshold"]
 
@@ -573,7 +602,12 @@ def main():
             strict=cfg.get("strict_reproducibility", False),
         )
 
-    main_worker(cfg)
+    try:
+        main_worker(cfg)
+    except BaseException:
+        get_root_logger().exception("Training terminated with an exception")
+        finish_tracking(exit_code=1)
+        raise
 
 
 if __name__ == "__main__":

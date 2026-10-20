@@ -1,6 +1,6 @@
 data/
 work_dir/
-wandb/
+swanlog/
 __pycache__/
 *.pyc
 *.pkl

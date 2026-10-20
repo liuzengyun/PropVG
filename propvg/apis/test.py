@@ -18,6 +18,7 @@ import numpy as np
 import copy
 from propvg.utils.dist import all_gather, synchronize
 from tqdm import tqdm
+from propvg.utils.experiment_tracking import log_evaluation
 
 
 def mask_overlaps(gt_mask, pred_masks, is_crowd):
@@ -159,6 +160,13 @@ def aerialvg_box_metrics(pred_bboxes, gt_bboxes):
 
 
 def evaluate_model(prefex, cfg, model, loader):
+    started = time.time()
+    result = _evaluate_model(prefex, cfg, model, loader)
+    log_evaluation(prefex, cfg.dataset, result, time.time() - started)
+    return result
+
+
+def _evaluate_model(prefex, cfg, model, loader):
     model.eval()
     device = list(model.parameters())[0].device
 

@@ -50,7 +50,7 @@ enable_grab=False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
 # Independent post-CRS refinement. False preserves the previous experiment.
-enable_crv = True
+enable_crv = False
 crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
 crv_crop_size = 48  # Candidate-centered crop in feature cells, not image pixels.
 crv_grid_size = 24  # Pool each matched original/masked 48x48 crop to this grid.
@@ -156,6 +156,7 @@ optimizer_config = dict(type="Adam", lr=lr, lr_vis_enc=0.00004, lr_lan_enc=lr,
                         betas=(0.9, 0.98), eps=1e-9, weight_decay=0, amsgrad=True)
 scheduler_config = dict(type="MultiStepLRWarmUp", warmup_epochs=2, decay_steps=[24, 32], decay_ratio=0.1, max_epoch=36)
 log_interval = 50
+swanlab = dict(mode="online", project="propvg", init_timeout=30, finish_wait=1, stats_interval=30)
 start_save_checkpoint = 0
 # Keep the last 10 epoch snapshots, plus top1_best.pth and latest.pth.
 save_interval = 1

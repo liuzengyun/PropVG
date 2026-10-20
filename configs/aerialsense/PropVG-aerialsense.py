@@ -232,6 +232,7 @@ scheduler_config = dict(
 )
 
 log_interval = 50
+swanlab = dict(mode="online", project="propvg", init_timeout=30, finish_wait=1, stats_interval=30)
 log_level = "INFO"
 save_interval = -1
 resume_from = None
