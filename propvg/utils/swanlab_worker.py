@@ -3,6 +3,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -10,6 +11,17 @@ import time
 
 
 EPOCH_PREFIXES = {"val", "test_epoch", "best", "epoch"}
+
+
+def error_detail(error):
+    """Keep useful SDK diagnostics without exposing credentials."""
+    detail = str(error)
+    for key, value in os.environ.items():
+        if value and any(word in key.upper() for word in ("API_KEY", "TOKEN", "PASSWORD", "SECRET")):
+            detail = detail.replace(value, "[REDACTED]")
+    detail = re.sub(r"(?i)(\b(?:[a-z0-9_]*api_key|access_token|password|secret)\s*[:=]\s*)[^\s,)\n]+",
+                    r"\1[REDACTED]", detail)
+    return type(error).__name__ + ": " + detail[:2000]
 
 
 def log_scalars(run, values, context):
@@ -47,36 +59,42 @@ def run_backend(directory, sdk=None, poll=.1, mode=None):
         mode = "online" if mode in ("auto", "cloud") else mode
         if mode not in ("online", "offline", "local", "disabled"):
             raise ValueError("Unsupported SwanLab mode")
-        # 0.7.x accepts online in init(), but its environment parser uses cloud.
-        os.environ["SWANLAB_MODE"] = "cloud" if mode == "online" else mode
+        os.environ["SWANLAB_MODE"] = mode
         if sdk is None:
             import swanlab as sdk
-        settings = sdk.Settings(
-            hardware_interval=max(5, int(metadata.get("stats_interval", 30))),
-            requirements_collect=False, conda_collect=False,
-            collect_runtime=False, backup=True)
+        version = re.match(r"(\d+)\.(\d+)", str(getattr(sdk, "__version__", "")))
+        modern = bool(version and tuple(map(int, version.groups())) >= (0, 10))
+        interval = max(5, int(metadata.get("stats_interval", 30)))
+        if modern:
+            settings = sdk.Settings(interactive=False, core={"skip_store": False},
+                                    probe=dict(requirements=False, conda=False, runtime=False,
+                                               git=False, monitor_interval=interval))
+        else:
+            # Legacy SDK remains usable for local-only recovery.
+            os.environ["SWANLAB_MODE"] = "cloud" if mode == "online" else mode
+            settings = sdk.Settings(hardware_interval=interval, requirements_collect=False,
+                                    conda_collect=False, collect_runtime=False, backup=True)
         # Let SwanLab allocate its own run ID. 0.7.x forbids an explicit ID
         # without resume="allow", which also disables its hardware monitor.
         common = dict(project=metadata["project"], workspace=metadata.get("workspace"),
-                      experiment_name=metadata["name"], group=metadata["group"],
+                      group=metadata["group"],
                       tags=metadata.get("tags", []), config=metadata["config"],
-                      logdir=str(directory / "sdk"), settings=settings, reinit=True)
-        try:
-            run = sdk.init(mode=mode, **common)
-        except Exception as error:
-            if mode != "online":
-                raise
-            status(fallback_reason="online_init_failed:" + type(error).__name__)
-            os.environ["SWANLAB_MODE"] = "offline"
-            run = sdk.init(mode="offline", **common)
+                      settings=settings, reinit=True)
+        common.update({"name" if modern else "experiment_name": metadata["name"],
+                       "log_dir" if modern else "logdir": str(directory / "sdk")})
+        run = sdk.init(mode=mode, **common)
         actual = "online" if run.mode in ("online", "cloud") else run.mode
-        url = sdk.get_url() if actual == "online" else None
-        status(mode=actual, url=url, sdk_run_id=str(run.public.run_id), run_directory=str(run.public.run_dir))
+        url = (run.url if modern else sdk.get_url()) if actual == "online" else None
+        run_id, run_dir = (run.id, run.dir) if modern else (run.public.run_id, run.public.run_dir)
+        status(mode=actual, url=url, sdk_run_id=str(run_id), run_directory=str(run_dir))
         print("SwanLab tracking: mode=%s url=%s" % (actual, url), flush=True)
     except Exception as error:
-        status(mode="local_only", fallback_reason=type(error).__name__)
-        print("SwanLab unavailable; complete events remain in the local journal.", flush=True)
-        run = None
+        detail = error_detail(error)
+        status(mode="initialization_failed", fallback_reason=type(error).__name__, error=detail)
+        print("SwanLab initialization failed: " + detail, flush=True)
+        # A failed SDK init may leave singleton/proxy state behind. The
+        # supervisor must retry offline in a fresh process, never this one.
+        return 1
 
     processed, context, summary = 0, {}, {}
     with (directory / "events.jsonl").open() as stream, (directory / "console.log").open("a") as console:
@@ -121,7 +139,8 @@ def run_backend(directory, sdk=None, poll=.1, mode=None):
                             signal.signal(signal.SIGALRM, lambda *_: os._exit(0))
                             signal.alarm(30)
                         if event.get("exit_code", 0):
-                            sdk.finish(state=type(run.state).CRASHED, error="Training exited abnormally")
+                            sdk.finish(state="crashed" if modern else type(run.state).CRASHED,
+                                       error="Training exited abnormally")
                         else:
                             sdk.finish()
                         if hasattr(signal, "SIGALRM"):
@@ -129,7 +148,7 @@ def run_backend(directory, sdk=None, poll=.1, mode=None):
                     status(finished=True, processed_events=processed)
                     break
             except Exception as error:
-                status(mode="local_only", fallback_reason=type(error).__name__, processed_events=processed)
+                status(mode="local_only", fallback_reason=type(error).__name__, error=error_detail(error), processed_events=processed)
                 run = None
                 if kind == "finish":
                     status(finished=True)
@@ -145,6 +164,18 @@ def run_supervised(directory):
     if modes[0] in ("online", "cloud", "auto"):
         modes.append("offline")
     reason = None
+    failures = []
+
+    def stop_session(session):
+        try:
+            os.killpg(session.pid, signal.SIGTERM)
+            session.wait(timeout=1.)
+        except ProcessLookupError:
+            pass
+        except subprocess.TimeoutExpired:
+            os.killpg(session.pid, signal.SIGKILL)
+            session.wait()
+
     for mode in modes:
         # A fresh process prevents a hung online SDK from affecting fallback.
         command = [sys.executable, str(Path(__file__).resolve()), str(directory), "--session", mode]
@@ -152,7 +183,7 @@ def run_supervised(directory):
             (directory / "status.json").unlink()
         except FileNotFoundError:
             pass
-        env = dict(os.environ, SWANLAB_MODE="cloud" if mode in ("online", "cloud", "auto") else mode)
+        env = dict(os.environ, SWANLAB_MODE="online" if mode in ("online", "cloud", "auto") else mode)
         session = subprocess.Popen(command, stdin=subprocess.DEVNULL, env=env, start_new_session=True)
         deadline = time.monotonic() + timeout
         while session.poll() is None:
@@ -161,29 +192,37 @@ def run_supervised(directory):
             except (OSError, ValueError):
                 state = {}
             if state.get("mode") in ("online", "offline", "local", "disabled", "local_only"):
+                if failures:
+                    state["initialization_failures"] = failures
+                    (directory / "status.json").write_text(json.dumps(state, indent=2))
                 return session.wait()
+            if state.get("mode") == "initialization_failed":
+                reason = state.get("error", state.get("fallback_reason"))
+                stop_session(session)
+                break
             if time.monotonic() >= deadline:
                 reason = mode + "_init_deadline"
-                try:
-                    os.killpg(session.pid, signal.SIGTERM)
-                    session.wait(timeout=1.)
-                except ProcessLookupError:
-                    pass
-                except subprocess.TimeoutExpired:
-                    os.killpg(session.pid, signal.SIGKILL)
-                    session.wait()
+                stop_session(session)
                 break
             time.sleep(.1)
         else:
-            reason = "backend_exited_before_initialization"
+            try:
+                state = json.loads((directory / "status.json").read_text())
+            except (OSError, ValueError):
+                state = {}
+            if state.get("finished"):
+                return session.returncode
+            reason = state.get("error", "backend_exited_before_initialization")
+        failures.append(dict(mode=mode, error=reason))
     (directory / "status.json").write_text(json.dumps(dict(
         name=metadata["name"], id=metadata["id"], mode="local_only", url=None,
-        fallback_reason=reason, journal=str(directory / "events.jsonl")), indent=2))
+        fallback_reason=reason, initialization_failures=failures,
+        journal=str(directory / "events.jsonl")), indent=2))
     return 0
 
 
 if __name__ == "__main__":
     if "--session" in sys.argv:
-        run_backend(sys.argv[1], mode=sys.argv[3])
+        raise SystemExit(run_backend(sys.argv[1], mode=sys.argv[3]))
     else:
         raise SystemExit(run_supervised(sys.argv[1]))

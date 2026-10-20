@@ -112,13 +112,20 @@ class TrackingTests(unittest.TestCase):
         tracking.finish_tracking()
         self.assertEqual(self.events(tracker)[-1]["type"], "finish")
 
-    def test_online_initialization_failure_automatically_uses_offline(self):
+    def test_online_initialization_failure_requires_a_fresh_offline_session(self):
         tracker, _ = self.start()
         tracking.log_metrics({"train/loss_total": 1.})
         tracking.finish_tracking()
-        sdk, run = self.sdk(fail_online=True)
-        self.backend(tracker, sdk)
-        self.assertEqual([c.kwargs["mode"] for c in sdk.init.call_args_list], ["online", "offline"])
+        online_sdk, _ = self.sdk(fail_online=True)
+        self.backend(tracker, online_sdk)
+        online_sdk.init.assert_called_once()
+        failed = json.loads((tracker.directory / "status.json").read_text())
+        self.assertEqual(failed["mode"], "initialization_failed")
+        self.assertIn("fake outage", failed["error"])
+        sdk, run = self.sdk(offline=True)
+        with patch.dict(os.environ):
+            worker.run_backend(tracker.directory, sdk=sdk, poll=0, mode="offline")
+        self.assertEqual(sdk.init.call_args.kwargs["mode"], "offline")
         self.assertNotIn("id", sdk.init.call_args.kwargs)
         status = json.loads((tracker.directory / "status.json").read_text())
         self.assertEqual(status["mode"], "offline")
@@ -127,6 +134,56 @@ class TrackingTests(unittest.TestCase):
         loss_call = next(c for c in run.log.call_args_list if "train/loss_total" in c.args[0])
         self.assertEqual(loss_call.args[0]["train/loss_total"], 1.)
         self.assertEqual(loss_call.kwargs["step"], 0)
+
+    def test_supervisor_uses_distinct_processes_after_initialization_failure(self):
+        tracker, _ = self.start()
+        tracking.finish_tracking()
+        failed = Mock(pid=12345)
+        failed.poll.return_value = None
+        offline = Mock(pid=12346)
+        offline.poll.return_value = None
+        offline.wait.return_value = 0
+        def spawn(command, **kwargs):
+            mode = command[-1]
+            state = dict(mode="initialization_failed", error="ApiError: project validation") if mode == "online" else dict(mode="offline")
+            (tracker.directory / "status.json").write_text(json.dumps(state))
+            return failed if mode == "online" else offline
+        with patch.object(worker.subprocess, "Popen", side_effect=spawn) as popen, \
+             patch.object(worker.os, "killpg") as kill:
+            self.assertEqual(worker.run_supervised(tracker.directory), 0)
+        self.assertEqual([c.args[0][-1] for c in popen.call_args_list], ["online", "offline"])
+        kill.assert_called_once_with(failed.pid, worker.signal.SIGTERM)
+        state = json.loads((tracker.directory / "status.json").read_text())
+        self.assertIn("project validation", state["initialization_failures"][0]["error"])
+
+    def test_sdk_error_diagnostics_redact_credentials(self):
+        with patch.dict(os.environ, {"SWANLAB_API_KEY": "credential-do-not-log"}):
+            detail = worker.error_detail(RuntimeError("api_key=credential-do-not-log secret=private"))
+        self.assertNotIn("credential-do-not-log", detail)
+        self.assertNotIn("private", detail)
+
+    def test_upload_worker_python_can_be_independent_of_training(self):
+        with patch.dict(os.environ, {"PROPVG_SWANLAB_PYTHON": "/tmp/upload-env/bin/python"}):
+            tracker, spawn = self.start()
+        self.assertEqual(spawn.call_args.args[0][0], "/tmp/upload-env/bin/python")
+        self.assertEqual(spawn.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "")
+
+    def test_modern_sdk_uses_new_settings_run_properties_and_finish_state(self):
+        tracker, _ = self.start()
+        tracking.log_metrics({"train/loss_total": .2})
+        tracking.finish_tracking(exit_code=1)
+        sdk, run = self.sdk()
+        sdk.__version__ = "0.10.2"
+        run.id, run.dir, run.url = "modern-run", "/tmp/modern-run", "https://example.invalid/modern-run"
+        self.backend(tracker, sdk)
+        self.assertIn("name", sdk.init.call_args.kwargs)
+        self.assertIn("log_dir", sdk.init.call_args.kwargs)
+        self.assertIn("probe", sdk.Settings.call_args.kwargs)
+        sdk.get_url.assert_not_called()
+        sdk.finish.assert_called_once_with(state="crashed", error="Training exited abnormally")
+        state = json.loads((tracker.directory / "status.json").read_text())
+        self.assertEqual(state["url"], run.url)
+        self.assertTrue(state["finished"])
 
     def test_online_records_validation_epoch_test_final_test_and_summary(self):
         tracker, _ = self.start()

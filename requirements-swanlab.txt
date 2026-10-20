@@ -1,0 +1,2 @@
+# Upload worker only; requires Python >= 3.9.
+swanlab>=0.10.2,<0.11

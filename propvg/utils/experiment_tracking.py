@@ -84,9 +84,13 @@ class ExperimentTracker:
         self.worker_log = (self.directory / "worker.log").open("a", encoding="utf-8")
         try:
             env = dict(os.environ, CUDA_VISIBLE_DEVICES="", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
+            default_python = Path(__file__).resolve().parents[2] / ".venv-swanlab/bin/python"
+            worker_python = os.environ.get("PROPVG_SWANLAB_PYTHON", options.get("python"))
+            if not worker_python:
+                worker_python = str(default_python) if default_python.is_file() else sys.executable
             # Executing a file directly avoids importing propvg/torch in child.
             self.process = subprocess.Popen(
-                [sys.executable, str(Path(__file__).with_name("swanlab_worker.py")), str(self.directory)],
+                [worker_python, str(Path(__file__).with_name("swanlab_worker.py")), str(self.directory)],
                 stdin=subprocess.DEVNULL, stdout=self.worker_log, stderr=subprocess.STDOUT,
                 env=env, start_new_session=True)
         except Exception as error:

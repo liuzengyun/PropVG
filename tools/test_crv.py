@@ -36,6 +36,10 @@ class CRVTests(unittest.TestCase):
                 torch.randn(1, 6, 16), torch.tensor([[0, 0, 0, 0, 1, 1]]), scores,
                 torch.logit(scores), [dict(img_shape=(80, 100), pad_shape=(100, 100))]]
 
+    def pooled_scenes(self, model, projected, valid, masks, origins):
+        masks = masks * valid * model.crop_support(origins, projected[0])
+        return model.pooled_scenes(projected, valid, masks, origins)
+
     def test_uncertainty_distinguishes_examples_and_duplicate_boxes(self):
         model = self.module()
         boxes = torch.tensor([[.02 + i * .18, .2, .1 + i * .18, .3] for i in range(5)])
@@ -68,7 +72,7 @@ class CRVTests(unittest.TestCase):
         torch.testing.assert_close(mask[0][inner], torch.ones_like(mask[0][inner]))
         self.assertEqual(mask[0][outer].count_nonzero(), 0)
         self.assertEqual(mask[0][~valid].count_nonzero(), 0)
-        _, scene, _ = model.pooled_scenes(feature, valid, mask, torch.tensor([[0, 0]]))
+        _, scene, _ = self.pooled_scenes(model, feature, valid, mask, torch.tensor([[0, 0]]))
         expected = (feature * valid).sum((-1, -2)) / valid.sum()
         for channel in (0, 1):
             torch.testing.assert_close(scene[0, channel][inner], expected[0, channel].expand_as(scene[0, channel][inner]))
@@ -81,14 +85,14 @@ class CRVTests(unittest.TestCase):
         masks = model.intervention_masks(model.clipped_boxes(boxes[0, :2]), visual[0],
                                          dict(img_shape=(80, 100), pad_shape=(100, 100)), valid)
         projected = model.scorer.visual(visual)
-        _, actual, _ = model.pooled_scenes(projected, valid, masks, torch.zeros(2, 2, dtype=torch.long))
+        _, actual, _ = self.pooled_scenes(model, projected, valid, masks, torch.zeros(2, 2, dtype=torch.long))
         mean = (visual * valid).sum((-1, -2), keepdim=True) / valid.sum()
         modified = visual * (1 - masks[:, None]) + mean * masks[:, None]
         expected = model.scorer.visual(modified)
         expected = torch.nn.functional.adaptive_avg_pool2d(expected, 6)
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
-    def test_local_crops_match_full_resolution_intervention_and_global_fill_mean(self):
+    def test_local_crops_equal_full_resolution_intervention_then_matched_crop_pooling(self):
         model = self.module(grid_size=24, crop_size=48)
         visual = torch.arange(2 * 144 * 144.).reshape(1, 2, 144, 144)
         valid = torch.ones(144, 144, dtype=torch.bool)
@@ -97,9 +101,10 @@ class CRVTests(unittest.TestCase):
         masks[0, 42:54, 52:64] = 1
         masks[1, 90:100, 80:92] = .4
         origins = torch.tensor([[24, 24], [60, 70]])
-        original, masked, support = model.pooled_scenes(visual, valid, masks, origins)
+        original, masked, support = self.pooled_scenes(model, visual, valid, masks, origins)
         mean = (visual * valid).sum((-1, -2), keepdim=True) / valid.sum()
-        full = visual * (1 - masks[:, None]) + mean * masks[:, None]
+        footprint = masks * model.crop_support(origins, visual[0]) * valid
+        full = visual * (1 - footprint[:, None]) + mean * footprint[:, None]
         for i, (x, y) in enumerate(origins.tolist()):
             crop_valid = valid[y:y + 48, x:x + 48][None, None].float()
             denominator = torch.nn.functional.avg_pool2d(crop_valid, 2)
@@ -124,28 +129,26 @@ class CRVTests(unittest.TestCase):
         self.assertEqual(support[0].sum().item(), 48 * 48)
         self.assertEqual(support[1].sum().item(), 24 * 24)
         valid = torch.ones(144, 144, dtype=torch.bool)
-        original, masked, pooled_valid = model.pooled_scenes(feature, valid, torch.ones(3, 144, 144), origins)
+        original, masked, pooled_valid = self.pooled_scenes(model, feature, valid, torch.ones(3, 144, 144), origins)
         torch.testing.assert_close(original, masked)
         self.assertEqual(pooled_valid[1].count_nonzero().item(), 12 * 12)
         torch.testing.assert_close(original[1, :, :12], torch.zeros_like(original[1, :, :12]))
-        # Changing pixels outside a crop cannot alter its original scene.
+        # Outside evidence must not enter the original local crop.
         changed = feature.clone()
         changed[:, :, :24] = 10000
-        other, _, _ = model.pooled_scenes(changed, valid, torch.zeros(3, 144, 144), origins)
-        torch.testing.assert_close(other[0], original[0])
+        other, _, _ = self.pooled_scenes(model, changed, valid, torch.zeros(3, 144, 144), origins)
+        torch.testing.assert_close(other[0], original[0], rtol=0, atol=0)
+        self.assertFalse(torch.allclose(other[1], other[0]))
         # GT coverage uses the cropped footprint, not an unseen expanded mask.
         gt = torch.tensor([.8, .5, .9, .6])
         coverage = model.gt_coverage(support[:1].float(), gt, feature[0], meta)
         self.assertEqual(coverage.item(), 0)
 
-    def test_local_pairing_keeps_each_candidates_own_original(self):
+    def test_each_local_original_is_paired_only_with_its_own_intervention(self):
         model = self.module()
         original = torch.randn(4, requires_grad=True)
         masked = torch.randn(4, requires_grad=True)
         actual = model.support_drop(original, masked)
-        for i in range(4):
-            expected = model.support_drop(original[i:i + 1], masked[i:i + 1])
-            torch.testing.assert_close(actual[i:i + 1], expected)
         torch.testing.assert_close(actual, original - masked)
         zero = model.support_drop(original, original)
         torch.testing.assert_close(zero, torch.zeros_like(zero), rtol=0, atol=1e-6)
@@ -154,12 +157,125 @@ class CRVTests(unittest.TestCase):
         self.assertEqual(original.grad[1:].count_nonzero().item(), 0)
         self.assertEqual(masked.grad[1:].count_nonzero().item(), 0)
 
+    def test_batched_crops_match_padded_reference_and_gradients(self):
+        for height, width in ((25, 29), (19, 23)):
+            model = self.module(grid_size=6, crop_size=13)
+            visual = torch.randn(2, 3, height, width, requires_grad=True)
+            valid = torch.ones(2, height, width, dtype=torch.bool)
+            valid[0, -4:] = False
+            valid[1, :, -3:] = False
+            owners = torch.tensor([0, 1, 0, 1])
+            origins = torch.tensor([[-4, -3], [7, 4], [20, 17], [-3, 18]])
+            masks = torch.rand(4, height, width) * valid[owners] * model.crop_support(origins, visual[0])
+            mean = model.image_mean(visual, valid)
+            original, actual, denominator = model.pooled_scenes(visual, valid, masks, origins, owners=owners, mean=mean)
+            full = visual[owners] + (mean[owners] - visual[owners]) * masks[:, None]
+            size = model.crop_size
+            pad = (size,) * 4
+            padded = torch.nn.functional.pad(full, pad)
+            padded_original = torch.nn.functional.pad(visual[owners], pad)
+            padded_valid = torch.nn.functional.pad(valid[owners, None].float(), pad)
+            expected, expected_original = [], []
+            for i, (x, y) in enumerate(origins.tolist()):
+                region = (slice(i, i + 1), slice(None), slice(y + size, y + 2 * size), slice(x + size, x + 2 * size))
+                crop_valid = padded_valid[region]
+                denom = torch.nn.functional.adaptive_avg_pool2d(crop_valid, 6)
+                normalize = lambda values: torch.nn.functional.adaptive_avg_pool2d(values * crop_valid, 6) / denom.clamp(min=1e-8)
+                expected.append(normalize(padded[region]))
+                expected_original.append(normalize(padded_original[region]))
+                torch.testing.assert_close(denominator[i:i + 1], denom)
+            expected = torch.cat(expected)
+            torch.testing.assert_close(original, torch.cat(expected_original))
+            torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+            actual_grad, = torch.autograd.grad(actual.square().sum(), visual, retain_graph=True)
+            expected_grad, = torch.autograd.grad(expected.square().sum(), visual)
+            torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-5, atol=1e-6)
+
+    def test_batched_grouping_matches_original_greedy_algorithm(self):
+        model = self.module()
+        args = self.inputs()
+        clipped = model.clipped_boxes(args[2]).expand(4, -1, -1).clone()
+        clipped[1, 1:4] = clipped[1, :1]
+        clipped[2] = clipped[2, :1]
+        clipped[3, 2:4] = 0
+        logits = args[6].squeeze(-1).expand(4, -1)
+        order = logits.argsort(1, descending=True)
+        entropy, counts = model.batch_uncertainty(logits, clipped, order)
+        for bi in range(len(logits)):
+            kept = []
+            for index in order[bi, :model.uncertainty_topn].tolist():
+                if not kept or pairwise_iou(clipped[bi, index:index + 1], clipped[bi, kept]).max() < model.duplicate_iou:
+                    kept.append(index)
+            probability = logits[bi, kept].softmax(0)
+            expected = probability.new_zeros(()) if len(kept) < 2 else (
+                -(probability * probability.log()).sum() / torch.tensor(float(len(kept))).log())
+            torch.testing.assert_close(entropy[bi], expected)
+            self.assertEqual(counts[bi].item(), len(kept))
+
+    def test_cross_image_batching_caches_text_and_preserves_local_pairs(self):
+        model = self.module(chunk_size=8).train()
+        args = self.inputs()
+        args = [value.repeat(3, *([1] * (value.ndim - 1))) if torch.is_tensor(value)
+                else value * 3 for value in args]
+        args[0][1] += .7
+        args[5][2] = torch.tensor([[.99], [.1], [.09], [.08], [.07], [.06], [.05], [.04]])
+        args[6] = torch.logit(args[5])
+        gt = [torch.tensor([.09, .45, .15, .55])] * 3
+        encoded = []
+        hook = model.scorer.register_forward_pre_hook(lambda _, inputs: encoded.append(inputs[0].shape[0]))
+        try:
+            with patch.object(model.scorer, "prepare_text", wraps=model.scorer.prepare_text) as text_cache, \
+                 patch.object(model.scorer, "spatial_positions", wraps=model.scorer.spatial_positions) as positions, \
+                 patch.object(model.scorer.visual, "forward", wraps=model.scorer.visual.forward) as projection:
+                probabilities, priority, losses, info = model(*args, refer_gt=gt)
+        finally:
+            hook.remove()
+        self.assertEqual(encoded, [8, 8, 8])  # Two routed images, each with 2*(5+1) scenes.
+        self.assertEqual(text_cache.call_count, 1)
+        self.assertEqual(positions.call_count, 1)
+        self.assertEqual(projection.call_count, 1)
+        self.assertEqual(projection.call_args.args[0].shape[0], 2)
+        torch.testing.assert_close(info["crv_active"], torch.tensor(2 / 3))
+        torch.testing.assert_close(probabilities[2], args[5][2], rtol=0, atol=0)
+        self.assertTrue(info["crv_samples"][2]["skipped"])
+        per_image_losses = []
+        for bi in range(2):
+            single = [value[bi:bi + 1] for value in args]
+            p, rank, loss, details = model(*single, refer_gt=gt[bi:bi + 1])
+            torch.testing.assert_close(p[0], probabilities[bi])
+            torch.testing.assert_close(rank[0], priority[bi])
+            torch.testing.assert_close(details["crv_samples"][0]["drops"], info["crv_samples"][bi]["drops"], atol=1e-6, rtol=1e-5)
+            per_image_losses.append(loss)
+        for key, value in losses.items():
+            torch.testing.assert_close(value, sum(loss[key] for loss in per_image_losses) / 3)
+
+    def test_chunk_size_changes_neither_outputs_nor_parameter_gradients(self):
+        first = self.module(chunk_size=1).train()
+        second = copy.deepcopy(first)
+        second.chunk_size = 8
+        args = self.inputs()
+        gt = [torch.tensor([.09, .45, .15, .55])]
+        a = first(*args, refer_gt=gt)
+        b = second(*args, refer_gt=gt)
+        torch.testing.assert_close(a[0], b[0])
+        torch.testing.assert_close(a[1], b[1])
+        for key in a[2]:
+            torch.testing.assert_close(a[2][key], b[2][key])
+        sum(a[2].values()).backward()
+        sum(b[2].values()).backward()
+        for (name, parameter), (other_name, other) in zip(first.named_parameters(), second.named_parameters()):
+            self.assertEqual(name, other_name)
+            if parameter.grad is None:
+                self.assertIsNone(other.grad)
+            else:
+                torch.testing.assert_close(parameter.grad, other.grad, rtol=1e-4, atol=2e-6)
+
     def test_crop_size_validation(self):
         for value in (0, -1, True, 3, 48.5):
             with self.assertRaisesRegex(ValueError, "crop_size"):
                 self.module(crop_size=value)
 
-    def test_144_feature_forward_uses_paired_48_crops_and_24_grids(self):
+    def test_144_feature_forward_scores_six_matched_local_pairs(self):
         model = self.module(hidden_channels=256, grid_size=24, crop_size=48, chunk_size=2).train()
         args = self.inputs()
         args[0] = torch.randn(1, 256, 144, 144, requires_grad=True)
@@ -174,7 +290,7 @@ class CRVTests(unittest.TestCase):
                 probabilities, _, losses, info = model(*args, refer_gt=[gt])
         finally:
             hook.remove()
-        # Five predicted-box pairs plus one exact-GT pair, each half in chunks of two.
+        # Five predicted-box pairs + one exact-GT pair, not a shared full scene.
         self.assertEqual(pooling.call_count, 3)
         self.assertEqual(encoded, [torch.Size([2, 16, 24, 24])] * 6)
         origins = torch.cat([call.args[3] for call in pooling.call_args_list])
@@ -183,6 +299,7 @@ class CRVTests(unittest.TestCase):
         details = info["crv_samples"][0]
         torch.testing.assert_close(details["crop_origins"], origins[:5])
         self.assertEqual(details["original_support"].shape, (5,))
+        self.assertGreater(details["original_support"].unique().numel(), 1)
         torch.testing.assert_close(details["drops"], details["original_support"] - details["masked_support"])
         expected = details["base_logits"] + info["crv_alpha"] * details["drops"]
         torch.testing.assert_close(details["fused_logits"], expected)
@@ -340,16 +457,14 @@ class CRVTests(unittest.TestCase):
         self.assertLess(original.grad[0].item(), 0)
         self.assertGreater(masked.grad[0].item(), 0)
 
-    def test_common_original_scalar_cancels_but_local_originals_have_rank_gradients(self):
+    def test_local_original_support_receives_candidate_ranking_gradients(self):
         model = self.module()
-        original = torch.randn(4, requires_grad=True)
         masked = torch.randn(4, requires_grad=True)
-        model.localization_loss(model.support_drop(original, masked), torch.tensor([.8, 0., 0., .2])).backward()
-        self.assertGreater(original.grad.abs().sum().item(), 0)
-        common = torch.randn((), requires_grad=True)
-        loss = model.localization_loss(model.support_drop(common, masked.detach()), torch.tensor([.8, 0., 0., .2]))
+        original = torch.randn(4, requires_grad=True)
+        loss = model.localization_loss(model.support_drop(original, masked), torch.tensor([.8, 0., 0., .2]))
         loss.backward()
-        torch.testing.assert_close(common.grad, torch.zeros_like(common), rtol=0, atol=1e-6)
+        self.assertGreater(original.grad.abs().sum().item(), 0)
+        torch.testing.assert_close(original.grad, -masked.grad)
 
     def test_direct_localization_uses_multiple_positives_and_ignores_unreachable_samples(self):
         model = self.module()
@@ -498,21 +613,28 @@ class CRVTests(unittest.TestCase):
         torch.testing.assert_close(a[0], b[0], rtol=0, atol=0)
         torch.testing.assert_close(a[1], b[1], rtol=0, atol=0)
 
-    def test_low_entropy_training_only_trains_counterfactual_scorer(self):
+    def test_low_entropy_training_skips_crv_and_adamw_does_not_update_it(self):
         model = self.module().train()
         args = self.inputs()
         args[5] = torch.tensor([[[.99], [.1], [.09], [.08], [.07], [.06], [.05], [.04]]])
         args[6] = torch.logit(args[5])
-        probabilities, _, losses, info = model(*args, refer_gt=[torch.tensor([.09, .45, .15, .55])])
+        parameters = {name: value.detach().clone() for name, value in model.named_parameters()}
+        optimizer = torch.optim.AdamW(model.parameters(), lr=.1, weight_decay=.1)
+        with patch.object(model.scorer, "forward", side_effect=AssertionError("Low entropy")), \
+             patch.object(model.scorer.visual, "forward", side_effect=AssertionError("Low entropy")), \
+             patch.object(model, "intervention_masks", side_effect=AssertionError("Low entropy")):
+            probabilities, _, losses, info = model(*args, refer_gt=[torch.tensor([.09, .45, .15, .55])])
         self.assertEqual(info["crv_active"].item(), 0)
         self.assertEqual(info["crv_alpha"].item(), 0)
         self.assertEqual(losses["loss_crv_fusion"].item(), 0)
-        self.assertGreater(losses["loss_crv_cf"].item(), 0)
+        self.assertEqual(losses["loss_crv_cf"].item(), 0)
         torch.testing.assert_close(probabilities, args[5], rtol=0, atol=0)
-        sum(losses.values()).backward()
-        self.assertGreater(model.scorer.visual.weight.grad.abs().sum().item(), 0)
-        for parameter in model.gate.parameters():
-            self.assertTrue(parameter.grad is None or parameter.grad.count_nonzero() == 0)
+        anchor = torch.nn.Parameter(torch.tensor(1.))
+        (anchor.square() + sum(losses.values())).backward()
+        self.assertTrue(all(parameter.grad is None for parameter in model.parameters()))
+        optimizer.step()
+        for name, value in model.named_parameters():
+            torch.testing.assert_close(value, parameters[name], rtol=0, atol=0)
 
     def test_padding_text_and_visual_values_cannot_change_scores(self):
         model = self.module().eval()
@@ -609,7 +731,7 @@ class CRVTests(unittest.TestCase):
         _validate_crv_checkpoint(model, {"module." + key: value for key, value in state.items()})
         with self.assertRaisesRegex(ValueError, "compatible CRV checkpoint"):
             _validate_crv_checkpoint(model, {})
-        for version in (1, 2, 3, 4, 5):
+        for version in (1, 2, 3, 4, 5, 6, 7):
             with self.assertRaisesRegex(ValueError, "compatible CRV checkpoint"):
                 _validate_crv_checkpoint(model, dict(state, **{"head.crv.schema_version": torch.tensor(version)}))
         model.head.crv = None

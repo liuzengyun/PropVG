@@ -1,4 +1,4 @@
-"""Independent local-crop counterfactual refinement guided by grouped CRS entropy."""
+"""Entropy-routed counterfactual refinement with paired local scene crops."""
 import math
 
 import torch
@@ -19,7 +19,7 @@ def pairwise_iou(boxes, targets):
 
 
 class SceneTextScorer(nn.Module):
-    """Shared local scene/text support score, before and after intervention."""
+    """Shared scene/text support score, before and after local intervention."""
     def __init__(self, channels, dim=128, heads=4, layers=2):
         super().__init__()
         self.visual = nn.Conv2d(channels, dim, 1, bias=False)
@@ -30,33 +30,43 @@ class SceneTextScorer(nn.Module):
         # A shared additive output bias would cancel in every support drop.
         self.score = nn.Sequential(nn.Linear(dim * 4, dim), nn.GELU(), nn.Linear(dim, 1, bias=False))
 
-    def forward(self, scenes, valid, text, text_mask):
-        # scenes: S,D,G,G. Invalid/padding cells never become scene evidence.
-        count, dim, height, width = scenes.shape
-        yy, xx = torch.meshgrid((torch.arange(height, device=scenes.device) + .5) / height,
-                                (torch.arange(width, device=scenes.device) + .5) / width, indexing="ij")
-        positions = self.position(torch.stack((xx, yy), -1).reshape(-1, 2).to(scenes))
-        memory = scenes.flatten(2).transpose(1, 2) + positions[None]
-        memory_valid = valid.flatten(1) > 0
+    def prepare_text(self, text, text_mask):
+        """Project each image's text once, retaining its scorer gradients."""
         text_valid = ~text_mask.bool()
-        usable = memory_valid.any(1) & text_valid.any(1)
-        # Make attention finite even for empty inputs, then suppress its result.
-        memory_valid = memory_valid.clone()
-        text_valid = text_valid.clone()
-        memory_valid[~memory_valid.any(1), 0] = True
-        text_valid[~text_valid.any(1), 0] = True
         original = self.text(text)
+        dim = original.shape[-1]
         token_position = torch.arange(text.shape[1], device=text.device, dtype=original.dtype)
         frequency = torch.exp(torch.arange(0, dim, 2, device=text.device, dtype=original.dtype)
                               * (-math.log(10000.) / dim))
         language_position = torch.zeros_like(original[:1])
         language_position[0, :, 0::2] = (token_position[:, None] * frequency).sin()
         language_position[0, :, 1::2] = (token_position[:, None] * frequency).cos()
-        read = self.reader(original + language_position, memory,
-                           tgt_key_padding_mask=~text_valid, memory_key_padding_mask=~memory_valid)
-        weights = (~text_mask.bool()).to(read.dtype)[..., None]
+        weights = text_valid.to(original.dtype)[..., None]
         denominator = weights.sum(1).clamp(min=1.)
         initial = (original * weights).sum(1) / denominator
+        return original + language_position, text_valid, weights, initial
+
+    def spatial_positions(self, height, width, reference):
+        yy, xx = torch.meshgrid((torch.arange(height, device=reference.device) + .5) / height,
+                                (torch.arange(width, device=reference.device) + .5) / width, indexing="ij")
+        return self.position(torch.stack((xx, yy), -1).reshape(-1, 2).to(reference))
+
+    def forward(self, scenes, valid, text, text_mask, prepared_text=None, positions=None):
+        # Scenes are independent batch entries, never one shared attention sequence.
+        if positions is None:
+            positions = self.spatial_positions(*scenes.shape[-2:], scenes)
+        memory = scenes.flatten(2).transpose(1, 2) + positions[None]
+        memory_valid = valid.flatten(1) > 0
+        language, text_valid, weights, initial = (self.prepare_text(text, text_mask)
+                                                if prepared_text is None else prepared_text)
+        usable = memory_valid.any(1) & text_valid.any(1)
+        # Make attention finite even for empty inputs, then suppress its result.
+        memory_valid, text_valid = memory_valid.clone(), text_valid.clone()
+        memory_valid[~memory_valid.any(1), 0] = True
+        text_valid[~text_valid.any(1), 0] = True
+        read = self.reader(language, memory,
+                           tgt_key_padding_mask=~text_valid, memory_key_padding_mask=~memory_valid)
+        denominator = weights.sum(1).clamp(min=1.)
         interpreted = (read * weights).sum(1) / denominator
         visual_weights = valid.flatten(1).to(scenes.dtype)[..., None]
         visual_mean = (scenes.flatten(2).transpose(1, 2) * visual_weights).sum(1)
@@ -67,7 +77,7 @@ class SceneTextScorer(nn.Module):
 
 class CounterfactualRefinement(nn.Module):
     def __init__(self, hidden_channels=256, topk=5, uncertainty_topn=5, grid_size=24, crop_size=48,
-                 scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=2,
+                 scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
                  inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
                  uncertainty_temperature=1.0, uncertainty_threshold=0.6, gate_initial_probability=0.02,
                  cf_temperature=1.0,
@@ -106,7 +116,7 @@ class CounterfactualRefinement(nn.Module):
         self.ranking_margin, self.safety_margin = ranking_margin, safety_margin
         self.safety_weight, self.repair_weight = safety_weight, repair_weight
         self.scorer = SceneTextScorer(hidden_channels, scorer_dim, scorer_heads, scorer_layers)
-        self.register_buffer("schema_version", torch.tensor(6, dtype=torch.long))
+        self.register_buffer("schema_version", torch.tensor(8, dtype=torch.long))
         # Saved with checkpoints so validation/evaluation before the scheduled
         # start cannot accidentally use a randomly initialized CRV branch.
         self.register_buffer("last_training_epoch", torch.tensor(0, dtype=torch.long))
@@ -130,6 +140,7 @@ class CounterfactualRefinement(nn.Module):
             if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
                 raise ValueError("CRV training epoch must be a nonnegative zero-based integer")
             self.last_training_epoch.fill_(epoch + 1)
+            return epoch + 1 >= self.start_epoch
         return int(self.last_training_epoch) >= self.start_epoch
 
     @staticmethod
@@ -174,18 +185,29 @@ class CounterfactualRefinement(nn.Module):
         return (masks * support).sum((-1, -2)) / support.sum().clamp(min=1e-8)
 
     def uncertainty(self, logits, boxes, order):
-        # Greedy grouping affects only uncertainty, never detection or ranking.
+        entropy, counts = self.batch_uncertainty(logits[None], boxes[None], order[None])
+        return entropy[0], counts[0]
+
+    def batch_uncertainty(self, logits, boxes, order):
+        """Same greedy IoU grouping, without per-candidate CUDA-to-host tests."""
+        indices = order[:, :self.uncertainty_topn]
+        selected_boxes = boxes.gather(1, indices[..., None].expand(-1, -1, 4))
+        lo = torch.maximum(selected_boxes[:, :, None, :2], selected_boxes[:, None, :, :2])
+        hi = torch.minimum(selected_boxes[:, :, None, 2:], selected_boxes[:, None, :, 2:])
+        inter = (hi - lo).clamp(min=0).prod(-1)
+        area = (selected_boxes[..., 2:] - selected_boxes[..., :2]).clamp(min=0).prod(-1)
+        overlaps = inter / (area[:, :, None] + area[:, None, :] - inter).clamp(min=1e-8)
         kept = []
-        for index in order[:self.uncertainty_topn].tolist():
-            if not kept or pairwise_iou(boxes[index:index + 1], boxes[kept]).max() < self.duplicate_iou:
-                kept.append(index)
-        zero = logits.new_tensor(0.)
-        if len(kept) < 2:
-            return zero, logits.new_tensor(float(len(kept)))
-        selected = logits[kept]
-        relative = (selected / self.uncertainty_temperature).softmax(0)
-        entropy = (-(relative * relative.clamp(min=1e-8).log()).sum() / math.log(len(kept))).clamp(0, 1)
-        return entropy, logits.new_tensor(float(len(kept)))
+        for index in range(indices.shape[1]):
+            keep = torch.ones_like(indices[:, 0], dtype=torch.bool) if not kept else ~(
+                (overlaps[:, index, :index] >= self.duplicate_iou) & torch.stack(kept, 1)).any(1)
+            kept.append(keep)
+        kept = torch.stack(kept, 1)
+        counts = kept.sum(1).to(logits.dtype)
+        selected = (logits.gather(1, indices) / self.uncertainty_temperature).masked_fill(~kept, -torch.inf)
+        relative = selected.softmax(1)
+        entropy = -(relative * relative.clamp(min=1e-8).log()).sum(1) / counts.clamp(min=2).log()
+        return entropy.clamp(0, 1), counts
 
     def crop_origins(self, boxes_xyxy, feature, meta):
         """Integer (x,y) origins on the padded feature map, not image pixels."""
@@ -204,34 +226,45 @@ class CounterfactualRefinement(nn.Module):
         x, y = origins[:, 0, None, None], origins[:, 1, None, None]
         return (xx >= x) & (xx < x + self.crop_size) & (yy >= y) & (yy < y + self.crop_size)
 
-    def pooled_scenes(self, projected, valid, masks, origins):
-        """Matched original/masked fixed-size crops, THEN valid-aware pooling."""
-        # Linear bias-free projection commutes exactly with mean replacement.
-        # The fill mean still uses the WHOLE valid image, not a crop's mean.
-        v = valid.to(projected.dtype)
-        mean = (projected * v).sum((-1, -2), keepdim=True) / v.sum().clamp(min=1.)
+    @staticmethod
+    def image_mean(projected, valid):
+        """Cache the full valid-image mean, not a candidate crop's mean."""
+        v = valid[:, None].to(projected.dtype)
+        return (projected * v).sum((-1, -2), keepdim=True) / v.sum((-1, -2), keepdim=True).clamp(min=1.)
+
+    def pooled_scenes(self, projected, valid, masks, origins, owners=None, mean=None):
+        """Matched original/masked C x C crops, then valid-aware G x G pooling.
+
+        Owners allow independent candidates from different images in one batch.
+        No full-scene baseline is used or shared across different local windows.
+        """
+        if valid.ndim == 2:
+            valid = valid[None]
+        if owners is None:
+            owners = origins.new_zeros(len(origins))
+        if mean is None:
+            mean = self.image_mean(projected, valid)
         height, width = projected.shape[-2:]
         offset = torch.arange(self.crop_size, device=projected.device)
         yy = origins[:, 1, None, None] + offset[None, :, None]
         xx = origins[:, 0, None, None] + offset[None, None, :]
         inside = (yy >= 0) & (yy < height) & (xx >= 0) & (xx < width)
         yy, xx = yy.clamp(0, height - 1), xx.clamp(0, width - 1)
-        local_valid = (valid[yy, xx] & inside)[:, None].to(projected.dtype)
-        original = projected[0, :, yy, xx].permute(1, 0, 2, 3)
-        local_masks = masks[torch.arange(len(masks), device=masks.device)[:, None, None], yy, xx][:, None]
-        masked = original + (mean - original) * local_masks
+        local = projected.permute(0, 2, 3, 1)[owners[:, None, None], yy, xx].permute(0, 3, 1, 2)
+        local_valid = (valid[owners[:, None, None], yy, xx] & inside)[:, None].to(projected.dtype)
+        local_masks = masks[torch.arange(len(masks), device=masks.device)[:, None, None], yy, xx]
+        masked = local + (mean[owners] - local) * local_masks[:, None]
         denominator = F.adaptive_avg_pool2d(local_valid, self.grid_size)
         normalize = lambda scenes: (F.adaptive_avg_pool2d(scenes * local_valid, self.grid_size)
                                      / denominator.clamp(min=1e-8)) * (denominator > 0)
-        return normalize(original), normalize(masked), denominator
+        return normalize(local), normalize(masked), denominator
 
     def fusion(self, base, drops, entropy):
         base = base.detach()
         statistics = entropy.detach().reshape(1)
         gate_logit = self.gate(statistics).squeeze(-1)
         alpha = gate_logit.sigmoid()
-        if not bool(entropy > self.uncertainty_threshold):
-            alpha = alpha * 0
+        alpha = alpha * (entropy > self.uncertainty_threshold).to(alpha.dtype)
         # Residual correction of ORIGINAL CRS logits; no softmax mixture or
         # replacement of the base branch, even when alpha approaches one.
         fused = base + alpha * drops
@@ -287,71 +320,117 @@ class CounterfactualRefinement(nn.Module):
         order = probabilities.argsort(dim=1, descending=True, stable=True)
         final_order = order.clone()
         final_probabilities = probabilities.clone()
+        clipped_boxes = self.clipped_boxes(boxes)
+        entropy_values, count_values = self.batch_uncertainty(logits, clipped_boxes, order)
+        valid_images = ~visual_mask.bool()
+        usable = valid_images.flatten(1).any(1) & (~text_mask.bool()).any(1)
+        routes = usable & (entropy_values > self.uncertainty_threshold)
+        # A single host transfer decides routing for the entire batch. Training
+        # and inference BOTH skip low-entropy samples before projection/masking.
+        routed = routes.nonzero(as_tuple=False).flatten().tolist()
+        contexts, supports = {}, {}
+        if routed:
+            active_valid = valid_images[routed]
+            projected = self.scorer.visual(visual[routed])
+            fill_mean = self.image_mean(projected, active_valid)
+            all_masks, all_origins, all_owners = [], [], []
+            offset = 0
+            for owner, bi in enumerate(routed):
+                indices = order[bi, :self.topk]
+                gt = refer_gt[bi] if self.training and refer_gt is not None else None
+                crop_boxes = clipped_boxes[bi, indices]
+                if gt is not None:
+                    gt = gt.detach().to(visual).clamp(0, 1)
+                    crop_boxes = torch.cat((crop_boxes, gt[None]))
+                masks = self.intervention_masks(crop_boxes, visual[bi], img_metas[bi], valid_images[bi])
+                origins = self.crop_origins(crop_boxes, visual[bi], img_metas[bi])
+                masks = masks * self.crop_support(origins, visual[bi])
+                count = len(masks)
+                contexts[bi] = (owner, offset, count, gt, masks, origins)
+                all_masks.append(masks)
+                all_origins.append(origins)
+                all_owners.append(order.new_full((count,), owner))
+                offset += count
+            masks, origins, owners = torch.cat(all_masks), torch.cat(all_origins), torch.cat(all_owners)
+            # Every candidate has its OWN original crop paired with the masked
+            # version of the SAME window. Cross-image batching only saves calls.
+            originals, interventions, valid_crops = [], [], []
+            for start in range(0, len(masks), self.chunk_size):
+                end = start + self.chunk_size
+                original, masked, crop_valid = self.pooled_scenes(
+                    projected, active_valid, masks[start:end], origins[start:end],
+                    owners=owners[start:end], mean=fill_mean)
+                originals.append(original)
+                interventions.append(masked)
+                valid_crops.append(crop_valid)
+            scenes = torch.cat((torch.cat(originals), torch.cat(interventions)))
+            pooled_valid = torch.cat(valid_crops)
+            scene_valid = torch.cat((pooled_valid, pooled_valid))
+            scene_owners = torch.cat((owners, owners))
+            active_text, active_text_mask = text[routed], text_mask[routed]
+            prepared = self.scorer.prepare_text(active_text, active_text_mask)
+            positions = self.scorer.spatial_positions(self.grid_size, self.grid_size, scenes)
+            encoded = []
+            # Batch across images/candidates and original/intervened scenes.
+            # Independent batch entries retain independent attention contexts.
+            for start in range(0, len(scenes), self.chunk_size):
+                end = start + self.chunk_size
+                selected = scene_owners[start:end]
+                encoded.append(self.scorer(
+                    scenes[start:end], scene_valid[start:end], active_text[selected], active_text_mask[selected],
+                    prepared_text=tuple(value[selected] for value in prepared), positions=positions))
+            encoded = torch.cat(encoded)
+            original_support = encoded[:len(masks)]
+            masked_support = encoded[len(masks):]
+            # Identical scenes must have exactly zero drops, even if different
+            # GEMM batch shapes introduce tiny floating-point differences.
+            masked_support = torch.where(masks.flatten(1).any(1), masked_support, original_support)
+            for bi, (_owner, offset, count, *_rest) in contexts.items():
+                supports[bi] = (original_support[offset:offset + count], masked_support[offset:offset + count])
         cf_terms, fusion_terms, alphas, active, entropies = [], [], [], [], []
-        group_counts, changed = [], []
+        changed, group_counts = [], []
         corrected, harmed, reachable, rejected = [], [], [], []
         sample_details = []
         for bi in range(len(boxes)):
-            clipped = self.clipped_boxes(boxes[bi])
+            clipped = clipped_boxes[bi]
             indices = order[bi, :self.topk]
             base = logits[bi, indices]
-            entropy, group_count = self.uncertainty(logits[bi], clipped, order[bi])
-            valid = ~visual_mask[bi].bool()
-            usable = valid.any() & (~text_mask[bi].bool()).any()
+            entropy, group_count = entropy_values[bi], count_values[bi]
             entropies.append(entropy)
             group_counts.append(group_count)
-            route = usable & (entropy > self.uncertainty_threshold)
-            active.append(route.float())
-            # Train the independent scorer on valid inputs even below threshold,
-            # but only ambiguous inputs receive fusion/ranking supervision.
-            if not bool(usable) or (not self.training and not bool(route)):
+            active.append(routes[bi].float())
+            if bi not in contexts:
                 alphas.append(base.new_tensor(0.))
                 changed.append(base.new_tensor(0.))
+                # Normalize task losses over the full local batch, with skipped
+                # samples contributing detached zero (no AdamW-only updates).
+                cf_terms.append(base.new_zeros(()))
+                fusion_terms.append(base.new_zeros(()))
+                if self.training and refer_gt is not None and refer_gt[bi] is not None:
+                    for values in (corrected, harmed, reachable, rejected):
+                        values.append(base.new_zeros(()))
                 sample_details.append({"indices": indices, "skipped": True})
                 continue
-            projected = self.scorer.visual(visual[bi:bi + 1])
-            candidate_masks = self.intervention_masks(clipped[indices], visual[bi], img_metas[bi], valid)
-            gt = refer_gt[bi] if self.training and refer_gt is not None else None
-            crop_boxes = clipped[indices]
-            masks = candidate_masks
-            if gt is not None:
-                gt = gt.detach().to(visual).clamp(0, 1)
-                gt_mask = self.intervention_masks(gt[None], visual[bi], img_metas[bi], valid)
-                masks = torch.cat((masks, gt_mask))
-                crop_boxes = torch.cat((crop_boxes, gt[None]))
-            origins = self.crop_origins(crop_boxes, visual[bi], img_metas[bi])
-            # Negative reliability must reflect only evidence actually removed.
-            masks = masks * self.crop_support(origins, visual[bi])
-            originals, interventions = [], []
-            for start in range(0, len(masks), self.chunk_size):
-                original, masked, pooled_valid = self.pooled_scenes(
-                    projected, valid, masks[start:start + self.chunk_size], origins[start:start + self.chunk_size])
-                count = len(original)
-                # Encode each half separately to keep scorer batches <= chunk_size.
-                for scenes, values in ((original, originals), (masked, interventions)):
-                    values.append(self.scorer(scenes, pooled_valid, text[bi:bi + 1].expand(count, -1, -1),
-                                              text_mask[bi:bi + 1].expand(count, -1)))
-            original_support, masked_support = torch.cat(originals), torch.cat(interventions)
+            _, _, _, gt, masks, origins = contexts[bi]
+            original_support, masked_support = supports[bi]
             importance = self.support_drop(original_support, masked_support)
             drops = importance[:len(indices)]
             fused, alpha, branches = self.fusion(base, drops, entropy)
             alphas.append(alpha)
             local_order = fused.argsort(descending=True, stable=True)
-            if bool(route):
-                final_order[bi, :len(indices)] = indices[local_order]
-                final_probabilities[bi, indices] = fused.sigmoid()
-            changed.append(((local_order[0] != 0) & route).float())
+            final_order[bi, :len(indices)] = indices[local_order]
+            final_probabilities[bi, indices] = fused.sigmoid()
+            changed.append((local_order[0] != 0).float())
             zero = fused.sum() * 0
             cf, fusion = zero, zero
-            if gt is not None and bool(usable):
+            if gt is not None:
                 ious = pairwise_iou(clipped[indices], gt[None]).squeeze(-1)
                 coverage = self.gt_coverage(masks[:len(indices)], gt, visual[bi], img_metas[bi])
                 cf, negative = self.counterfactual_loss(drops, ious, coverage)
                 cf = cf + self.gt_loss_weight * F.relu(self.positive_margin - importance[-1])
                 fusion, _, _, _ = self.fusion_loss(branches["base_logits"], fused, ious)
-                fusion = fusion * route
                 before = (ious[0] >= .5)
-                after = (ious[fused.argmax()] >= .5) if bool(route) else before
+                after = (ious[fused.argmax()] >= .5)
                 corrected.append((~before & after).float())
                 harmed.append((before & ~after).float())
                 reachable.append((ious >= .5).any().float())
@@ -370,13 +449,13 @@ class CounterfactualRefinement(nn.Module):
                                    "base_distribution": base.softmax(0).detach(),
                                    "cf_distribution": (drops / self.cf_temperature).softmax(0).detach(),
                                    "fused_distribution": fused.softmax(0).detach(),
-                                   "gate_statistics": branches["gate_statistics"], "active": bool(route)})
+                                   "gate_statistics": branches["gate_statistics"], "active": True})
         # Explicit ordering keys retain ALL candidates, permit only Top-K
         # internal reordering, and cannot accidentally promote original K+1.
         priority = torch.empty_like(logits)
         priority.scatter_(1, final_order, torch.arange(boxes.shape[1], 0, -1, device=boxes.device,
                                                       dtype=logits.dtype)[None].expand_as(logits))
-        parameter_zero = next(self.parameters()).reshape(-1)[0] * 0
+        parameter_zero = logits.new_zeros(())
         mean = lambda values: torch.stack(values).mean() if values else parameter_zero
         losses = {"loss_crv_cf": mean(cf_terms) * self.cf_loss_weight,
                   "loss_crv_fusion": mean(fusion_terms) * self.fusion_loss_weight}

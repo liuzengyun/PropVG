@@ -50,10 +50,10 @@ enable_grab=False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
 # Independent post-CRS refinement. False preserves the previous experiment.
-enable_crv = False
+enable_crv = True
 crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
-crv_crop_size = 48  # Candidate-centered crop in feature cells, not image pixels.
-crv_grid_size = 24  # Pool each matched original/masked 48x48 crop to this grid.
+crv_crop_size = 48  # Candidate-centered local crop in feature cells, not image pixels.
+crv_grid_size = 24  # Pool matched original/masked local crops to this scoring grid.
 crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
@@ -124,7 +124,7 @@ model = dict(
               enable_crv=enable_crv,
               crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size, crop_size=crv_crop_size,
                        start_epoch=crv_start_epoch,
-                       scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=2,
+                       scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
                        inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
                        uncertainty_temperature=1.0, gate_initial_probability=0.02,
                        uncertainty_threshold=crv_uncertainty_threshold,

@@ -49,7 +49,9 @@ def main():
     destination = prepare_replay(args.source, args.mode, args.project, args.workspace)
     print("Replaying into a NEW SwanLab run; original journal is unchanged:", destination, flush=True)
     worker = Path(__file__).resolve().parents[1] / "propvg/utils/swanlab_worker.py"
-    result = subprocess.run([sys.executable, str(worker), str(destination)], stdin=subprocess.DEVNULL,
+    default_python = Path(__file__).resolve().parents[1] / ".venv-swanlab/bin/python"
+    worker_python = os.environ.get("PROPVG_SWANLAB_PYTHON") or (str(default_python) if default_python.is_file() else sys.executable)
+    result = subprocess.run([worker_python, str(worker), str(destination)], stdin=subprocess.DEVNULL,
                             env=dict(os.environ, CUDA_VISIBLE_DEVICES=""))
     raise SystemExit(result.returncode)
 

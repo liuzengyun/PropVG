@@ -1,6 +1,7 @@
 data/
 work_dir/
 swanlog/
+.venv-swanlab/
 __pycache__/
 *.pyc
 *.pkl

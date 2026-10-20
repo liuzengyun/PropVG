@@ -1,6 +1,6 @@
 # SwanLab 实验监控
 
-已将训练监控切换为 SwanLab。`propvg` 环境已安装 SwanLab 0.7.20；使用已登录的账号即可，启动命令不变：
+训练监控使用 SwanLab。云端新版项目要求 SDK ≥ 0.9.0，而训练环境的 Python 3.8 无法安装该版本，因此后台上传使用独立的 Python 3.11 环境 `.venv-swanlab`。训练启动命令不变：
 
 ```bash
 bash gpu1.sh
@@ -11,6 +11,16 @@ bash tools/dist_train.sh
 默认项目为 `propvg`，实验名为“实验组目录/启动时间”。后台初始化成功后，终端会在下一次日志提交时显示 `SwanLab online: https://...`；也可从本次实验的 `swanlab_tracking.json` 找到 `status.json`，读取其中的网页地址。
 
 这项变更从下次启动训练生效。补传 SwanLab 本地记录可手动运行下文的工具。
+
+换机器时，先用 Python ≥ 3.9 创建上传环境：
+
+```bash
+python3.11 -m venv .venv-swanlab
+.venv-swanlab/bin/python -m pip install -r requirements-swanlab.txt
+.venv-swanlab/bin/swanlab login
+```
+
+代码自动优先选择项目内的 `.venv-swanlab/bin/python`；也可用 `PROPVG_SWANLAB_PYTHON` 或配置中的 `swanlab.python` 指定解释器。登录信息沿用同一用户的 SwanLab 账号。
 
 ## 配置和开关
 
@@ -52,7 +62,7 @@ SWANLAB_MODE=disabled bash gpu1.sh # 关闭监控
 | `config.tracking_summary` | 完整汇总，包含最终实验目录等文本信息；本地副本为 `summary.json` |
 | 终端日志 | 原训练 logger 的文本，在初始化后由后台打印并交给 SwanLab 捕获；本地副本为 `console.log` |
 
-兼容已安装的 SwanLab 0.7.20，按指标分别设置 `step`，不依赖新版的 `define_metric`。训练 loss 保持原单位；AerialVG Top-1、Top-5、box mIoU 为百分数。原有平面指标字段也继续记录。
+按指标分别设置 `step`。训练 loss 保持原单位；AerialVG Top-1、Top-5、box mIoU 为百分数。原有平面指标字段也继续记录。
 
 多卡仅 rank0 写 journal 并启动上传进程。训练进程不导入 SwanLab SDK；独立后台进程负责初始化、联网和上传。保留原有训练、验证、测试及 checkpoint 选择逻辑。后台会采集系统资源；训练进程显存使用量以 `memory/*` 为准。
 
@@ -71,7 +81,7 @@ swanlog/tracking-时间-ID/
   sdk/          # SwanLab 标准本地记录
 ```
 
-在线初始化失败或超时会尝试离线；SDK 无法使用时保留完整 journal，训练继续。离线启动的实验不会中途自动切成在线。后台正常收尾最多等待约 30 秒，超时未传完的记录可从 journal 补传。
+在线初始化失败或超时会在全新的进程中尝试离线，避免失败 SDK 状态影响回退；SDK 无法使用时保留完整 journal，训练继续。`status.json` 和 `worker.log` 会记录已脱敏的具体错误。离线启动的实验不会中途自动切成在线。后台正常收尾最多等待约 30 秒，超时未传完的记录可从 journal 补传。
 
 使用项目提供的恢复工具创建一个名称带 `replay` 的新 SwanLab 实验：
 
