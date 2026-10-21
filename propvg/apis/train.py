@@ -85,13 +85,15 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss = loss_det + loss_mask + loss_label_nt + loss_refer + loss_filter
         crv_values = {}
         if "loss_crv_cf" in losses:
-            for key in ("loss_crv_cf", "loss_crv_fusion"):
-                value = losses.pop(key)
-                loss = loss + value
-                crv_values[key] = value.detach()
-            for key in ("alpha", "active", "uncertainty", "corrected", "harmed", "reachable", "rejected_negatives",
-                        "rank_changed", "group_count", "ready"):
-                crv_values["crv_" + key] = losses.pop("metric_crv_" + key).detach()
+            # Preserve old CRV fields while collecting optional new losses and
+            # diagnostics; CRV-disabled baseline logging is unchanged.
+            for key in tuple(losses):
+                if key.startswith("loss_crv_"):
+                    value = losses.pop(key)
+                    loss = loss + value
+                    crv_values[key] = value.detach()
+                elif key.startswith("metric_crv_"):
+                    crv_values[key[len("metric_"):]] = losses.pop(key).detach()
         # loss = loss_det
         optimizer.zero_grad()
         if cfg.use_fp16:

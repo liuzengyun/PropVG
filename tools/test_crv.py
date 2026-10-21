@@ -9,7 +9,7 @@ import torch
 from mmcv import Config
 from propvg.models import build_head
 from propvg.models.heads.counterfactual_refinement import CounterfactualRefinement, pairwise_iou
-from propvg.apis.train import clip_training_gradients
+from propvg.apis.train import clip_training_gradients, train_model
 from propvg.utils.checkpoint import _validate_crv_checkpoint
 
 
@@ -34,7 +34,14 @@ class CRVTests(unittest.TestCase):
         scores = torch.linspace(.65, .50, count)[None, :, None]
         return [torch.randn(1, 16, 24, 24), torch.zeros(1, 24, 24, dtype=torch.bool), boxes,
                 torch.randn(1, 6, 16), torch.tensor([[0, 0, 0, 0, 1, 1]]), scores,
-                torch.logit(scores), [dict(img_shape=(80, 100), pad_shape=(100, 100))]]
+                torch.logit(scores), [dict(img_shape=(80, 100), pad_shape=(100, 100))], torch.randn(1, count, 16)]
+
+    def fuse(self, model, base, drops, entropy, features=None, text=None, text_mask=None):
+        channels = model.gate_query[0].normalized_shape[0]
+        features = base.new_zeros(len(base), channels) if features is None else features
+        text = base.new_zeros(6, channels) if text is None else text
+        text_mask = torch.zeros(len(text), dtype=torch.bool, device=text.device) if text_mask is None else text_mask
+        return model.fusion(base, drops, entropy, features, text, text_mask)
 
     def pooled_scenes(self, model, projected, valid, masks):
         original, denominator, mean = model.pooled_original(projected, valid[None])
@@ -225,7 +232,8 @@ class CRVTests(unittest.TestCase):
             torch.testing.assert_close(details["crv_samples"][0]["drops"], info["crv_samples"][bi]["drops"], atol=1e-6, rtol=1e-5)
             per_image_losses.append(loss)
         for key, value in losses.items():
-            torch.testing.assert_close(value, sum(loss[key] for loss in per_image_losses) / 3)
+            if key != "loss_crv_gate":  # Selector uses eligible-class means, not full-batch averaging.
+                torch.testing.assert_close(value, sum(loss[key] for loss in per_image_losses) / 3)
 
     def test_chunk_size_changes_neither_outputs_nor_parameter_gradients(self):
         first = self.module(chunk_size=1).train()
@@ -267,6 +275,7 @@ class CRVTests(unittest.TestCase):
         args[1] = torch.zeros(1, 144, 144, dtype=torch.bool)
         args[1][:, 116:] = True
         args[3] = torch.randn(1, 64, 256, requires_grad=True)
+        args[8] = torch.randn(1, args[2].shape[1], 256, requires_grad=True)
         args[4] = torch.zeros(1, 64, dtype=torch.bool)
         args[4][:, 18:] = True
         gt = torch.tensor([.09, .45, .15, .55])
@@ -288,7 +297,7 @@ class CRVTests(unittest.TestCase):
         self.assertEqual(details["original_support"].shape, (5,))
         torch.testing.assert_close(details["original_support"], details["original_support"][:1].expand(5))
         torch.testing.assert_close(details["drops"], details["original_support"] - details["masked_support"])
-        expected = details["base_logits"] + info["crv_alpha"] * details["drops"]
+        expected = details["base_logits"] + info["crv_alpha"] * (details["calibrated_cf_logits"] - details["base_logits"])
         torch.testing.assert_close(details["fused_logits"], expected)
         torch.testing.assert_close(probabilities[0, details["indices"], 0], expected.sigmoid())
         outside = torch.ones(args[2].shape[1], dtype=torch.bool)
@@ -297,6 +306,7 @@ class CRVTests(unittest.TestCase):
         sum(losses.values()).backward()
         self.assertIsNone(args[0].grad)
         self.assertIsNone(args[3].grad)
+        self.assertIsNone(args[8].grad)
         self.assertGreater(model.scorer.visual.weight.grad.abs().sum().item(), 0)
 
     def test_expanded_negative_covering_gt_is_not_a_negative(self):
@@ -331,27 +341,127 @@ class CRVTests(unittest.TestCase):
             model = self.module()
             base = torch.tensor([.2, .1])
             drops = torch.tensor([-1., 1.], requires_grad=True)
-            fused, alpha, branches = model.fusion(base, drops, torch.tensor(1.))
+            fused, alpha, branches = self.fuse(model, base, drops, torch.tensor(1.))
             ious = torch.tensor([.9, 0.]) if correct else torch.tensor([0., .9])
             loss, *_ = model.fusion_loss(branches["base_logits"], fused, ious)
             loss.backward()
-            gradient = model.gate.bias.grad.item()
+            gradient = model.gate[-1].bias.grad.item()
             self.assertGreater(gradient, 0) if correct else self.assertLess(gradient, 0)
             self.assertGreater(drops.grad.abs().sum().item(), 0)
             self.assertGreater(alpha.item(), 0)
 
-    def test_residual_fusion_uses_original_logits_not_probability_mixture(self):
+    def test_selector_targets_only_one_correct_one_wrong_disagreements(self):
+        model = self.module()
+        for ious, target, valid in (([0., .8], 1., True), ([.8, 0.], 0., True),
+                                    ([0., .2], 0., False), ([.7, .8], 1., False)):
+            actual_target, actual_valid = model.selector_target(torch.tensor(ious), torch.tensor(1), torch.tensor(True))
+            self.assertEqual(actual_target.item(), target)
+            self.assertEqual(actual_valid.item(), valid)
+        _, valid = model.selector_target(torch.tensor([0., .8]), torch.tensor(0), torch.tensor(True))
+        self.assertFalse(valid.item())
+        _, valid = model.selector_target(torch.tensor([0., .8]), torch.tensor(1), torch.tensor(False))
+        self.assertFalse(valid.item())
+
+    def test_selector_bce_balances_classes_and_ignores_undecidable_samples(self):
+        model = self.module()
+        logits = torch.zeros(4, requires_grad=True)
+        targets = torch.tensor([1., 0., 0., 1.])
+        valid = torch.tensor([True, True, True, False])
+        loss = model.gate_classification_loss(logits, targets, valid)
+        torch.testing.assert_close(loss, torch.tensor(2.).log())
+        loss.backward()
+        torch.testing.assert_close(logits.grad, torch.tensor([-.25, .125, .125, 0.]))
+        empty = model.gate_classification_loss(logits, targets, torch.zeros_like(valid))
+        self.assertEqual(empty.item(), 0)
+
+    def test_training_loop_optimizes_and_logs_new_gate_loss(self):
+        class Toy(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.base = torch.nn.Parameter(torch.tensor(1.))
+                self.selector = torch.nn.Parameter(torch.tensor(.2))
+
+            def forward(self, **kwargs):
+                zero = self.selector * 0
+                return {"loss_det": self.base.square(), "loss_crv_cf": zero, "loss_crv_fusion": zero,
+                        "loss_crv_gate": self.selector.square(), "metric_crv_gate_positive": zero.detach() + .5}, None
+        model = Toy()
+        optimizer = torch.optim.SGD(model.parameters(), lr=.1)
+        config = Config(dict(distributed=False, use_fp16=False, grad_norm_clip=None,
+                             log_interval=1, data=dict(samples_per_gpu=1)))
+        with patch("propvg.apis.train.extract_data", side_effect=lambda values: values), \
+             patch("propvg.apis.train.is_main", return_value=True), \
+             patch("propvg.apis.train.get_root_logger"), patch("propvg.apis.train.set_tracking_context"), \
+             patch("propvg.apis.train.log_metrics") as logging:
+            train_model(0, config, model, optimizer, [{}])
+        torch.testing.assert_close(model.selector, torch.tensor(.16))
+        torch.testing.assert_close(model.base, torch.tensor(.8))
+        values = logging.call_args.args[0]
+        self.assertAlmostEqual(values["loss_crv_gate"], .04)
+        self.assertAlmostEqual(values["train/loss_total"], 1.04)
+        self.assertEqual(values["crv_gate_positive"], .5)
+
+    def test_gate_bce_does_not_train_crv_scorer_or_upstream_inputs(self):
+        model = self.module()
+        base = torch.tensor([1., 0.], requires_grad=True)
+        drops = torch.tensor([0., 1.], requires_grad=True)
+        queries = torch.randn(2, 16, requires_grad=True)
+        text = torch.randn(6, 16, requires_grad=True)
+        _, _, branches = self.fuse(model, base, drops, torch.tensor(.9), features=queries, text=text)
+        loss = model.gate_classification_loss(branches["gate_logit"][None], torch.ones(1), torch.ones(1, dtype=torch.bool))
+        loss.backward()
+        self.assertLess(model.gate[-1].bias.grad.item(), 0)
+        for value in (base, drops, queries, text):
+            self.assertIsNone(value.grad)
+        self.assertTrue(all(p.grad is None for p in model.scorer.parameters()))
+
+    def test_pair_selector_can_learn_different_trust_at_identical_entropy(self):
+        model = self.module(gate_dim=8).train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=.02)
+        pattern = torch.linspace(-1., 1., 16)
+        features = [torch.stack((torch.zeros(16), pattern)), torch.stack((torch.zeros(16), -pattern))]
+        for _ in range(70):
+            logits = torch.stack([self.fuse(model, torch.tensor([1., 0.]), torch.tensor([0., 1.]),
+                                            torch.tensor(.9), features=q)[2]["gate_logit"] for q in features])
+            loss = model.gate_classification_loss(logits, torch.tensor([1., 0.]), torch.ones(2, dtype=torch.bool))
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+        probabilities = logits.sigmoid().detach()
+        self.assertGreater(probabilities[0].item(), .9)
+        self.assertLess(probabilities[1].item(), .1)
+
+    def test_score_calibration_restores_crv_endpoint_even_for_small_raw_drops(self):
+        model = self.module()
+        model.gate[-1].bias.data.fill_(1000.)
+        base, drops = torch.tensor([20., 0.]), torch.tensor([0., .001])
+        fused, alpha, branches = self.fuse(model, base, drops, torch.tensor(.9))
+        self.assertEqual(alpha.item(), 1)
+        self.assertEqual(fused.argmax().item(), 1)
+        torch.testing.assert_close(fused, branches["calibrated_cf_logits"])
+        torch.testing.assert_close(fused.mean(), base.mean())
+        torch.testing.assert_close(fused.std(unbiased=False), base.std(unbiased=False))
+
+    def test_agreement_and_uninformative_crv_preserve_exact_base_scores(self):
+        model = self.module(gate_initial_probability=.99)
+        base = torch.tensor([2., 1.])
+        for drops in (torch.tensor([5., 0.]), torch.tensor([0., 0.]), torch.tensor([1., 1.000001])):
+            fused, alpha, _ = self.fuse(model, base, drops, torch.tensor(.9))
+            self.assertEqual(alpha.item(), 0)
+            torch.testing.assert_close(fused, base, rtol=0, atol=0)
+
+    def test_calibrated_logit_fusion_preserves_endpoints_and_avoids_probability_mixture(self):
         model = self.module(gate_initial_probability=.99)
         base = torch.tensor([8., 0.])
         drops = torch.tensor([0., 10.], requires_grad=True)
-        fused, alpha, branches = model.fusion(base, drops, torch.tensor(.8))
+        fused, alpha, branches = self.fuse(model, base, drops, torch.tensor(.8))
         self.assertGreater(alpha.item(), .5)
         self.assertEqual(fused.argmax().item(), 1)
-        torch.testing.assert_close(fused, base + alpha * drops)
-        zero_drop, _, _ = model.fusion(base, torch.zeros_like(drops), torch.tensor(.8))
+        torch.testing.assert_close(fused, (1 - alpha) * base + alpha * branches["calibrated_cf_logits"])
+        zero_drop, _, _ = self.fuse(model, base, torch.zeros_like(drops), torch.tensor(.8))
         torch.testing.assert_close(zero_drop, base, rtol=0, atol=0)
         # Independent sigmoid scores need not sum to one; CRS is never replaced.
-        self.assertGreater(fused.sigmoid().sum().item(), 1.9)
+        self.assertGreater(fused.sigmoid().sum().item(), 1.)
         mixture = (1-alpha) * base.softmax(0) + alpha * drops.softmax(0)
         self.assertFalse(torch.allclose(fused.sigmoid(), mixture))
         loss, *_ = model.fusion_loss(branches["base_logits"], fused, torch.tensor([0., .9]))
@@ -379,40 +489,47 @@ class CRVTests(unittest.TestCase):
     def test_extreme_scores_and_saturated_gates_stay_finite(self):
         for bias in (-1000., 1000.):
             model = self.module()
-            model.gate.bias.data.fill_(bias)
+            model.gate[-1].bias.data.fill_(bias)
             base, drops = torch.tensor([1000., -1000.]), torch.tensor([-2000., 2000.])
-            fused, alpha, branches = model.fusion(base, drops,
-                                                  torch.tensor(1.))
+            fused, alpha, branches = self.fuse(model, base, drops, torch.tensor(1.))
             self.assertTrue(torch.isfinite(fused).all())
-            torch.testing.assert_close(fused, base + alpha * drops)
+            torch.testing.assert_close(fused, base + alpha * (branches["calibrated_cf_logits"] - base))
             self.assertTrue(torch.isfinite(fused.sigmoid()).all())
             self.assertEqual(fused.argmax().item(), 0 if bias < 0 else 1)
         self.assertGreater(model.cf_temperature.item(), 0)
 
-    def test_gate_uses_only_detached_entropy(self):
+    def test_gate_uses_detached_pair_features_text_and_four_relative_scores(self):
         model = self.module()
-        base, drops = torch.tensor([2., 1., 0.]), torch.tensor([0., 1., 2.])
+        with torch.no_grad():
+            model.gate[-1].weight.normal_(0, .1)
+        base = torch.tensor([2., 1., 0.], requires_grad=True)
+        drops = torch.tensor([0., 1., 2.], requires_grad=True)
+        features = torch.randn(3, 16, requires_grad=True)
+        text = torch.randn(6, 16, requires_grad=True)
         entropy = torch.tensor(.8, requires_grad=True)
-        _, alpha_a, a = model.fusion(base, drops, entropy)
-        _, alpha_b, b = model.fusion(base + 10, drops * 10, entropy)
+        _, alpha_a, a = self.fuse(model, base, drops, entropy, features=features, text=text)
+        _, alpha_b, b = self.fuse(model, base + 10, drops * 10, torch.tensor(.9), features=features, text=text)
         stats = a["gate_statistics"]
-        self.assertEqual(stats.shape, (1,))
+        self.assertEqual(stats.shape, (4,))
         self.assertFalse(stats.requires_grad)
-        torch.testing.assert_close(stats, entropy.detach().reshape(1))
         torch.testing.assert_close(alpha_a, alpha_b)
         torch.testing.assert_close(b["base_logits"], a["base_logits"] + 10)
-        self.assertEqual(sum(p.numel() for p in model.gate.parameters()), 2)
+        self.assertGreater(sum(p.numel() for p in model.gate.parameters()), 2)
         alpha_a.backward()
         self.assertIsNone(entropy.grad)
+        for value in (base, drops, features, text):
+            self.assertIsNone(value.grad)
+        self.assertGreater(model.gate_query[1].weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.gate_text[1].weight.grad.abs().sum().item(), 0)
 
     def test_threshold_is_strict_and_inactive_fusion_is_exact_base(self):
         model = self.module(gate_initial_probability=.99)
         for entropy in (.0, .59, .6):
-            fused, alpha, branches = model.fusion(torch.tensor([2., 1.]), torch.tensor([0., 100.]),
-                                                  torch.tensor(entropy))
+            fused, alpha, branches = self.fuse(model, torch.tensor([2., 1.]), torch.tensor([0., 100.]),
+                                               torch.tensor(entropy))
             self.assertEqual(alpha.item(), 0)
             torch.testing.assert_close(fused, branches["base_logits"], rtol=0, atol=0)
-        _, alpha, _ = model.fusion(torch.tensor([2., 1.]), torch.tensor([0., 100.]), torch.tensor(.61))
+        _, alpha, _ = self.fuse(model, torch.tensor([2., 1.]), torch.tensor([0., 100.]), torch.tensor(.61))
         self.assertGreater(alpha.item(), 0)
 
     def test_safety_reference_is_detached(self):
@@ -471,7 +588,7 @@ class CRVTests(unittest.TestCase):
 
     def test_direct_localization_gradient_does_not_depend_on_fusion_gate(self):
         model = self.module()
-        model.gate.bias.data.fill_(-1000.)
+        model.gate[-1].bias.data.fill_(-1000.)
         scenes = torch.randn(6, 16, 6, 6)
         support = model.scorer(scenes, torch.ones(6, 1, 6, 6), torch.randn(6, 6, 16),
                                torch.zeros(6, 6, dtype=torch.bool))
@@ -558,14 +675,14 @@ class CRVTests(unittest.TestCase):
     def test_independent_gradients_and_deterministic_forward(self):
         model = self.module().train()
         args = self.inputs()
-        for index in (0, 2, 3, 5, 6):
+        for index in (0, 2, 3, 5, 6, 8):
             args[index].requires_grad_(True)
         gt = [torch.tensor([.09, .45, .15, .55])]
         rng = torch.get_rng_state()
         probabilities, priority, losses, info = model(*args, refer_gt=gt)
         torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
         sum(losses.values()).backward()
-        for index in (0, 2, 3, 5, 6):
+        for index in (0, 2, 3, 5, 6, 8):
             self.assertIsNone(args[index].grad)
         self.assertGreater(model.scorer.visual.weight.grad.abs().sum().item(), 0)
         self.assertTrue(all(torch.isfinite(parameter.grad).all() for parameter in model.parameters() if parameter.grad is not None))
@@ -576,9 +693,12 @@ class CRVTests(unittest.TestCase):
         model = self.module().eval()
         args = self.inputs()
         original = args[5][0, :, 0].argsort(descending=True)
-        def reverse(base, *unused):
+        fusion = model.fusion
+        def reverse(base, *values):
             scores = torch.arange(len(base), dtype=base.dtype)
-            return scores, base.new_tensor(.5), dict(base_logits=base, gate_statistics=torch.zeros(1))
+            _, _, branches = fusion(base, *values)
+            branches["apply"] = torch.tensor(True)
+            return scores, base.new_tensor(.5), branches
         with patch.object(model, "fusion", side_effect=reverse):
             _, priority, _, _ = model(*args)
         result = priority[0, :, 0].argsort(descending=True)
@@ -722,7 +842,7 @@ class CRVTests(unittest.TestCase):
         _validate_crv_checkpoint(model, {"module." + key: value for key, value in state.items()})
         with self.assertRaisesRegex(ValueError, "compatible CRV checkpoint"):
             _validate_crv_checkpoint(model, {})
-        for version in (1, 2, 3, 4, 5, 6, 7, 8):
+        for version in (1, 2, 3, 4, 5, 6, 7, 8, 9):
             with self.assertRaisesRegex(ValueError, "compatible CRV checkpoint"):
                 _validate_crv_checkpoint(model, dict(state, **{"head.crv.schema_version": torch.tensor(version)}))
         model.head.crv = None

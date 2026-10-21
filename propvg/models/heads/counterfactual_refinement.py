@@ -76,6 +76,10 @@ class SceneTextScorer(nn.Module):
 
 
 class CounterfactualRefinement(nn.Module):
+    metric_names = ("alpha", "active", "uncertainty", "corrected", "harmed", "reachable", "rejected_negatives",
+                    "rank_changed", "group_count", "ready", "disagreement", "gate_positive", "gate_negative",
+                    "gate_accuracy", "gate_probability", "calibration_scale")
+
     def __init__(self, hidden_channels=256, topk=5, uncertainty_topn=5, grid_size=24, crop_size=None,
                  scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
                  inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
@@ -83,7 +87,8 @@ class CounterfactualRefinement(nn.Module):
                  cf_temperature=1.0,
                  start_epoch=1, positive_margin=1.0,
                  negative_gt_coverage=0.01, gt_loss_weight=0.1,
-                 cf_loss_weight=0.1, fusion_loss_weight=1.0,
+                 cf_loss_weight=0.1, fusion_loss_weight=1.0, gate_loss_weight=1.0,
+                 gate_dim=64, calibration_eps=1e-4, calibration_min_scale=0.1,
                  ranking_margin=0.5, safety_margin=0.5, safety_weight=2.0, repair_weight=2.0):
         super().__init__()
         if min(topk, uncertainty_topn, grid_size, chunk_size, scorer_layers) < 1:
@@ -104,6 +109,14 @@ class CounterfactualRefinement(nn.Module):
             raise ValueError("CRV start_epoch must be a positive 1-based integer")
         if scorer_dim % scorer_heads or scorer_dim % 2:
             raise ValueError("CRV scorer_dim must be even and divisible by scorer_heads")
+        if isinstance(gate_dim, bool) or not isinstance(gate_dim, int) or gate_dim < 1:
+            raise ValueError("CRV gate_dim must be a positive integer")
+        if not math.isfinite(calibration_eps) or calibration_eps <= 0:
+            raise ValueError("CRV calibration_eps must be finite and positive")
+        if not math.isfinite(calibration_min_scale) or calibration_min_scale <= 0:
+            raise ValueError("CRV calibration_min_scale must be finite and positive")
+        if not math.isfinite(gate_loss_weight) or gate_loss_weight < 0:
+            raise ValueError("CRV gate_loss_weight must be finite and nonnegative")
         self.topk, self.uncertainty_topn, self.grid_size = topk, uncertainty_topn, grid_size
         self.chunk_size = chunk_size
         self.inner_scale, self.outer_scale, self.duplicate_iou = inner_scale, outer_scale, duplicate_iou
@@ -112,19 +125,24 @@ class CounterfactualRefinement(nn.Module):
         self.start_epoch, self.positive_margin = start_epoch, positive_margin
         self.negative_gt_coverage, self.gt_loss_weight = negative_gt_coverage, gt_loss_weight
         self.cf_loss_weight, self.fusion_loss_weight = cf_loss_weight, fusion_loss_weight
+        self.gate_loss_weight = gate_loss_weight
+        self.calibration_eps, self.calibration_min_scale = calibration_eps, calibration_min_scale
         self.ranking_margin, self.safety_margin = ranking_margin, safety_margin
         self.safety_weight, self.repair_weight = safety_weight, repair_weight
         self.scorer = SceneTextScorer(hidden_channels, scorer_dim, scorer_heads, scorer_layers)
-        self.register_buffer("schema_version", torch.tensor(9, dtype=torch.long))
+        self.register_buffer("schema_version", torch.tensor(10, dtype=torch.long))
         # Saved with checkpoints so validation/evaluation before the scheduled
         # start cannot accidentally use a randomly initialized CRV branch.
         self.register_buffer("last_training_epoch", torch.tensor(0, dtype=torch.long))
         # Used only by independent CRV ranking supervision/diagnostics, not fusion.
         self.register_buffer("cf_temperature", torch.tensor(float(cf_temperature)))
-        # Only entropy controls fusion. Two scalars replace the 14-D quality MLP.
-        self.gate = nn.Linear(1, 1)
-        nn.init.zeros_(self.gate.weight)
-        nn.init.constant_(self.gate.bias, math.log(gate_initial_probability / (1 - gate_initial_probability)))
+        # Entropy controls ROUTING only. Trust is learned from the two competing
+        # candidates, full text, and four detached relative-score statistics.
+        self.gate_query = nn.Sequential(nn.LayerNorm(hidden_channels), nn.Linear(hidden_channels, gate_dim), nn.GELU())
+        self.gate_text = nn.Sequential(nn.LayerNorm(hidden_channels), nn.Linear(hidden_channels, gate_dim), nn.GELU())
+        self.gate = nn.Sequential(nn.Linear(4 * gate_dim + 4, 2 * gate_dim), nn.GELU(), nn.Linear(2 * gate_dim, 1))
+        nn.init.zeros_(self.gate[-1].weight)
+        nn.init.constant_(self.gate[-1].bias, math.log(gate_initial_probability / (1 - gate_initial_probability)))
 
     @staticmethod
     def clipped_boxes(boxes):
@@ -234,16 +252,69 @@ class CounterfactualRefinement(nn.Module):
         pooled_masks = F.adaptive_avg_pool2d(masks, self.grid_size)
         return original[owners] + (mean[owners] * pooled_masks - weighted) / denominator[owners].clamp(min=1e-8)
 
-    def fusion(self, base, drops, entropy):
+    def fusion(self, base, drops, entropy, candidate_features, text, text_mask):
         base = base.detach()
-        statistics = entropy.detach().reshape(1)
-        gate_logit = self.gate(statistics).squeeze(-1)
-        alpha = gate_logit.sigmoid()
-        alpha = alpha * (entropy > self.uncertainty_threshold).to(alpha.dtype)
-        # Residual correction of ORIGINAL CRS logits; no softmax mixture or
-        # replacement of the base branch, even when alpha approaches one.
-        fused = base + alpha * drops
-        return fused, alpha, {"base_logits": base, "gate_statistics": statistics}
+        # Base arrives in CRS order; stable sort breaks CF ties in that order.
+        cf_order = drops.detach().argsort(descending=True, stable=True)
+        challenger = cf_order[0]
+        crs_scale = base.std(unbiased=False).clamp(min=self.calibration_min_scale)
+        cf_scale = drops.detach().std(unbiased=False)
+        denominator = cf_scale.clamp(min=self.calibration_eps)
+        calibrated = base.mean() + crs_scale * (drops - drops.mean()) / denominator
+        # A constant/nearly-constant counterfactual branch is not evidence.
+        informative = cf_scale > self.calibration_eps
+        disagreement = challenger != 0
+        second = 1 if len(base) > 1 else 0
+        cf_second = cf_order[second]
+        statistics = torch.stack(((base[0] - base[challenger]) / crs_scale,
+                                  (drops[challenger] - drops[0]) / denominator,
+                                  (base[0] - base[second]) / crs_scale,
+                                  (drops[challenger] - drops[cf_second]) / denominator)).detach()
+        pair = self.gate_query(candidate_features.detach()[torch.stack((challenger.new_zeros(()), challenger))])
+        valid = (~text_mask.bool()).to(text.dtype)[:, None]
+        sentence = (text.detach() * valid).sum(0) / valid.sum().clamp(min=1.)
+        language = self.gate_text(sentence)
+        gate_input = torch.cat((pair[0], pair[1], pair[1] - pair[0], language, statistics))
+        gate_logit = self.gate(gate_input).squeeze(-1)
+        probability = gate_logit.sigmoid()
+        apply = (entropy > self.uncertainty_threshold) & disagreement & informative
+        alpha = probability * apply.to(probability.dtype)
+        # Calibrated LOGIT interpolation, not a softmax-probability mixture.
+        # alpha=0 preserves CRS; alpha=1 has exactly the CF ranking when informative.
+        fused = base + alpha * (calibrated - base)
+        return fused, alpha, {"base_logits": base, "gate_statistics": statistics,
+                              "gate_logit": gate_logit, "gate_probability": probability,
+                              "cf_index": challenger, "disagreement": disagreement,
+                              "informative": informative, "apply": apply,
+                              "calibrated_cf_logits": calibrated,
+                              "calibration_scale": (crs_scale / denominator).detach()}
+
+    @staticmethod
+    def selector_target(ious, cf_index, informative):
+        """Only one-correct/one-wrong disagreements teach the trust selector."""
+        base_correct, cf_correct = ious[0] >= .5, ious[cf_index] >= .5
+        valid = (cf_index != 0) & informative & (base_correct != cf_correct)
+        return cf_correct.to(ious.dtype).detach(), valid.detach()
+
+    def gate_classification_loss(self, logits, targets, valid, return_accuracy=False):
+        """Globally class-balanced BCE; neither/both-correct labels are ignored.
+
+        Every READY training rank calls the same count collective, including
+        ranks with no routed/GT samples. DDP averages gradients, hence world_size.
+        """
+        positive, negative = valid & (targets > .5), valid & (targets <= .5)
+        correct = ((logits.detach() > 0) == (targets > .5)) & valid
+        counts = torch.stack((positive.sum(), negative.sum(), correct.sum())).to(dtype=torch.float32)
+        world_size = 1
+        if self.training and torch.distributed.is_available() and torch.distributed.is_initialized():
+            world_size = torch.distributed.get_world_size()
+            torch.distributed.all_reduce(counts)
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        classes = (counts[:2] > 0).sum().clamp(min=1)
+        loss = ((bce * positive).sum() / counts[0].clamp(min=1)
+                + (bce * negative).sum() / counts[1].clamp(min=1)) * (world_size / classes)
+        accuracy = counts[2] / counts[:2].sum().clamp(min=1)
+        return (loss, accuracy) if return_accuracy else loss
 
     def fusion_loss(self, base, fused, ious):
         # Metric-compatible multiple positives; ambiguous IoUs are ignored only
@@ -277,17 +348,19 @@ class CounterfactualRefinement(nn.Module):
         return loss, negative
 
     def forward(self, visual, visual_mask, boxes, text, text_mask, probabilities, logits, img_metas,
-                refer_gt=None, epoch=None):
+                candidate_features, refer_gt=None, epoch=None):
         # All upstream paths stop here, including the base scores used by fusion.
         visual, boxes, text = visual.detach(), boxes.detach(), text.detach()
+        candidate_features = candidate_features.detach()
+        if candidate_features.shape != boxes.shape[:2] + (text.shape[-1],):
+            raise ValueError("CRV requires aligned CRS candidate features with shape B,N,C")
         probabilities, logits = probabilities.detach().squeeze(-1), logits.detach().squeeze(-1)
         if not self.stage_ready(epoch):
             # Detached zeros leave ALL CRV gradients None: even AdamW cannot
             # decay/update this branch before its scheduled start epoch.
             zero = logits.new_zeros(())
-            losses = {"loss_crv_cf": zero, "loss_crv_fusion": zero}
-            info = {"crv_" + key: zero for key in ("alpha", "active", "uncertainty", "corrected", "harmed",
-                                                   "reachable", "rejected_negatives", "rank_changed", "group_count", "ready")}
+            losses = {"loss_crv_cf": zero, "loss_crv_fusion": zero, "loss_crv_gate": zero}
+            info = {"crv_" + key: zero for key in self.metric_names}
             info["crv_crs_probabilities"] = probabilities
             info["crv_samples"] = [{"skipped": True, "reason": "before_start_epoch"} for _ in range(len(boxes))]
             info["crv_last_training_epoch"] = self.last_training_epoch.detach().clone()
@@ -356,6 +429,9 @@ class CounterfactualRefinement(nn.Module):
         cf_terms, fusion_terms, alphas, active, entropies = [], [], [], [], []
         changed, group_counts = [], []
         corrected, harmed, reachable, rejected = [], [], [], []
+        gate_logits, gate_targets, gate_valid = [], [], []
+        gate_probabilities, gate_applicable = [], []
+        disagreements, calibration_scales = [], []
         sample_details = []
         for bi in range(len(boxes)):
             clipped = clipped_boxes[bi]
@@ -372,6 +448,13 @@ class CounterfactualRefinement(nn.Module):
                 # samples contributing detached zero (no AdamW-only updates).
                 cf_terms.append(base.new_zeros(()))
                 fusion_terms.append(base.new_zeros(()))
+                gate_logits.append(base.new_zeros(()))
+                gate_targets.append(base.new_zeros(()))
+                gate_valid.append(base.new_zeros((), dtype=torch.bool))
+                gate_probabilities.append(base.new_zeros(()))
+                gate_applicable.append(base.new_zeros(()))
+                disagreements.append(base.new_zeros(()))
+                calibration_scales.append(base.new_zeros(()))
                 if self.training and refer_gt is not None and refer_gt[bi] is not None:
                     for values in (corrected, harmed, reachable, rejected):
                         values.append(base.new_zeros(()))
@@ -381,11 +464,17 @@ class CounterfactualRefinement(nn.Module):
             original_support, masked_support = supports[bi]
             importance = self.support_drop(original_support, masked_support)
             drops = importance[:len(indices)]
-            fused, alpha, branches = self.fusion(base, drops, entropy)
+            fused, alpha, branches = self.fusion(base, drops, entropy, candidate_features[bi, indices], text[bi], text_mask[bi])
             alphas.append(alpha)
+            gate_logits.append(branches["gate_logit"])
+            gate_applicable.append(branches["apply"].float())
+            gate_probabilities.append(branches["gate_probability"] * branches["apply"])
+            disagreements.append(branches["disagreement"].float())
+            calibration_scales.append(branches["calibration_scale"])
+            target, eligible = base.new_zeros(()), base.new_zeros((), dtype=torch.bool)
             local_order = fused.argsort(descending=True, stable=True)
             final_order[bi, :len(indices)] = indices[local_order]
-            final_probabilities[bi, indices] = fused.sigmoid()
+            final_probabilities[bi, indices] = torch.where(branches["apply"], fused.sigmoid(), probabilities[bi, indices])
             changed.append((local_order[0] != 0).float())
             zero = fused.sum() * 0
             cf, fusion = zero, zero
@@ -395,6 +484,7 @@ class CounterfactualRefinement(nn.Module):
                 cf, negative = self.counterfactual_loss(drops, ious, coverage)
                 cf = cf + self.gt_loss_weight * F.relu(self.positive_margin - importance[-1])
                 fusion, _, _, _ = self.fusion_loss(branches["base_logits"], fused, ious)
+                target, eligible = self.selector_target(ious, branches["cf_index"], branches["informative"])
                 before = (ious[0] >= .5)
                 after = (ious[fused.argmax()] >= .5)
                 corrected.append((~before & after).float())
@@ -403,11 +493,20 @@ class CounterfactualRefinement(nn.Module):
                 rejected.append(((ious == 0) & ~negative).float().sum() / (ious == 0).float().sum().clamp(min=1.))
             cf_terms.append(cf)
             fusion_terms.append(fusion)
+            gate_targets.append(target)
+            gate_valid.append(eligible)
             sample_details.append({"indices": indices, "skipped": False,
                                    "original_support": original_support[:len(indices)].detach(),
                                    "masked_support": masked_support[:len(indices)].detach(),
                                    "importance": drops.detach(),
                                    "drops": drops.detach(), "fused_logits": fused.detach(),
+                                   "calibrated_cf_logits": branches["calibrated_cf_logits"].detach(),
+                                   "gate_probability": branches["gate_probability"].detach(),
+                                   "gate_target": target.detach(), "gate_supervised": eligible.detach(),
+                                   "cf_index": branches["cf_index"].detach(),
+                                   "crs_candidate_id": indices[0].detach(),
+                                   "cf_candidate_id": indices[branches["cf_index"]].detach(),
+                                   "calibration_scale": branches["calibration_scale"],
                                    "base_logits": base.detach(),
                                    # These normalized distributions are diagnostics ONLY;
                                    # they never enter the residual fusion or final scores.
@@ -424,11 +523,22 @@ class CounterfactualRefinement(nn.Module):
         mean = lambda values: torch.stack(values).mean() if values else parameter_zero
         losses = {"loss_crv_cf": mean(cf_terms) * self.cf_loss_weight,
                   "loss_crv_fusion": mean(fusion_terms) * self.fusion_loss_weight}
+        gate_logits, gate_targets, gate_valid = torch.stack(gate_logits), torch.stack(gate_targets), torch.stack(gate_valid)
+        if self.training:
+            gate_loss, gate_accuracy = self.gate_classification_loss(gate_logits, gate_targets, gate_valid, return_accuracy=True)
+        else:
+            gate_loss, gate_accuracy = parameter_zero, parameter_zero
+        losses["loss_crv_gate"] = gate_loss * self.gate_loss_weight
         metrics = {"alpha": mean(alphas), "active": mean(active), "rank_changed": mean(changed),
                    "uncertainty": mean(entropies), "group_count": mean(group_counts),
                    "ready": logits.new_tensor(1.),
                    "corrected": mean(corrected), "harmed": mean(harmed), "reachable": mean(reachable),
-                   "rejected_negatives": mean(rejected)}
+                   "rejected_negatives": mean(rejected), "disagreement": mean(disagreements),
+                   "calibration_scale": mean(calibration_scales),
+                   "gate_positive": (gate_valid & (gate_targets > .5)).float().mean(),
+                   "gate_negative": (gate_valid & (gate_targets <= .5)).float().mean(),
+                   "gate_probability": torch.stack(gate_probabilities).sum() / torch.stack(gate_applicable).sum().clamp(min=1),
+                   "gate_accuracy": gate_accuracy}
         info = {"crv_" + key: value.detach() for key, value in metrics.items()}
         info["crv_samples"] = sample_details
         info["crv_crs_probabilities"] = probabilities.detach()

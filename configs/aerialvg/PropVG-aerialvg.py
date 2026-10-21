@@ -125,11 +125,13 @@ model = dict(
                        start_epoch=crv_start_epoch,
                        scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
                        inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
-                       uncertainty_temperature=1.0, gate_initial_probability=0.02,
+                       uncertainty_temperature=1.0, gate_initial_probability=0.5,
                        uncertainty_threshold=crv_uncertainty_threshold,
-                       cf_temperature=1.0,  # Independent CRV ranking only; fusion uses raw CRS logits.
-                       negative_gt_coverage=0.01, gt_loss_weight=0.1,
-                       cf_loss_weight=0.1, fusion_loss_weight=1.0,
+                       cf_temperature=1.0,  # Independent CRV ranking only; fusion calibrates CF logits.
+                       negative_gt_coverage=0.01, gt_loss_weight=0.5,
+                       cf_loss_weight=1, fusion_loss_weight=1.0,
+                       gate_loss_weight=1.0, gate_dim=64,
+                       calibration_eps=1e-4, calibration_min_scale=0.1,
                        positive_margin=1.0, ranking_margin=0.5,
                        safety_margin=0.5, safety_weight=2.0, repair_weight=2.0),
               enable_bcem=enable_bcem,
