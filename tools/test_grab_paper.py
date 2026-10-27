@@ -185,7 +185,7 @@ class GrabFilterLossTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(2)
         options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
-        options.update(enable_grab=True, enable_mask=False, enable_bcem=False,
+        options.update(enable_grab=True, enable_mask=False, enable_bcem=False, enable_correctness=False,
                        enable_crv=False, num_queries=4)
         torch.manual_seed(1081)
         cls.head = build_head(options).eval()

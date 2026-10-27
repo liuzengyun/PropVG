@@ -28,6 +28,7 @@ from .grab_binding import GrabGraphBinding
 from .optional_modules import build_optional_module
 from .counterfactual_refinement import CounterfactualRefinement
 from .background_context import BackgroundContextEnhancement
+from .top1_correctness import Top1CorrectnessHead
 
 
 class GlobalCrossAttention(nn.Module):
@@ -446,6 +447,8 @@ class REFHead(nn.Module):
         bcem=None,
         enable_crv=False,
         crv=None,
+        enable_correctness=False,
+        correctness=None,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
@@ -575,9 +578,18 @@ class REFHead(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(seed)
                 self.crv = CounterfactualRefinement(hidden_channels=hidden_channels, **options)
+        # Observational head: no allocation/RNG draws when disabled, and no
+        # changes to legacy initialization or dropout streams when enabled.
+        self.correctness = None
+        if enable_correctness:
+            options = dict(correctness or {})
+            seed = options.pop("init_seed", 2717)
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(seed)
+                self.correctness = Top1CorrectnessHead(hidden_channels=hidden_channels, **options)
 
     def _score_referring(self, query, text, text_mask):
-        if self.enable_crv:
+        if self.enable_crv or self.correctness is not None:
             return self.mrsm(query, text, text_mask, return_logits=True)
         score, attention = self.mrsm(query, text, text_mask)
         return score, attention, None
@@ -830,6 +842,12 @@ class REFHead(nn.Module):
         }
         if ranking_priority is not None:
             pred_dict["ranking_priority"] = ranking_priority.detach()
+        if self.correctness is not None:
+            observation = self.correctness(refer_query_embed, bound_boxes, lan_feat, lan_mask,
+                                           refer_score, refer_logits, selected_classes, img_metas, ranking_priority)
+            value, metrics = self.correctness.loss(observation, targets["bbox"], img_metas)
+            loss_dict["loss_correctness"] = value
+            loss_dict.update({"metric_correctness_" + key: metric for key, metric in metrics.items()})
         return loss_dict, pred_dict, extra_dict
 
     def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None, with_mask=True):
@@ -948,4 +966,12 @@ class REFHead(nn.Module):
         }
         if ranking_priority is not None:
             pred_dict["ranking_priority"] = ranking_priority.detach()
+        if self.correctness is not None:
+            self.correctness.require_trained()
+            observation = self.correctness(refer_query_embed, bound_boxes, lan_feat, lan_mask,
+                                           refer_score, refer_logits, selected_classes, img_metas, ranking_priority)
+            pred_dict.update(top1_correct_probability=observation["probability"].detach(),
+                             top1_correct_logit=observation["logit"].detach(),
+                             top1_correct_query_index=observation["index"],
+                             top1_grouped_entropy=observation["entropy"])
         return pred_dict, extra_dict

@@ -44,16 +44,20 @@ def set_random_seed(seed, deterministic=False, strict=False):
 
 
 def clip_training_gradients(model, max_norm):
-    """CRV gradients must not change the norm used to clip the base model."""
+    """Independent heads must not change the base model's clipping norm."""
     base_model = model.module if hasattr(model, "module") else model
-    crv = getattr(getattr(base_model, "head", base_model), "crv", None)
-    if crv is None:
+    head = getattr(base_model, "head", base_model)
+    independent = [branch for branch in (getattr(head, "crv", None), getattr(head, "correctness", None))
+                   if branch is not None]
+    if not independent:
         return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
-    crv_parameters = list(crv.parameters())
-    crv_ids = {id(parameter) for parameter in crv_parameters}
-    base_parameters = [parameter for parameter in model.parameters() if id(parameter) not in crv_ids]
+    independent_parameters = [list(branch.parameters()) for branch in independent]
+    independent_ids = {id(parameter) for parameters in independent_parameters for parameter in parameters}
+    base_parameters = [parameter for parameter in model.parameters() if id(parameter) not in independent_ids]
     torch.nn.utils.clip_grad_norm_(base_parameters, max_norm)
-    return torch.nn.utils.clip_grad_norm_(crv_parameters, max_norm)
+    for parameters in independent_parameters:
+        norm = torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+    return norm
 
 
 def train_model(epoch, cfg, model, optimizer, loader):
@@ -94,6 +98,14 @@ def train_model(epoch, cfg, model, optimizer, loader):
                     crv_values[key] = value.detach()
                 elif key.startswith("metric_crv_"):
                     crv_values[key[len("metric_"):]] = losses.pop(key).detach()
+        correctness_values = {}
+        if "loss_correctness" in losses:
+            value = losses.pop("loss_correctness")
+            loss = loss + value
+            correctness_values["loss_correctness"] = value.detach()
+            for key in tuple(losses):
+                if key.startswith("metric_correctness_"):
+                    correctness_values[key[len("metric_"):]] = losses.pop(key).detach()
         # loss = loss_det
         optimizer.zero_grad()
         if cfg.use_fp16:
@@ -104,6 +116,10 @@ def train_model(epoch, cfg, model, optimizer, loader):
         if cfg.grad_norm_clip:
             clip_training_gradients(model, cfg.grad_norm_clip)
         optimizer.step()
+        if correctness_values and correctness_values["correctness_valid_samples"].item() > 0:
+            base_model = model.module if hasattr(model, "module") else model
+            base_model.head.correctness.mark_optimizer_step()
+        crv_values.update(correctness_values)
 
         if cfg.distributed:
             loss_det = reduce_mean(loss_det)

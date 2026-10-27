@@ -48,6 +48,10 @@ freeze_beit3 = False
 enable_grab = False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
+# Optional detached correctness estimation; False preserves previous models.
+enable_correctness = False
+correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
+                   loss_weight=1.0, decision_threshold=0.5)
 # Independent post-CRS refinement; disabled to retain the previous pipeline.
 enable_crv = False
 crv_topk = 5
@@ -182,6 +186,8 @@ model = dict(
         MTD=dict(K=250),
         enable_grab=enable_grab,
         enable_mask=enable_mask,
+        enable_correctness=enable_correctness,
+        correctness=correctness,
         enable_crv=enable_crv,
         crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
                  start_epoch=crv_start_epoch,

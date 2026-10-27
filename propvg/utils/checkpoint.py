@@ -100,6 +100,23 @@ def _load_optimizer_state(model, optimizer, checkpoint, model_state):
                                "state": {key: value for key, value in saved["state"].items() if key in retained_ids}})
 
 
+def _validate_correctness_checkpoint(model, state):
+    """Old checkpoints remain valid with the default-disabled new branch."""
+    base = model.module if hasattr(model, "module") else model
+    correctness = getattr(getattr(base, "head", None), "correctness", None)
+    if correctness is None:
+        return
+    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
+    expected = {"head.correctness." + name for name in correctness.state_dict()}
+    version = normalized.get("head.correctness.schema_version")
+    steps = normalized.get("head.correctness.trained_steps")
+    if not expected.issubset(normalized) or version is None or int(version) != int(correctness.schema_version) \
+            or steps is None or int(steps) <= 0:
+        raise ValueError("Enabled correctness head requires its complete trained checkpoint. "
+                         "For old-model evaluation set model.head.enable_correctness=False. "
+                         "To train the new head from baseline weights use --finetune-from, not --resume-from/--load-from.")
+
+
 def log_loaded_info(ckpt, load_file, dataset=None):
     logger = get_root_logger()
     log_str = f"loaded checkpoint from {load_file}\n"
@@ -180,6 +197,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
     if is_paral_state(state) and not is_paral_model(model):
         state = de_parallel(state)
     _validate_crv_checkpoint(model, state)
+    _validate_correctness_checkpoint(model, state)
     try:
         model.load_state_dict(state, strict=True)
     except:
