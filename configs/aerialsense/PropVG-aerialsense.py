@@ -176,7 +176,7 @@ model = dict(
         loss_weight=dict(
             mask=dict(dice=1.0, bce=1.0, nt=0.2, neg=0),
             bbox=0.1,
-            allbbox=0.1,
+            allbbox=0.025,
             refer=1.0,
         ),
         MTD=dict(K=250),

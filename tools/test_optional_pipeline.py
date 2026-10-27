@@ -1,7 +1,9 @@
 """CPU regressions for optional branches and candidate/score alignment."""
 import copy
+import importlib
 import os
 import unittest
+from unittest import mock
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/propvg_matplotlib")
 import numpy as np
@@ -9,6 +11,7 @@ import pycocotools.mask as mask_utils
 import torch
 from mmcv import Config
 from propvg.models import build_head
+from propvg.models.heads.grab_binding import GrabGraphBinding
 from propvg.models.det_seg.mix_ref_unimodel_OMG import MIXRefUniModel_OMG
 from propvg.apis.test import aerialvg_box_metrics
 from propvg.utils.checkpoint import _load_optimizer_state, _optimizer_parameter_names
@@ -27,7 +30,15 @@ class OptionalPipelineTests(unittest.TestCase):
     def head(self, grab, mask, legacy=False):
         options = dict(self.options, enable_grab=True if legacy else grab, enable_mask=True if legacy else mask)
         torch.manual_seed(713)
-        head = build_head(options)
+        if legacy and not grab:
+            # Simulate the pre-paper model that allocated the old Grab layout
+            # even when unused. Enabled Grab now intentionally has new weights.
+            constructor = lambda **kwargs: GrabGraphBinding(**dict(kwargs, legacy_layout=True))
+            with mock.patch.object(importlib.import_module("propvg.models.heads.REFHead"),
+                                   "GrabGraphBinding", side_effect=constructor):
+                head = build_head(options)
+        else:
+            head = build_head(options)
         # The historical model allocated every branch, even when not used.
         head.enable_grab = grab
         head.enable_mask = mask

@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-crv-val"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-grab-val"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -46,11 +46,11 @@ if teacher and use_auxiliary_gt:
 # True: freeze the complete BEiT-3 vision-language backbone.
 freeze_beit3 = False
 
-enable_grab=False
+enable_grab=True
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
 # Independent post-CRS refinement. False preserves the previous experiment.
-enable_crv = True
+enable_crv = False
 crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
 crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
 crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
@@ -163,5 +163,5 @@ start_save_checkpoint = 0
 save_interval = 1
 max_keep_ckpts = 10
 # finetune_from = "PropVG-grefcoco.pth"
-# resume_from = '/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays/20261018_112107/epoch_35.pth'
+# resume_from = '/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays-8/20261019_112949/epoch_18.pth'
 start_test = 27  # 1-based: test each epoch from 27, using the same GPUs as val; None/<=0 disables.

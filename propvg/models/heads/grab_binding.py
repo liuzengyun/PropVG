@@ -1,4 +1,8 @@
-"""GrabVG-style hypothesis filtering and graph-attentive feature binding."""
+"""GrabVG binding structure from the detailed paper, Sections 3.2--3.3/A.2.
+
+Losses and teacher supervision are deliberately owned by the existing caller.
+The initialization-only legacy layout preserves disabled-Grab experiments.
+"""
 import math
 
 import torch
@@ -11,23 +15,31 @@ def _gather_nodes(x, indices):
 
 
 class GraphBlock(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, project_message=True):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim))
+        self.out_proj = nn.Linear(dim, dim) if project_message else nn.Identity()
 
     def forward(self, x, message):
-        x = self.norm1(x + message)
+        x = self.norm1(x + self.out_proj(message))
         return self.norm2(x + self.ffn(x))
 
 
 class GrabGraphBinding(nn.Module):
-    def __init__(self, hidden_channels=256, num_heads=8, k=6, layers=4, anchors=48, keep_ratio=0.5):
+    def __init__(self, hidden_channels=256, num_heads=8, k=6, layers=4, anchors=48, keep_ratio=0.5,
+                 legacy_layout=False):
         super().__init__()
+        # Only the disabled branch's meta descriptor uses this layout. Its
+        # parameter shapes, names, order and RNG draws must remain historical.
+        self._legacy_layout = legacy_layout
         self.k = k
         self.keep_ratio = keep_ratio
         self.num_anchors = anchors
+        self.num_heads = num_heads
+        self.head_dim = hidden_channels // num_heads
+        self.edge_channels = hidden_channels if legacy_layout else 64
 
         # Text-aware hypothesis filtering.
         self.filter_attn = nn.MultiheadAttention(hidden_channels, num_heads, batch_first=True)
@@ -40,28 +52,72 @@ class GrabGraphBinding(nn.Module):
 
         # Language-guided box-relative appearance sampling.
         self.anchor_query = nn.Parameter(torch.randn(anchors, hidden_channels) * 0.02)
-        side_y, side_x = 6, 8
-        yy, xx = torch.meshgrid(torch.linspace(-0.5, 0.5, side_y), torch.linspace(-0.5, 0.5, side_x), indexing="ij")
-        self.register_buffer("base_points", torch.stack((xx, yy), dim=-1).reshape(anchors, 2), persistent=False)
+        if legacy_layout:
+            yy, xx = torch.meshgrid(torch.linspace(-0.5, 0.5, 6), torch.linspace(-0.5, 0.5, 8), indexing="ij")
+            base_points = torch.stack((xx, yy), dim=-1).reshape(anchors, 2)
+        else:
+            base_points = self._square_ring_points(anchors)
+        self.register_buffer("base_points", base_points, persistent=False)
         self.anchor_text_attn = nn.MultiheadAttention(hidden_channels, num_heads, batch_first=True)
+        if not legacy_layout:
+            self.anchor_text_norm1 = nn.LayerNorm(hidden_channels)
+            self.anchor_text_ffn = nn.Sequential(
+                nn.Linear(hidden_channels, hidden_channels * 4), nn.GELU(), nn.Linear(hidden_channels * 4, hidden_channels)
+            )
+            self.anchor_text_norm2 = nn.LayerNorm(hidden_channels)
         self.offset_head = nn.Sequential(
             nn.Linear(hidden_channels * 3, hidden_channels), nn.GELU(), nn.Linear(hidden_channels, 2)
         )
-        self.level_proj = nn.ModuleList([nn.Linear(hidden_channels, hidden_channels) for _ in range(4)])
+        if legacy_layout:
+            self.level_proj = nn.ModuleList([nn.Linear(hidden_channels, hidden_channels) for _ in range(4)])
+        else:
+            self.level_fusion = nn.Linear(hidden_channels * 4, hidden_channels)
         self.appearance_attn = nn.MultiheadAttention(hidden_channels, num_heads, batch_first=True)
         self.appearance_norm = nn.LayerNorm(hidden_channels)
+        if not legacy_layout:
+            self.appearance_ffn = nn.Sequential(
+                nn.Linear(hidden_channels, hidden_channels * 4), nn.GELU(), nn.Linear(hidden_channels * 4, hidden_channels)
+            )
+            self.appearance_norm2 = nn.LayerNorm(hidden_channels)
 
         # Language-conditioned edge-aware graph attention.
-        self.geo_mlp = nn.Sequential(nn.Linear(7, hidden_channels), nn.ReLU(), nn.Linear(hidden_channels, hidden_channels))
-        self.text_edge = nn.Sequential(nn.Linear(hidden_channels, hidden_channels), nn.Sigmoid())
+        geometry_channels = 7 if legacy_layout else 8
+        self.geo_mlp = nn.Sequential(
+            nn.Linear(geometry_channels, self.edge_channels), nn.ReLU(), nn.Linear(self.edge_channels, self.edge_channels)
+        )
+        self.text_edge = nn.Sequential(nn.Linear(hidden_channels, self.edge_channels), nn.Sigmoid())
         self.q_proj = nn.ModuleList([nn.Linear(hidden_channels, hidden_channels) for _ in range(layers)])
         self.k_proj = nn.ModuleList([nn.Linear(hidden_channels, hidden_channels) for _ in range(layers)])
         self.v_proj = nn.ModuleList([nn.Linear(hidden_channels, hidden_channels) for _ in range(layers)])
-        self.edge_k = nn.ModuleList([nn.Linear(hidden_channels, hidden_channels) for _ in range(layers)])
-        self.edge_v = nn.ModuleList([nn.Linear(hidden_channels, hidden_channels) for _ in range(layers)])
-        self.edge_bias = nn.ModuleList([nn.Linear(hidden_channels, 1) for _ in range(layers)])
-        self.blocks = nn.ModuleList([GraphBlock(hidden_channels) for _ in range(layers)])
-        self.final_gate = nn.Linear(hidden_channels * 2, hidden_channels)
+        self.edge_k = nn.ModuleList([nn.Linear(self.edge_channels, hidden_channels) for _ in range(layers)])
+        self.edge_v = nn.ModuleList([nn.Linear(self.edge_channels, hidden_channels) for _ in range(layers)])
+        self.edge_bias = nn.ModuleList([nn.Linear(self.edge_channels, 1 if legacy_layout else num_heads) for _ in range(layers)])
+        self.blocks = nn.ModuleList([GraphBlock(hidden_channels, project_message=not legacy_layout) for _ in range(layers)])
+        if legacy_layout:
+            self.final_gate = nn.Linear(hidden_channels * 2, hidden_channels)
+        else:
+            self.final_gate = nn.Sequential(
+                nn.Linear(hidden_channels * 2, hidden_channels), nn.GELU(), nn.Linear(hidden_channels, hidden_channels)
+            )
+
+    @staticmethod
+    def _square_ring_points(anchors):
+        """Equal-perimeter samples on inner, boundary and 1.2x outer squares.
+
+        The paper specifies the three scales but not point ordering; use an
+        equal allocation (16 points per ring for its 48-anchor setting).
+        """
+        if anchors <= 0 or anchors % 12:
+            raise ValueError("Grab anchors must be a positive multiple of 12 for three square rings")
+        steps = torch.arange(anchors // 12, dtype=torch.float32) / (anchors // 12)
+        half = torch.full_like(steps, 0.5)
+        ring = torch.cat((
+            torch.stack((steps - 0.5, -half), dim=-1),
+            torch.stack((half, steps - 0.5), dim=-1),
+            torch.stack((0.5 - steps, half), dim=-1),
+            torch.stack((-half, 0.5 - steps), dim=-1),
+        ))
+        return torch.cat([ring * scale for scale in (0.5, 1.0, 1.2)])
 
     @staticmethod
     def _sentence_pool(text, text_mask):
@@ -86,10 +142,12 @@ class GrabGraphBinding(nn.Module):
         padding = text_mask.bool() if text_mask is not None else None
         anchor = self.anchor_query[None].expand(b, -1, -1)
         anchor_text, _ = self.anchor_text_attn(anchor, text, text, key_padding_mask=padding)
+        anchor_text = self.anchor_text_norm1(anchor + anchor_text)
+        anchor_text = self.anchor_text_norm2(anchor_text + self.anchor_text_ffn(anchor_text))
         anchor = anchor[:, None].expand(-1, n, -1, -1)
         anchor_text = anchor_text[:, None].expand(-1, n, -1, -1)
         proposal = queries[:, :, None].expand(-1, -1, self.num_anchors, -1)
-        offsets = torch.tanh(self.offset_head(torch.cat((proposal, anchor, anchor_text), dim=-1))) * 0.5
+        offsets = self.offset_head(torch.cat((proposal, anchor, anchor_text), dim=-1))
         centers, sizes = boxes[..., :2], boxes[..., 2:].clamp(min=1e-5)
         points = centers[:, :, None] + (self.base_points[None, None] + offsets) * sizes[:, :, None]
         points = points.clamp(0.0, 1.0)
@@ -110,47 +168,65 @@ class GrabGraphBinding(nn.Module):
             grid = level_points.mul(2.0).sub(1.0).reshape(b, n * self.num_anchors, 1, 2)
             sampled = F.grid_sample(visual, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
             sampled = sampled.squeeze(-1).transpose(1, 2).reshape(b, n, self.num_anchors, c)
-            sampled_levels.append(self.level_proj[level](sampled))
-        sampled = torch.stack(sampled_levels, dim=0).mean(0)
+            sampled_levels.append(sampled)
+        sampled = self.level_fusion(torch.cat(sampled_levels, dim=-1))
         q = queries.reshape(b * n, 1, c)
         memory = torch.cat((q, sampled.reshape(b * n, self.num_anchors, c)), dim=1)
         update, _ = self.appearance_attn(q, memory, memory)
-        return self.appearance_norm(q + update).reshape(b, n, c)
+        appearance = self.appearance_norm(q + update)
+        appearance = self.appearance_norm2(appearance + self.appearance_ffn(appearance))
+        return appearance.reshape(b, n, c)
+
+    @staticmethod
+    def _geometry(boxes):
+        """r[j, i] describes source i relative to receiver j (paper Eq. 5--6)."""
+        centers, sizes = boxes[..., :2], boxes[..., 2:].clamp(min=1e-5)
+        delta = centers[:, None, :] - centers[:, :, None]
+        distance = torch.linalg.vector_norm(delta, dim=-1)
+        direction = delta / (distance[..., None] + 1e-6)
+        logscale = torch.log(sizes[:, None, :] / sizes[:, :, None])
+        geometry = torch.cat((delta, distance[..., None], torch.log(distance[..., None] + 1e-6),
+                              direction, logscale), dim=-1)
+        return geometry, distance
+
+    def _adjacency(self, distance):
+        """Symmetrized kNN, including every reverse edge and each self-loop."""
+        b, n, _ = distance.shape
+        eye = torch.eye(n, dtype=torch.bool, device=distance.device)[None]
+        nearest = distance.detach().masked_fill(eye, float("inf")).topk(min(self.k, n - 1), largest=False).indices
+        adjacency = torch.zeros((b, n, n), dtype=torch.bool, device=distance.device)
+        adjacency.scatter_(2, nearest, True)
+        return adjacency | adjacency.transpose(1, 2) | eye
 
     def _topology(self, appearance, boxes, sentence):
         b, n, c = appearance.shape
-        centers, sizes = boxes[..., :2], boxes[..., 2:].clamp(min=1e-5)
-        delta = centers[:, :, None] - centers[:, None, :]
-        distance = torch.sqrt((delta ** 2).sum(-1) + 1e-8)
-        direction = delta / (distance[..., None] + 1e-6)
-        logscale = torch.log(sizes[:, :, None] / sizes[:, None, :])
-        geometry = torch.cat((delta, distance[..., None], direction, logscale), dim=-1)
-
-        # Symmetrized kNN plus self-loops. Dense masks preserve every reverse
-        # edge, unlike a second fixed-size top-k truncation.
-        detached_dist = distance.detach()
-        eye = torch.eye(n, dtype=torch.bool, device=boxes.device)[None]
-        nearest = detached_dist.masked_fill(eye, float("inf")).topk(min(self.k, max(n - 1, 1)), largest=False).indices
-        adjacency = torch.zeros((b, n, n), dtype=torch.bool, device=boxes.device)
-        adjacency.scatter_(2, nearest, True)
-        adjacency = adjacency | adjacency.transpose(1, 2) | eye
+        geometry, distance = self._geometry(boxes)
+        adjacency = self._adjacency(distance)
 
         edge = self.geo_mlp(geometry) * self.text_edge(sentence)[:, None, None]
         z = appearance
         for qp, kp, vp, ek, ev, eb, block in zip(
             self.q_proj, self.k_proj, self.v_proj, self.edge_k, self.edge_v, self.edge_bias, self.blocks
         ):
-            q, key, value = qp(z), kp(z), vp(z)
-            logits = (q[:, :, None] * (key[:, None] + ek(edge))).sum(-1) / math.sqrt(c)
-            logits = logits + eb(edge).squeeze(-1)
-            logits = logits.masked_fill(~adjacency, -1e4)
+            q, key, value = [projection(z).reshape(b, n, self.num_heads, self.head_dim)
+                             for projection in (qp, kp, vp)]
+            edge_key = ek(edge).reshape(b, n, n, self.num_heads, self.head_dim)
+            edge_value = ev(edge).reshape(b, n, n, self.num_heads, self.head_dim)
+            # Each head independently attends over source neighbors i for j.
+            logits = (torch.einsum("bjhd,bihd->bhji", q, key)
+                      + torch.einsum("bjhd,bjihd->bhji", q, edge_key)) / math.sqrt(self.head_dim)
+            logits = logits + eb(edge).permute(0, 3, 1, 2)
+            logits = logits.masked_fill(~adjacency[:, None], float("-inf"))
             attention = F.softmax(logits, dim=-1)
-            message = (attention[..., None] * (value[:, None] + ev(edge))).sum(2)
-            z = block(z, message)
-        gate = torch.sigmoid(self.final_gate(torch.cat((z, appearance), dim=-1)))
-        return gate * z + (1.0 - gate) * appearance
+            message = (torch.einsum("bhji,bihd->bjhd", attention, value)
+                       + torch.einsum("bhji,bjihd->bjhd", attention, edge_value))
+            z = block(z, message.reshape(b, n, c))
+        gate = torch.sigmoid(self.final_gate(torch.cat((appearance, z), dim=-1)))
+        return appearance + gate * (z - appearance)
 
     def forward(self, queries, boxes, text, text_mask=None, visuals=None, visual_masks=None):
+        if self._legacy_layout:
+            raise RuntimeError("legacy_layout is an initialization-only descriptor, not an active Grab model")
         queries, boxes, filter_logits, selected = self._filter(queries, boxes, text, text_mask)
         appearance = self._appearance(queries, boxes, text, text_mask, visuals, visual_masks)
         graph = self._topology(appearance, boxes, self._sentence_pool(text, text_mask))

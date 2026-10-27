@@ -159,7 +159,96 @@ def summarize(rows, meta, top_logits, top_boxes, output):
     return result
 
 
-def plot(rows, output):
+def plot_entropy_histogram(ax, values, correct, title, log_density=False):
+    """Keep the original per-group linear density; log scale is optional."""
+    import numpy as np
+    from matplotlib.ticker import LogLocator, NullFormatter, StrMethodFormatter
+    positive_densities = []
+    for mask, label, color in ((correct, "CRS correct", "#2678b2"), (~correct, "CRS wrong", "#d55e00")):
+        if not mask.any():
+            continue
+        density, _, _ = ax.hist(values[mask], bins=np.linspace(0, 1, 51), density=True,
+                                alpha=.42, label=label, color=color,
+                                edgecolor=color, linewidth=.55, zorder=3)
+        positive_densities.extend(density[density > 0].tolist())
+    if log_density and positive_densities:
+        ax.set_yscale("log")
+        # Zero-count bins have zero height and no representation on a log axis;
+        # do not add pseudocounts or renormalize either correctness group.
+        ax.set_ylim(min(positive_densities) * .65, max(positive_densities) * 1.6)
+        ax.yaxis.set_major_locator(LogLocator(base=10))
+        ax.yaxis.set_major_formatter(StrMethodFormatter("{x:g}"))
+        ax.yaxis.set_minor_locator(LogLocator(base=10, subs=(2, 5)))
+        ax.yaxis.set_minor_formatter(NullFormatter())
+    for threshold in (.4, .8):
+        ax.axvline(threshold, color="#777777", linestyle="--", linewidth=.9, alpha=.75, zorder=4)
+    ax.set(title=title, xlabel="Normalized entropy",
+           ylabel="Density (log scale)" if log_density else "Density", xlim=(0, 1))
+    ax.set_axisbelow(True)
+    ax.grid(axis="y", which="major", color="#d9dfe5", linewidth=.7)
+    ax.grid(axis="y", which="minor", color="#e9edf1", linewidth=.4, linestyle=":")
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.legend(frameon=False)
+
+
+def plot_broken_entropy_histogram(fig, subplot_spec, values, correct, title):
+    """Show an isolated high peak with an explicitly marked linear-axis break.
+
+    The same complete, per-group-normalized histogram is drawn on both axes.
+    Only a range with no bar endpoints is omitted; no samples are discarded.
+    """
+    import numpy as np
+    from matplotlib.ticker import MaxNLocator
+    bins = np.linspace(0, 1, 51)
+    heights = []
+    series = []
+    for selected, color in ((correct, "#2678b2"), (~correct, "#d55e00")):
+        if selected.any():
+            density, _ = np.histogram(values[selected], bins=bins, density=True)
+            heights.extend(density.tolist())
+            series.append((density, color))
+    descending = sorted(heights, reverse=True)
+    peak = descending[0] if descending else 0.
+    runner_up = descending[1] if len(descending) > 1 else peak
+    break_low = float(np.ceil(runner_up / 2) * 2)
+    break_high = float(np.floor(peak * .85 / 2) * 2)
+    if break_high <= break_low + 2:
+        ax = fig.add_subplot(subplot_spec)
+        plot_entropy_histogram(ax, values, correct, title, log_density=False)
+        return (ax,)
+    grids = subplot_spec.subgridspec(2, 1, height_ratios=(1, 3.4), hspace=.07)
+    upper = fig.add_subplot(grids[0])
+    lower = fig.add_subplot(grids[1], sharex=upper)
+    for ax in (upper, lower):
+        plot_entropy_histogram(ax, values, correct, "", log_density=False)
+    upper.set_ylim(break_high, float(np.ceil(peak / 2) * 2 + 2))
+    lower.set_ylim(0, break_low)
+    upper.set_title(title)
+    upper.set_xlabel("")
+    upper.set_ylabel("")
+    upper.spines["bottom"].set_visible(False)
+    upper.tick_params(axis="x", which="both", bottom=False, labelbottom=False)
+    upper.yaxis.set_major_locator(MaxNLocator(nbins=3, integer=True))
+    lower.yaxis.set_major_locator(MaxNLocator(nbins=4, integer=True))
+    lower.get_legend().remove()
+    upper.text(.985, .08, f"Linear y-axis; break {break_low:g}\u2013{break_high:g}",
+               transform=upper.transAxes, ha="right", va="bottom", fontsize=8, color="#666666")
+    # Slashes on both sides make the omitted y interval explicit.
+    for ax, y in ((upper, 0), (lower, 1)):
+        ax.plot([0, 1], [y, y], transform=ax.transAxes, linestyle="none",
+                marker=[(-1, -.5), (1, .5)], markersize=8,
+                color="#555555", markeredgewidth=1, clip_on=False, zorder=10)
+    # Label the actual first-bin densities, so a break cannot hide their values.
+    for density, color in series:
+        height = float(density[0])
+        ax = upper if height >= break_high else lower
+        ax.annotate(f"{height:.2f}", (bins[1], height), xytext=(3, 3),
+                    textcoords="offset points", color=color, fontsize=8)
+    return upper, lower
+
+
+def plot(rows, output, log_density=False, broken_y=True):
     import numpy as np
     import matplotlib
     matplotlib.use("Agg")
@@ -167,23 +256,24 @@ def plot(rows, output):
     correct = np.array([row["correct"] for row in rows], dtype=bool)
     raw = np.array([row["raw_entropy"] for row in rows])
     grouped = np.array([row["grouped_entropy"] for row in rows])
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
-    for ax, values, title in ((axes[0, 0], raw, "Top-5 entropy (no grouping)"),
-                               (axes[0, 1], grouped, "Top-5 entropy (IoU grouping)")):
-        for mask, label, color in ((correct, "CRS correct", "#2678b2"), (~correct, "CRS wrong", "#d55e00")):
-            ax.hist(values[mask], bins=np.linspace(0, 1, 51), density=True, alpha=.5, label=label, color=color)
-        for value in (.4, .8):
-            ax.axvline(value, color="gray", linestyle="--", linewidth=1)
-        ax.set(title=title, xlabel="Normalized entropy", ylabel="Density", xlim=(0, 1))
-        ax.legend()
+    fig = plt.figure(figsize=(12, 8), constrained_layout=True)
+    grids = fig.add_gridspec(2, 2)
+    for column, values, title in ((0, raw, "Top-5 entropy (no grouping)"),
+                                   (1, grouped, "Top-5 entropy (IoU grouping)")):
+        if broken_y and not log_density:
+            plot_broken_entropy_histogram(fig, grids[0, column], values, correct, title)
+        else:
+            plot_entropy_histogram(fig.add_subplot(grids[0, column]), values, correct, title,
+                                   log_density=log_density)
+    cdf_ax, errors_ax = fig.add_subplot(grids[1, 0]), fig.add_subplot(grids[1, 1])
     for mask, label, color in ((correct, "CRS correct", "#2678b2"), (~correct, "CRS wrong", "#d55e00")):
         values = np.sort(raw[mask])
-        axes[1, 0].plot(values, np.arange(1, len(values) + 1) / max(len(values), 1) * 100,
-                        color=color, label=label)
+        cdf_ax.plot(values, np.arange(1, len(values) + 1) / max(len(values), 1) * 100,
+                    color=color, label=label)
     for value in (.4, .8):
-        axes[1, 0].axvline(value, color="gray", linestyle="--", linewidth=1)
-    axes[1, 0].set(title="Cumulative distribution (no grouping)", xlabel="Normalized entropy", ylabel="Samples at or below threshold (%)")
-    axes[1, 0].legend()
+        cdf_ax.axvline(value, color="gray", linestyle="--", linewidth=1)
+    cdf_ax.set(title="Cumulative distribution (no grouping)", xlabel="Normalized entropy", ylabel="Samples at or below threshold (%)")
+    cdf_ax.legend()
     for values, name in ((raw, "No grouping"), (grouped, "IoU grouping")):
         edges = np.unique(np.quantile(values, np.linspace(0, 1, 11)))
         chunks = [np.flatnonzero((values >= lo) & ((values <= hi) if i == len(edges) - 2 else (values < hi)))
@@ -191,11 +281,10 @@ def plot(rows, output):
         chunks = [part for part in chunks if len(part)]
         x = [float(values[part].mean()) for part in chunks]
         y = [float((~correct[part]).mean() * 100) for part in chunks]
-        axes[1, 1].plot(x, y, marker="o", label=name)
-    axes[1, 1].axhline((~correct).mean() * 100, color="gray", linestyle="--", label="Overall error rate")
-    axes[1, 1].set(title="Error rate by entropy decile", xlabel="Mean entropy in equal-count bin", ylabel="Top-1 error (%)")
-    axes[1, 1].legend()
-    fig.tight_layout()
+        errors_ax.plot(x, y, marker="o", label=name)
+    errors_ax.axhline((~correct).mean() * 100, color="gray", linestyle="--", label="Overall error rate")
+    errors_ax.set(title="Error rate by entropy decile", xlabel="Mean entropy in equal-count bin", ylabel="Top-1 error (%)")
+    errors_ax.legend()
     fig.savefig(output / "entropy_distribution.png", dpi=160)
     plt.close(fig)
 

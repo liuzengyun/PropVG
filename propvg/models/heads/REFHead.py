@@ -546,7 +546,10 @@ class REFHead(nn.Module):
         # query features only; proposal boxes and the original PropVG losses
         # remain unchanged.
         self.grab_binding = build_optional_module(
-            lambda: GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48),
+            # Preserve historical RNG replay/omitted keys when Grab is off;
+            # only the enabled branch adopts the detailed paper's structure.
+            lambda: GrabGraphBinding(hidden_channels=hidden_channels, num_heads=8, k=6, layers=4, anchors=48,
+                                     legacy_layout=not enable_grab),
             enable_grab, "grab_binding", self._omitted_parameter_names,
         )
         self.dist_head = MTDv2(hidden_channels, MTD["K"])
@@ -784,8 +787,17 @@ class REFHead(nn.Module):
             referred_kept = target_gt_refer.sum(1) > 0
             referred_logit = (filter_scores * target_gt_refer_full).sum(1) / target_gt_refer_full.sum(1).clamp(min=1.0)
             missing = referred_exists & (~referred_kept)
-            keep_loss = (-F.logsigmoid(referred_logit) * missing.float()).sum() / referred_exists.float().sum().clamp(min=1.0)
-            loss_filter = filter_bce + keep_loss
+            # Paper Eq. 10: average only over pruned referents, not the batch.
+            # DDP averages gradients over ranks; compensate so the result is
+            # the global missing-sample mean, including when some ranks miss 0.
+            missing_count = missing.float().sum()
+            world_size = 1
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(missing_count)
+                world_size = torch.distributed.get_world_size()
+            keep_loss = (-F.logsigmoid(referred_logit) * missing.float()).sum() * world_size / missing_count.clamp(min=1.0)
+            # Paper Eq. 11: lambda_bce=0.3, lambda_keep=1, lambda_filter=1.
+            loss_filter = 0.3 * filter_bce + keep_loss
         else:
             loss_filter = x.sum() * 0.0
 
@@ -793,7 +805,7 @@ class REFHead(nn.Module):
             "loss_mask": loss_mask,
             "loss_det": loss_det,
             "loss_refer": loss_refer,
-            "loss_filter": loss_filter * 0.5,
+            "loss_filter": loss_filter,
         }
 
         ranking_priority = None
