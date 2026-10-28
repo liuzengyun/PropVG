@@ -26,3 +26,4 @@ third/
 *.pth
 visualization/
 reports/
+temp/

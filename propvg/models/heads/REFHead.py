@@ -850,7 +850,10 @@ class REFHead(nn.Module):
             loss_dict.update({"metric_correctness_" + key: metric for key, metric in metrics.items()})
         return loss_dict, pred_dict, extra_dict
 
-    def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None, with_mask=True):
+    def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None, with_mask=True,
+                     return_crv_inputs=False):
+        if return_crv_inputs and (self.training or with_mask):
+            raise ValueError("CRV cache extraction requires eval mode and with_mask=False")
         extra_dict = {}
         img_metas = targets["img_metas"] if targets is not None else [
             {"img_shape": img.shape[-2:], "pad_shape": img.shape[-2:]} for _ in range(img.shape[0])
@@ -944,6 +947,14 @@ class REFHead(nn.Module):
             lan_feat, lan_mask, img_metas,
         )
         extra_dict.update(background_info)
+        if return_crv_inputs:
+            # Opt-in offline extraction only. No CRV, correctness head or GT
+            # enters this path; default inference below remains unchanged.
+            refer_label, _, refer_logits = self.mrsm(refer_query_embed, lan_feat, lan_mask, return_logits=True)
+            return dict(visual=multi_level_feats[0], visual_mask=multi_level_masks[0],
+                        boxes=bound_boxes, text=lan_feat, text_mask=lan_mask,
+                        probabilities=refer_label, logits=refer_logits,
+                        candidate_features=refer_query_embed), {}
         refer_label, proposal_word_attnmap, refer_logits = self._score_referring(refer_query_embed, lan_feat, lan_mask)
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
