@@ -2,8 +2,6 @@
 
 当前版本：`schema_version=10`，2026-10-21。
 
-新增的独立冻结基线训练方式见 [CRV_cached_training.md](CRV_cached_training.md)：可选择一次缓存中间特征或每 batch 在线冻结前向，仅优化原有 CRV，最后保存基线与 CRV 的完整权重。缓存模式默认在成功完成后清理派生特征。此入口不改变下文 CRV 算法，也不改变原来的联合训练/测试方式。
-
 核心文件：`propvg/models/heads/counterfactual_refinement.py`；接入位置为`REFHead.py`中CRS评分之后。当前配置采用最大视觉特征图、全图均值干预、48×48整图评分网格，**不做局部裁剪**。
 
 ## 1 动机：不确定不等于应该相信CRV
