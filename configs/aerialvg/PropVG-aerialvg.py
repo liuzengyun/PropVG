@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-BASE"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-RelationScoring"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -62,6 +62,9 @@ crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refin
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
 enable_bcem = False
+# Replace CRS after optional background enhancement; False preserves old models.
+enable_relation_scoring = True
+relation_neighbors = 6
 # New experiments sample four points per stage directly on each ray.
 bcem_sampling_mode = "ray"
 bcem_num_rays = 8
@@ -123,8 +126,12 @@ model = dict(
               detr_loss={"criterion": {"loss_class": 1.0, "loss_bbox": 5.0, "loss_giou": 2.0},
                          "matcher": {"cost_class": 1.0, "cost_bbox": 5.0, "cost_giou": 2.0}},
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
-                           "bbox": 0.1, "allbbox": 0.025, "refer": 1.0}, MTD={"K": 250},
+                           "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
+              enable_relation_scoring=enable_relation_scoring,
+              relation_scoring=dict(num_neighbors=relation_neighbors, model_dim=256, geometry_dim=64,
+                                    num_heads=8, num_layers=2, ffn_dim=512, dropout=0.1,
+                                    duplicate_iou=0.8, chunk_size=256),
               enable_correctness=enable_correctness, correctness=correctness,
               enable_crv=enable_crv,
               crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,

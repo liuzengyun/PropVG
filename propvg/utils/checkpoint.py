@@ -52,6 +52,27 @@ def _validate_crv_checkpoint(model, state):
                          "To start CRV training from a baseline, use --finetune-from instead of --load-from/--resume-from.")
 
 
+def _validate_relation_checkpoint(model, state):
+    """Never evaluate a baseline with a random replacement scorer, or vice versa."""
+    base = model.module if hasattr(model, "module") else model
+    scorer = getattr(getattr(base, "head", None), "relation_scorer", None)
+    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
+    prefix = "head.relation_scorer."
+    if scorer is None:
+        if any(key.startswith(prefix) for key in normalized):
+            raise ValueError("Checkpoint uses relation scoring; enable_relation_scoring must match its saved config. "
+                             "The replacement checkpoint has no trained CRS to silently fall back to.")
+        return
+    expected = {prefix + key: value for key, value in scorer.state_dict().items()}
+    version, steps = normalized.get(prefix + "schema_version"), normalized.get(prefix + "trained_steps")
+    if (not expected.keys() <= normalized.keys() or version is None or int(version) != int(scorer.schema_version)
+            or steps is None or int(steps) <= 0
+            or any(normalized[key].shape != value.shape for key, value in expected.items() if key in normalized)):
+        raise ValueError("Enabled relation scoring requires a complete trained compatible checkpoint. "
+                         "To train the replacement from an old baseline use --finetune-from, "
+                         "not --load-from/--resume-from. For old-model testing disable enable_relation_scoring.")
+
+
 def _load_optimizer_state(model, optimizer, checkpoint, model_state):
     """Resume across removal of inactive branches without shifting Adam states."""
     saved = checkpoint["optimizer"]
@@ -198,6 +219,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
         state = de_parallel(state)
     _validate_crv_checkpoint(model, state)
     _validate_correctness_checkpoint(model, state)
+    _validate_relation_checkpoint(model, state)
     try:
         model.load_state_dict(state, strict=True)
     except:

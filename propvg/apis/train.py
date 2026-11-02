@@ -119,6 +119,10 @@ def train_model(epoch, cfg, model, optimizer, loader):
         if correctness_values and correctness_values["correctness_valid_samples"].item() > 0:
             base_model = model.module if hasattr(model, "module") else model
             base_model.head.correctness.mark_optimizer_step()
+        base_model = model.module if hasattr(model, "module") else model
+        relation_scorer = getattr(getattr(base_model, "head", None), "relation_scorer", None)
+        if relation_scorer is not None:
+            relation_scorer.mark_optimizer_step()
         crv_values.update(correctness_values)
 
         if cfg.distributed:

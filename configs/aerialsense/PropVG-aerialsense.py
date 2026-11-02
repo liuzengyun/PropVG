@@ -46,6 +46,9 @@ freeze_beit3 = False
 
 # Optional GrabVG components already implemented in the current model.
 enable_grab = False
+# Optional pairwise relation scorer; False retains CRS.
+enable_relation_scoring = False
+relation_neighbors = 6
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
 # Optional detached correctness estimation; False preserves previous models.
@@ -185,6 +188,10 @@ model = dict(
         ),
         MTD=dict(K=250),
         enable_grab=enable_grab,
+        enable_relation_scoring=enable_relation_scoring,
+        relation_scoring=dict(num_neighbors=relation_neighbors, model_dim=256, geometry_dim=64,
+                              num_heads=8, num_layers=2, ffn_dim=512, dropout=0.1,
+                              duplicate_iou=0.8, chunk_size=256),
         enable_mask=enable_mask,
         enable_correctness=enable_correctness,
         correctness=correctness,

@@ -29,6 +29,7 @@ from .optional_modules import build_optional_module
 from .counterfactual_refinement import CounterfactualRefinement
 from .background_context import BackgroundContextEnhancement
 from .top1_correctness import Top1CorrectnessHead
+from .candidate_relation_scoring import CandidateRelationScorer
 
 
 class GlobalCrossAttention(nn.Module):
@@ -449,12 +450,17 @@ class REFHead(nn.Module):
         crv=None,
         enable_correctness=False,
         correctness=None,
+        enable_relation_scoring=False,
+        relation_scoring=None,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
         self.enable_mask = enable_mask
         self.enable_bcem = enable_bcem
         self.enable_crv = enable_crv
+        self.enable_relation_scoring = enable_relation_scoring
+        if enable_relation_scoring and enable_crv:
+            raise ValueError("First relation-scoring experiment replaces CRS; set enable_crv=False")
         self._omitted_parameter_names = []
         self.seg_branch = build_optional_module(
             lambda: SegBranch(hidden_channels, upsample_rate=1), enable_mask,
@@ -544,7 +550,10 @@ class REFHead(nn.Module):
         self.query_embed = nn.Embedding(num_queries, hidden_channels)
         self.query_pos = nn.Embedding(num_queries, hidden_channels)
         self.refer_loss = nn.CrossEntropyLoss()
-        self.mrsm = CRS(hidden_channels)
+        self.mrsm = build_optional_module(
+            lambda: CRS(hidden_channels), not enable_relation_scoring,
+            "mrsm", self._omitted_parameter_names,
+        )
         # GrabVG-style language-conditioned local graph binding.  It refines
         # query features only; proposal boxes and the original PropVG losses
         # remain unchanged.
@@ -587,8 +596,20 @@ class REFHead(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(seed)
                 self.correctness = Top1CorrectnessHead(hidden_channels=hidden_channels, **options)
+        self.relation_scorer = None
+        if enable_relation_scoring:
+            options = dict(relation_scoring or {})
+            seed = int(options.pop("init_seed", 3717))
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(seed)
+                self.relation_scorer = CandidateRelationScorer(hidden_channels=hidden_channels, **options)
 
-    def _score_referring(self, query, text, text_mask):
+    def _score_referring(self, query, text, text_mask, boxes=None, classes=None, img_metas=None, extra_dict=None):
+        if self.relation_scorer is not None:
+            score, logits, attention, details = self.relation_scorer(query, boxes, text, text_mask, classes, img_metas)
+            if extra_dict is not None:
+                extra_dict.update(details)
+            return score, [attention], logits
         if self.enable_crv or self.correctness is not None:
             return self.mrsm(query, text, text_mask, return_logits=True)
         score, attention = self.mrsm(query, text, text_mask)
@@ -764,7 +785,10 @@ class REFHead(nn.Module):
             lan_feat, lan_mask, img_metas,
         )
         extra_dict.update(background_info)
-        refer_label, proposal_word_attnmap, refer_logits = self._score_referring(refer_query_embed, lan_feat, lan_mask)
+        refer_label, proposal_word_attnmap, refer_logits = self._score_referring(
+            refer_query_embed, lan_feat, lan_mask, boxes=bound_boxes, classes=selected_classes,
+            img_metas=img_metas, extra_dict=extra_dict,
+        )
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
 
@@ -781,9 +805,12 @@ class REFHead(nn.Module):
         target_gt_refer = (
             target_gt_refer_full.gather(1, selected_indices) if self.enable_grab else target_gt_refer_full
         )
-        loss_refer = (
-            F.binary_cross_entropy(refer_label.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
-        )
+        if self.relation_scorer is not None:
+            loss_refer = self.referloss(refer_logits.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
+        else:
+            loss_refer = (
+                F.binary_cross_entropy(refer_label.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
+            )
 
         # ! seg loss
         loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"]) if target_mask is not None else x.sum() * 0.0
@@ -820,7 +847,8 @@ class REFHead(nn.Module):
             "loss_filter": loss_filter,
         }
 
-        ranking_priority = None
+        # Preserve precision for the new head without changing legacy ranking.
+        ranking_priority = refer_logits if self.relation_scorer is not None else None
         if self.enable_crv:
             refer_score, ranking_priority, crv_losses, crv_info = self.crv(
                 multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
@@ -944,11 +972,16 @@ class REFHead(nn.Module):
             lan_feat, lan_mask, img_metas,
         )
         extra_dict.update(background_info)
-        refer_label, proposal_word_attnmap, refer_logits = self._score_referring(refer_query_embed, lan_feat, lan_mask)
+        if self.relation_scorer is not None:
+            self.relation_scorer.require_trained()
+        refer_label, proposal_word_attnmap, refer_logits = self._score_referring(
+            refer_query_embed, lan_feat, lan_mask, boxes=bound_boxes, classes=selected_classes,
+            img_metas=img_metas, extra_dict=extra_dict,
+        )
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
 
-        ranking_priority = None
+        ranking_priority = refer_logits if self.relation_scorer is not None else None
         if self.enable_crv:
             # No GT (including targets['bbox']) is read during inference.
             refer_score, ranking_priority, _, crv_info = self.crv(
