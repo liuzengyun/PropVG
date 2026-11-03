@@ -1,9 +1,4 @@
 """CPU regressions for detached correctness estimation and legacy compatibility."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
 import importlib.util
 import math
@@ -206,7 +201,7 @@ class CorrectnessIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(2)
         cls.options = copy.deepcopy(Config.fromfile('configs/aerialvg/PropVG-aerialvg.py').model.head)
-        cls.options.update(num_queries=8, enable_mask=False, enable_crv=False, enable_relation_scoring=False,
+        cls.options.update(num_queries=8, enable_mask=False, enable_crv=False,
                            correctness=dict(hidden_dim=16, topk=5))
         cls.options['bcem'] = dict(context_dim=16, sampling_mode='ray', num_rays=4,
                                    radial_samples=4, min_valid_points=2, chunk_size=2, checkpoint_chunks=False)

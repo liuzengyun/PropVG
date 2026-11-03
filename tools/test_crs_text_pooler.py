@@ -1,12 +1,7 @@
 """Regression checks for CRS sentence pooling with integer padding masks.
 
-Run from the repository root: PYTHONPATH=. python tools/test_script/test_crs_text_pooler.py
+Run from the repository root: PYTHONPATH=. python tools/test_crs_text_pooler.py
 """
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import os
 import unittest
 

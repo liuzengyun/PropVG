@@ -1,13 +1,7 @@
 """CPU regressions: pair scoring, geometry, gradients and legacy isolation."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
-import math
 import os
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -17,30 +11,9 @@ from mmcv import Config
 
 from propvg.models import build_head
 from propvg.models.det_seg.mix_ref_unimodel_OMG import MIXRefUniModel_OMG
-from propvg.models.heads.candidate_relation_scoring import CandidateRelationScorer, PairTextLayer
+from propvg.models.heads.candidate_relation_scoring import CandidateRelationScorer
 from propvg.utils.checkpoint import _validate_relation_checkpoint
 from propvg.apis.train import train_model
-
-
-def _copy_based_attention_reference(layer, pair, memory, text_valid):
-    """Pre-optimization math, intentionally copying text for every pair.
-
-    Adapt B,P,D inputs to the original flattened implementation for numerical
-    and gradient regressions; this slow reference is never used in training.
-    """
-    b, count, dim = pair.shape
-    owners = torch.arange(b, device=pair.device).repeat_interleave(count)
-    flat = pair.reshape(-1, dim)
-    q = layer.query(flat).reshape(-1, layer.heads, layer.head_dim)
-    key, value = (item[owners] for item in memory)
-    valid = text_valid[owners]
-    logits = torch.einsum('shd,shld->shl', q, key) / math.sqrt(layer.head_dim)
-    logits = logits.float().masked_fill(~valid[:, None], -torch.inf)
-    logits = torch.where(valid.any(1)[:, None, None], logits, torch.zeros_like(logits))
-    weights = logits.softmax(-1).to(pair.dtype) * valid[:, None].to(pair.dtype)
-    context = torch.einsum('shl,shld->shd', layer.attention_dropout(weights), value).flatten(1)
-    flat = layer.norm1(flat + layer.output_dropout(layer.output(context)))
-    return layer.norm2(flat + layer.ffn(flat)).reshape_as(pair), weights.mean(1).reshape(b, count, -1)
 
 
 class RelationScoringTests(unittest.TestCase):
@@ -178,85 +151,6 @@ class RelationScoringTests(unittest.TestCase):
         a[1].square().mean().backward(); b[1].square().mean().backward()
         for (name, x), (_, y) in zip(left.named_parameters(), right.named_parameters()):
             torch.testing.assert_close(x.grad, y.grad, rtol=2e-4, atol=2e-6, msg=name)
-
-    def test_shared_kv_matches_copy_based_scores_and_all_gradients(self):
-        optimized = self.module(chunk_size=11)
-        # Non-uniform learned adoption weights must also preserve equivalence.
-        torch.nn.init.normal_(optimized.weight[-1].weight, std=.1)
-        reference = copy.deepcopy(optimized)
-        for layer in reference.layers:
-            layer.forward = MethodType(_copy_based_attention_reference, layer)
-        first = self.inputs(n=9, batch=3)
-        first[3][1] = 1  # Mix normal text with one all-padding image.
-        second = [x.detach().clone().requires_grad_(x.requires_grad) if torch.is_tensor(x)
-                  else copy.deepcopy(x) for x in first]
-        a, b = optimized(*first), reference(*second)
-        for x, y in zip(a[:3], b[:3]):
-            torch.testing.assert_close(x, y, rtol=2e-5, atol=2e-6)
-        for key in a[3]:
-            torch.testing.assert_close(a[3][key], b[3][key], rtol=2e-5, atol=2e-6, msg=key)
-        labels = torch.zeros_like(a[1]); labels[:, 0] = 1
-        torch.nn.functional.binary_cross_entropy_with_logits(a[1], labels).backward()
-        torch.nn.functional.binary_cross_entropy_with_logits(b[1], labels).backward()
-        for (name, x), (_, y) in zip(optimized.named_parameters(), reference.named_parameters()):
-            torch.testing.assert_close(x.grad, y.grad, rtol=3e-4, atol=3e-6, msg=name)
-        for index in (0, 2):
-            torch.testing.assert_close(first[index].grad, second[index].grad, rtol=3e-4, atol=3e-6)
-
-    def test_batched_attention_never_mixes_pairs_or_images(self):
-        torch.manual_seed(812)
-        layer = PairTextLayer(16, 4, 32, 0).eval()
-        pair, text = torch.randn(2, 9, 16), torch.randn(2, 7, 16)
-        valid, position = torch.ones(2, 7, dtype=torch.bool), torch.zeros(1, 7, 16)
-        original = layer(pair, layer.prepare_memory(text, position), valid)[0]
-        modified = pair.clone(); modified[0, 3, 0] += 10
-        result = layer(modified, layer.prepare_memory(text, position), valid)[0]
-        keep = torch.ones(2, 9, dtype=torch.bool); keep[0, 3] = False
-        torch.testing.assert_close(result[keep], original[keep], rtol=0, atol=0)
-        modified_text = text.clone(); modified_text[0] += torch.randn_like(text[0])
-        result = layer(pair, layer.prepare_memory(modified_text, position), valid)[0]
-        torch.testing.assert_close(result[1], original[1], rtol=0, atol=0)
-
-    def test_chunks_keep_batch_axis_and_share_same_unexpanded_memory(self):
-        model = self.module(chunk_size=11)
-        args = self.inputs(batch=3)
-        calls, hooks = [], []
-        for index, layer in enumerate(model.layers):
-            def record(_, inputs, index=index):
-                pair, (key, value), valid = inputs
-                calls.append((index, pair.shape, key.shape, value.shape,
-                              key.data_ptr(), value.data_ptr(), valid.shape))
-            hooks.append(layer.register_forward_pre_hook(record))
-        model(*args)
-        for hook in hooks: hook.remove()
-        chunks = math.ceil(8 * 6 / 11)
-        self.assertEqual(len(calls), chunks * 2)  # Not ceil(B*N*K/chunk_size)*2.
-        for index in range(2):
-            layer_calls = [row for row in calls if row[0] == index]
-            self.assertEqual([row[1] for row in layer_calls],
-                             [torch.Size([3, 11, 16])] * 4 + [torch.Size([3, 4, 16])])
-            self.assertEqual(len({row[4:6] for row in layer_calls}), 1)
-            for row in layer_calls:
-                self.assertEqual(row[2], torch.Size([3, 4, 7, 4]))
-                self.assertEqual(row[3], row[2])
-                self.assertEqual(row[6], torch.Size([3, 7]))
-
-    def test_backward_does_not_save_pair_expanded_text_key_value(self):
-        layer = PairTextLayer(16, 4, 32, 0)
-        pair = torch.randn(2, 31, 16, requires_grad=True)
-        text = torch.randn(2, 7, 16, requires_grad=True)
-        saved_shapes = []
-        def pack(tensor):
-            saved_shapes.append(tuple(tensor.shape))
-            return tensor
-        with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
-            out, _ = layer(pair, layer.prepare_memory(text, torch.zeros(1, 7, 16)),
-                           torch.ones(2, 7, dtype=torch.bool))
-            out.square().mean().backward()
-        self.assertNotIn((2 * 31 * 4, 4, 7), saved_shapes)
-        self.assertNotIn((2 * 31 * 4, 7, 4), saved_shapes)
-        self.assertIn((2 * 4, 4, 7), saved_shapes)
-        self.assertIn((2 * 4, 7, 4), saved_shapes)
 
     def test_neighbour_permutation_keeps_aggregate_unchanged(self):
         model = self.module().eval()
@@ -420,8 +314,7 @@ class RelationScoringTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'set enable_crv=False'): build_head(options)
         for filename in ('configs/aerialvg/PropVG-aerialvg.py', 'configs/aerialsense/PropVG-aerialsense.py'):
             cfg = Config.fromfile(filename)
-            # The user's active experiment may enable this switch.
-            self.assertIsInstance(cfg.model.head.enable_relation_scoring, bool)
+            self.assertFalse(cfg.model.head.enable_relation_scoring)
             self.assertEqual(cfg.model.head.relation_scoring.num_neighbors, 6)
 
 

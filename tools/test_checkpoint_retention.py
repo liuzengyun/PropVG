@@ -1,9 +1,4 @@
 """CPU checks for checkpoint retention, best selection and resumable snapshots."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 from pathlib import Path
 import tempfile
 import unittest

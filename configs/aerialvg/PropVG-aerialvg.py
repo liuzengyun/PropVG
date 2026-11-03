@@ -34,7 +34,6 @@ teacher_annsfile = "data/AerialVG/teacher_trainset.json"
 # every available teacher box. The current JSON contains exactly 5 raw boxes
 # per sample, so values above 5 cannot add supervision with this file.
 teacher_max_boxes = 5
-teacher_max10 = True  # Filter teacher boxes whose clipped pixel area is >10x the original refer GT.
 # Teacher predictions overlapping the exact refer GT at or above this IoU are
 # discarded; the original refer GT remains the only target for that instance.
 teacher_dedup_iou = 0.5
@@ -66,8 +65,6 @@ enable_bcem = False
 # Replace CRS after optional background enhancement; False preserves old models.
 enable_relation_scoring = True
 relation_neighbors = 6
-relation_foreground_topk = 64  # Keep detector's num_queries=256; prune only before relation scoring.
-relation_strict_disjoint_neighbors = True
 # New experiments sample four points per stage directly on each ray.
 bcem_sampling_mode = "ray"
 bcem_num_rays = 8
@@ -107,8 +104,7 @@ data = dict(
                teacher_annsfile=teacher_annsfile if teacher else None,
                teacher_dedup_iou=teacher_dedup_iou,
                teacher_nms_iou=teacher_nms_iou,
-               teacher_max_boxes=teacher_max_boxes,
-               teacher_max10=teacher_max10),
+               teacher_max_boxes=teacher_max_boxes),
     val=dict(type=dataset_type, which_set="val", annsfile="data/AerialVG/annotation/vg_val_odvg.jsonl",
              imgsfile="data/AerialVG/images", pipeline=val_pipeline),
     test=dict(type=dataset_type, which_set="test", annsfile="data/AerialVG/annotation/vg_test_odvg.jsonl",
@@ -133,11 +129,7 @@ model = dict(
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_relation_scoring=enable_relation_scoring,
-              # chunk_size counts pairs PER IMAGE; all images share the batch axis.
-              relation_scoring=dict(num_neighbors=relation_neighbors,
-                                    foreground_topk=relation_foreground_topk,
-                                    strict_disjoint_neighbors=relation_strict_disjoint_neighbors,
-                                    model_dim=256, geometry_dim=64,
+              relation_scoring=dict(num_neighbors=relation_neighbors, model_dim=256, geometry_dim=64,
                                     num_heads=8, num_layers=2, ffn_dim=512, dropout=0.1,
                                     duplicate_iou=0.8, chunk_size=256),
               enable_correctness=enable_correctness, correctness=correctness,

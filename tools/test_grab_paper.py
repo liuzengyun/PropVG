@@ -1,9 +1,4 @@
 """CPU checks for detailed GrabVG binding and its Grab-only filtering loss."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
 import math
 import os
@@ -191,7 +186,7 @@ class GrabFilterLossTests(unittest.TestCase):
         torch.set_num_threads(2)
         options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
         options.update(enable_grab=True, enable_mask=False, enable_bcem=False, enable_correctness=False,
-                       enable_crv=False, enable_relation_scoring=False, num_queries=4)
+                       enable_crv=False, num_queries=4)
         torch.manual_seed(1081)
         cls.head = build_head(options).eval()
 
