@@ -1,4 +1,9 @@
 """CPU-only tracking tests; no account, cloud uploads, GPUs or real training."""
+if __package__:
+    from .. import _bootstrap  # noqa: F401
+else:
+    import tools._bootstrap as _bootstrap  # noqa: F401
+
 import ast
 from enum import Enum
 import importlib.util
@@ -18,7 +23,7 @@ from mmcv import Config
 from propvg.utils import experiment_tracking as tracking
 
 spec = importlib.util.spec_from_file_location("standalone_swanlab_worker_test",
-    Path(__file__).resolve().parents[1] / "propvg/utils/swanlab_worker.py")
+    _bootstrap.REPO_ROOT / "propvg/utils/swanlab_worker.py")
 worker = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(worker)
 
@@ -291,7 +296,7 @@ class TrackingTests(unittest.TestCase):
         self.assertIn("lr/0", values[-1])
 
     def test_replay_creates_a_new_snapshot_without_modifying_original(self):
-        spec = importlib.util.spec_from_file_location("tracking_replay_test", Path(__file__).with_name("replay_swanlab.py"))
+        spec = importlib.util.spec_from_file_location("tracking_replay_test", _bootstrap.TOOLS_DIR / "replay_swanlab.py")
         replay = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(replay)
         tracker, _ = self.start()

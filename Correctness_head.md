@@ -81,7 +81,7 @@ python tools/train.py configs/aerialvg/PropVG-aerialvg.py \
 测试原模型，即使当前配置存在新参数，也可以显式关闭：
 
 ```bash
-python tools/eval_aerialvg.py /path/to/original_experiment_config.py \
+python tools/test_script/eval_aerialvg.py /path/to/original_experiment_config.py \
   --checkpoint /path/to/old_checkpoint.pth --split val \
   --cfg-options model.head.enable_correctness=False
 ```

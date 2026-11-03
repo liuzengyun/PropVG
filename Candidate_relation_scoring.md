@@ -2,7 +2,7 @@
 
 **模块名称：** 候选中心关系评分头（Candidate-Centred Relation Scorer）。
 
-**当前方案：** 每个候选独立作为目标假设，从去重后的检测上下文中选择最近的K个邻居，默认K=6。将当前候选、单个邻居、有方向的5维几何和完整文本送入共享配对网络，得到K个匹配logit及K个采用权重，最后加权形成该候选的定位logit。开启时替换CRS，不与CRS分数融合；关闭时仍使用原CRS。
+**当前方案（2026-11-03）：** 检测器仍生成256个候选（AerialSense为128），关系头按检测前景置信度保留Top-64。每个保留候选独立作为目标假设，按距离贪心选择至多K=6个邻居，要求邻居与当前候选、邻居彼此均严格零面积交叠。将当前候选、单个邻居、有方向的5维几何和完整文本送入共享配对网络，得到K个匹配logit及K个采用权重，最后加权形成该候选的定位logit。开启时替换CRS，不与CRS分数融合；关闭时仍使用原CRS，且不执行新增筛选。
 
 代码：`propvg/models/heads/candidate_relation_scoring.py`。接入：`REFHead.py` 的 `_score_referring`。版本：`schema_version=1`。
 
@@ -28,7 +28,7 @@ BCEM从框外空间特征读取连续环境观测，并回写增强候选特征�
 
 ## 2 符号、输入和总体dataflow
 
-记batch为B，实际候选数N，原通道C=256，文本长度L通常64，邻居数K=6，评分维度D=256，几何维度G=64。
+记batch为B，进入筛选前的候选数N，保留数M=min(64,N)，原通道C=256，文本长度L通常64，邻居数K=6，评分维度D=256，几何维度G=64。
 
 输入是经过原`refer_adapter`及可选BCEM后的候选特征、同索引预测框、同索引检测分类logit、完整文本与padding mask、图像有效尺寸。若Grab先筛选，N是实际保留数而非固定256；AerialSense也支持128个初始候选。
 
@@ -41,36 +41,41 @@ BCEM从框外空间特征读取连续环境观测，并回写增强候选特征�
     ├─关系评分关闭：原CRS → 原分数、原损失、原排序
     │
     └─关系评分开启：不构建/执行旧CRS
-       ├─预测框与检测前景分数detach → 上下文去重
-       ├─对每个目标假设j：排除自身/近重复 → 选最近K个
+       ├─检测前景置信度detach → Top-64索引
+       ├─按同一索引收集候选特征/预测框/检测类别：B×M×C/4/2
+       ├─对每个目标假设j：按距离贪心选至多K个严格不重叠邻居
        ├─当前候选 + 一个邻居 + 5维相对几何 → 配对token
        ├─每对独立读取完整文本，两层交叉注意力+FFN
        ├─共享得分头 → K个匹配logit
        ├─共享权重头 → K个采用logit → 有效邻居softmax
        └─加权聚合 → 每个候选一个定位logit
-          → 训练：沿用原refer标签，BCEWithLogits
-          → 推理：全部候选按新logit排序，最高分框作为结果
+          → 训练：同步收集原refer标签；正样本被筛掉时跳过该样本定位BCE
+          → 推理：仅保留的M个候选按新logit排序，最高分框作为结果
+
+检测分类/框回归损失始终使用原始全部256个预测，不使用Top-64替代。BCEM仍在原位置处理完整候选库，新筛选不改变它的输入。Grab如开启，先运行原Grab，再从其保留池取至多64个。
 ```
 
 代码不接受GT作为关系头输入。teacher、辅助GT和关系标签都不是该头的前向依赖；现有teacher开关仍只按原流程影响检测监督，不因新增模块改变。
 
-## 3 上下文去重与6近邻选择
+## 3 前景Top-64与严格零重叠6近邻
 
-### 3.1 只对上下文库去重，不删除目标候选
+### 3.1 先按检测前景置信度保留候选
 
-**目的：** 避免同一个物体的多个预测框占满邻居名额。
+**目的：** 减少明显背景及低可信预测参与关系评分，同时控制计算量。这里既筛目标假设，也筛邻居池，而不是只过滤上下文。
 
-从当前DETR输出的两类分类logit取`softmax[...,0]`作为前景置信度。框按有效图像裁剪，排除非有限值及裁剪后零面积框。按前景分数从高到低贪心保留上下文代表；与已保留代表IoU≥`duplicate_iou`的框被上下文抑制，默认阈值0.8，置信度并列保持原索引顺序。
+从当前DETR输出的两类分类logit取`softmax[...,0]`作为前景置信度，类别0是前景，类别1是no-object。这不是文本定位分数，也不运行CRS预选。按前景概率降序取Top-64，分数相同保持筛选前索引顺序；不使用0.5概率硬门槛、不注入GT，也不增加新前景网络。
 
-该筛选只产生上下文索引库，不修改检测框、检测标签或参与最终评分的N个候选。即使j在上下文去重时被另一个框代表，j本身仍会获得独立定位分数。
+有效性检查排除非有限坐标/分数及有效图像内零面积框，它们排序为最后。若有效框不足64，固定形状的剩余槽位仅用于补齐：不参与邻居和定位BCE，最终仍由原退化框后处理删除。保留数不超过现有候选数。特征、框、类别、原refer标签按同一索引收集，索引无梯度但特征gather保留梯度。
+
+Top-64不保证全部是真实前景，也不保证框覆盖完整物体。训练与测试规则相同；目标被筛掉时推理不会用GT补回。原检测监督仍负责改善前景置信度和框质量。
 
 ### 3.2 对每个目标假设选择最近邻居
 
 **目的：** 保留邻近物体配置，同时控制每候选计算量。
 
-对j排除：自身、与j的IoU≥0.8的上下文代表。再按有效图像像素坐标中的中心欧氏距离，取最近的K个；距离并列保持原索引顺序。本版不加最大半径、不加前景分数硬阈值、不按CRS或新评分预筛。
+在保留池内，对j排除自身和与j存在任何正面积交集的候选。剩余框按有效图像像素坐标的中心距离从近到远遍历；若候选与任意已选邻居有正面积交叠，也跳过。选满K个即停止，否则保留实际数量，不用重叠框或重复框补齐。距离相同保持当前池的稳定索引顺序，池自身已按前景分数排序。
 
-前景置信度只用于重复框代表的选择，不保证保留下来的每个上下文都是物体。因此仍可能选到背景预测，也可能遗漏距离较远的真实参考物。
+零交叠用交集面积严格等于0判定，无宽松epsilon；边界/角点接触允许保留。框按float32执行与后处理一致的有效图像裁剪/缩放，再用float64计算交集。没有额外的全局NMS；`duplicate_iou=0.8`仅供旧策略兼容，新严格模式不使用它。贪心最近邻不保证全局最佳参考物集合；重叠物体、远处参考物也可能被排除。
 
 ### 3.3 有效性与空邻域
 
@@ -152,14 +157,19 @@ j^*=\arg\max_jS_j.$$
 
 **目的：** 单独检验评分结构，不同时改变标签、检测损失或数据监督。
 
-使用原DETR最后一层匹配结果产生的refer正负标签；开启Grab时沿原索引收集标签。不顺带改成“所有IoU≥0.5的框均为正”，不对每个邻居额外赋标签。
+使用原DETR最后一层匹配结果产生的refer正负标签；开启Grab时先沿Grab索引收集，再沿前景Top-K索引收集。不顺带改成“所有IoU≥0.5的框均为正”，不对每个邻居额外赋标签。
 
-$$L_{refer}=\lambda_{refer}\operatorname{BCEWithLogits}(S,y),\qquad
+对存在refer目标但其匹配正候选被筛掉的样本，跳过该样本的定位BCE，不能错误地将它训练成全负；检测及其他原损失仍正常计算。真正无目标的表达式仍可计算全负BCE；全部候选无效时也跳过。记有效槽位为m_bj、可训练样本指示为a_b：
+
+$$\ell_b=\frac{\sum_{j=1}^{M}m_{bj}\operatorname{BCEWithLogits}(S_{bj},y_{bj})}{\max(1,\sum_jm_{bj})},\qquad
+L_{refer}=\lambda_{refer}\frac{\sum_b a_b\ell_b}{\max(1,\sum_b a_b)},\qquad
 L=L_{det}+L_{refer}+\text{原开关启用的其他损失}.$$
+
+多卡按所有卡有效样本总数归一化，本地loss乘world_size抵消DDP的梯度平均，不按各卡不同的有效样本数分别平均。全部卡无可训练样本时返回图连接的0，不标记关系头为已训练。Grab目标保留惩罚仍只判断Grab自身筛选是否漏掉目标，不把后续Top-64筛选造成的遗漏归罪于Grab。
 
 新头复用原`loss_refer`字段，不增加独立loss。原检测分类/L1/GIoU、伪框读取、filter和mask逻辑不改。`allbbox`、`refer`等权重沿用运行配置，不因开启模块自动改变；不同配置的检测权重可能不同，对照实验应主动检查。损失中的`L_det`指已经乘过原权重的检测损失。
 
-特征和文本正常回传，定位BCE可优化新头、BCEM及前级共享网络。坐标、前景分数、NMS/KNN和几何停止梯度；不直接通过几何分支优化预测框，但特征联合训练仍可能间接改变未来检测结果。
+特征和文本正常回传，定位BCE可优化新头、BCEM及前级共享网络。坐标、前景排序、离散KNN和几何停止梯度；不直接通过几何分支优化预测框，但特征联合训练仍可能间接改变未来检测结果。
 
 “不回写特征”仅指前向中不原位修改候选库，不是切断所有前级梯度。正确性统计头仍是独立detach分支，仅观察当前新头选出的Top-1，不干预排序；其概率应在新模型上重新校准评估。
 
@@ -167,31 +177,52 @@ L=L_{det}+L_{refer}+\text{原开关启用的其他损失}.$$
 
 | 对象 | 默认形状 | 目的 |
 |---|---|---|
-| 候选/框/检测分类 | B×N×256 / B×N×4 / B×N×2 | 同索引原检测输出 |
-| 邻居索引及有效mask | B×N×6 | 只组织上下文，不删目标候选 |
-| 相对几何 | B×N×6×5 | 绑定邻居语义与位置 |
-| 配对表示 | 概念B×N×6×256 | 实际逐chunk生成 |
+| 原检测候选/框/检测分类 | B×256×256 / B×256×4 / B×256×2 | AerialSense原候选数128；检测监督不筛选 |
+| 筛选后特征/框/类别 | B×64×256 / B×64×4 / B×64×2 | 数量不足时为M=min(64,N) |
+| 邻居索引及有效mask | B×M×6 | 局部索引属于保留池 |
+| 相对几何 | B×M×6×5 | 绑定邻居语义与位置 |
+| 配对表示 | 概念B×M×6×256 | 每图沿M×6分块，保留B维 |
 | 完整文本 | B×L×256 | 最大长度通常64 |
-| 配对得分/聚合权重 | B×N×6 | 六个独立配对 |
-| 最终logit/概率 | B×N×1 | 全部候选参与排名 |
-| 聚合文本注意力 | B×N×L | 仅诊断显示 |
+| 每层文本Key/Value | B×8×L×32 | 所有配对共享，不按配对复制 |
+| 每块注意力矩阵 | B×8×P×L | P≤chunk_size，只沿文本维softmax |
+| 配对得分/聚合权重 | B×M×6 | 六个独立配对 |
+| 最终logit/概率 | B×M×1 | 只有保留候选参与排名 |
+| 聚合文本注意力 | B×M×L | 仅诊断显示 |
 
-上下文选择每batch仅将小量框和检测前景分数传CPU，执行贪心去重与KNN，再把索引、几何传回原设备；不转移候选特征和文本。这样避免每个NMS迭代都做CUDA标量同步，但仍有一次主机同步和O(BN²)几何开销，必须实际测速。
+Top-K在原设备执行；随后每batch仅将小量保留框和检测前景分数传CPU，执行严格贪心KNN，再把索引、几何传回原设备；不转移候选特征和文本。这样避免逐候选CUDA标量同步，但仍有一次主机同步和O(BM²)几何矩阵及贪心遍历开销，必须实际测速。
 
-每层文本Key/Value只按B幅图投影一次，并在配对chunk中复用；不把完整文本为BNK组反复线性投影。默认chunk_size=256是**配对数**，不是每图候选数。N=256、K=6时每图1536组配对，不重新运行BEiT-3或检测器。
+### 8.1 共享文本K/V的批量成对注意力
+
+**目的：** 去掉相同文本按每个配对复制的显存、访存及反向索引累加开销，不改变任何配对的文本读取规则。
+
+每层文本Key/Value只按B幅图投影一次，保持B×heads×L×head_dim形状。当前块的配对Query保持B×heads×P×head_dim，通过批量矩阵乘法计算QKᵀ，再与同一份Value相乘。不再使用旧实现的`memory[owners]`将文本展开为每个配对一份。
+
+softmax只在L个文本位置上进行；图像之间、配对之间没有注意力交互。原来的两层交叉注意力、padding处理、残差LayerNorm、FFN、匹配头及权重头均保留。这里是多个独立查询共享内存，不是新增候选集合自注意力。
+
+### 8.2 沿每图配对维度分块
+
+**目的：** 保留batch并行度，减少小算子调用，不减少参与评分的候选或邻居。
+
+`chunk_size=256`表示**每幅图每块最多256个配对**，不是候选数，也不是整个batch合计256对。原256候选、K=6时每图1536组配对，需要6块；前景Top-64后每图384组配对，仅需2块，两层交互共4次调用。共享文本K/V及batch并行的优化继续保留。
+
+配对特征按B×M×K的顺序组织，分块后沿每图配对维拼回，再恢复为B×M×K。邻居不足的补齐项仍计算后屏蔽，未做稀疏跳过优化；不重新运行BEiT-3或检测器。该优化只减少关系头处理量，不减少原检测器或BCEM的前向计算。
 
 分块降低单次临时张量，但不消除训练时所有配对的反向图。训练dropout使不同chunk设置可能消耗不同随机数；评估或dropout=0时应保持预测和梯度的数值一致性。不承诺开启后速度/显存与原CRS相同。
 
 ## 9 配置、训练与旧模型兼容
 
-两份配置`configs/aerialvg/PropVG-aerialvg.py`和`configs/aerialsense/PropVG-aerialsense.py`均增加默认关闭的开关：
+两份配置`configs/aerialvg/PropVG-aerialvg.py`和`configs/aerialsense/PropVG-aerialsense.py`均提供以下开关。关系头构造器缺省关闭；示例仅展示配置方法，不改变用户已选模块开关：
 
 ```python
 enable_relation_scoring = False  # True replaces CRS; missing flag also means False.
 relation_neighbors = 6
+relation_foreground_topk = 64
+relation_strict_disjoint_neighbors = True
 # model.head 中：
 enable_relation_scoring=enable_relation_scoring,
 relation_scoring=dict(num_neighbors=relation_neighbors, model_dim=256,
+                      foreground_topk=relation_foreground_topk,
+                      strict_disjoint_neighbors=relation_strict_disjoint_neighbors,
                       geometry_dim=64, num_heads=8, num_layers=2, ffn_dim=512,
                       dropout=0.1, duplicate_iou=0.8, chunk_size=256),
 ```
@@ -199,11 +230,13 @@ relation_scoring=dict(num_neighbors=relation_neighbors, model_dim=256,
 | 参数 | 默认 | 含义 |
 |---|---:|---|
 | num_neighbors | 6 | 每个目标假设的邻居上限，正整数 |
-| duplicate_iou | 0.8 | 上下文去重及排除目标近重复框 |
+| foreground_topk | 新配置64；构造器None | 前景保留数；None不筛目标，兼容旧配置 |
+| strict_disjoint_neighbors | 新配置True；构造器False | 严格零交叠贪心选邻；False用旧NMS/近重复策略 |
+| duplicate_iou | 0.8 | 仅旧策略的上下文去重及目标近重复排除阈值 |
 | model_dim / geometry_dim | 256 / 64 | 图文评分维度/几何编码维度 |
 | num_layers / num_heads / ffn_dim | 2 / 8 / 512 | 配对文本读取结构 |
 | dropout | 0.1 | 新头训练正则，不影响旧头 |
-| chunk_size | 256 | 每次处理的配对数 |
+| chunk_size | 256 | 每幅图每块的配对数，batch并行处理 |
 | init_seed | 3717 | 独立CPU初始化种子，构造后恢复原RNG |
 
 仅打开关系头而不打开BCEM也可运行；若研究两个模块组合，单独设`enable_bcem=True`并保持原BCEM参数。Grab可开关，teacher可开关。第一版要求`enable_crv=False`，不把替换评分器与旧反事实重排混在一起；冲突会明确报错。旧CRV代码保留，关系开关关闭时不受影响。
@@ -221,7 +254,7 @@ CLI覆盖要改展开后的`model.head.*`，只覆盖顶层`relation_neighbors`�
 从头训练新实验保持原BEiT-3预训练设置，不加载PropVG整模型。从已有基线初始化则用`--finetune-from /原基线/top1_best.pth`，并清空冲突的resume/load；新头需要训练，不能把随机初始化当作已经训练的替代模型。
 
 ```bash
-python tools/eval_aerialvg.py /新实验目录/保存的配置.py \
+python tools/test_script/eval_aerialvg.py /新实验目录/保存的配置.py \
   --checkpoint /新实验目录/top1_best.pth --split test
 ```
 
@@ -229,14 +262,19 @@ python tools/eval_aerialvg.py /新实验目录/保存的配置.py \
 
 关系头注册schema和`trained_steps`。原训练循环在optimizer.step后标记训练步数，随完整checkpoint保存。测试会检查权重完整性、形状、版本及训练状态；旧基线误开新头会报错，新关系模型误关开关也会报错，不能静默换成未训练的CRS。新模型测试应使用原保存配置，K、去重阈值等改变会改变实验设置，即使权重形状不变。
 
+本次新策略不增加、删除或重命名参数及buffer，`schema_version`仍为1，旧关系头权重可以严格加载。但行为由配置控制：旧存档没有这两个新字段，默认`foreground_topk=None, strict_disjoint_neighbors=False`，仍为全部目标候选、上下文NMS和旧选邻；新配置为64/True，属于新的实验策略，不能声称复现旧实验。恢复旧关系行为可显式设为None/False。关闭`enable_relation_scoring`时两项均不执行，原CRS、其他模块和用户checkpoint文件不改。训练/评估请使用相同实验保存配置，避免无形状变化的策略差异。
+
 ## 10 诊断、验证与消融
 
-`extra_dict`新增：`relation_neighbor_indices`、`relation_neighbor_valid`、`relation_geometry`、`relation_context_kept`、`relation_candidate_valid`、`relation_fallback`、`relation_effective_mask`、`relation_pair_logits`、`relation_weights`，均detach仅供诊断。`attn_map_query`保存以同一邻居权重聚合的最后一层文本注意力，不伪装成原CRS的三层注意力。
+`extra_dict`包含：`relation_neighbor_indices`、`relation_neighbor_valid`、`relation_geometry`、`relation_context_kept`、`relation_candidate_valid`、`relation_fallback`、`relation_effective_mask`、`relation_pair_logits`、`relation_weights`，均detach仅供诊断。前景筛选还提供`relation_candidate_indices`（筛选前绑定池索引）与`relation_detector_indices`（合成Grab映射后的原DETR槽位）；邻居索引是筛选后局部索引，不能混用。`attn_map_query`保存以同一邻居权重聚合的最后一层文本注意力，不伪装成原CRS的三层注意力。
+
+新增训练日志：`relation_candidates`为评分槽位数，`relation_neighbor_count`为平均真实邻居数，`relation_fallback_rate`为空邻域比例，`relation_refer_skipped`为本卡定位BCE跳过比例（多卡日志平均），`relation_refer_valid_samples`为全卡可训练样本总数。它们只用于监控，不加到loss。
 
 检查命令：
 
 ```bash
-PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_scoring.py'
+PYTHONWARNINGS=ignore python -m unittest discover -s tools/test_script -p 'test_relation_scoring.py'
+PYTHONWARNINGS=ignore python -m unittest discover -s tools/test_script -p 'test_relation_foreground_policy.py'
 ```
 
 测试覆盖上下文去重与保留所有目标、6近邻、方向/尺度/padding、缺少邻居、空文本/空候选、mask类型、权重聚合、邻居置换不变性、候选置换等变性、分块输出/梯度、文本投影复用、真实256候选维度、特征联合梯度及框坐标截断、完整REFHead、Grab/BCEM/正确性头组合、旧分支与随机数兼容、训练状态及checkpoint误用拒绝。
@@ -248,11 +286,27 @@ PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_sco
 - BCEM现有回归测试新增关闭独立统计头与关系头的显式设置，防止测试因用户当前配置启用尚未训练的统计头而误报；未放宽生产模型的加载检查。
 - 当前环境CUDA不可用，尚未进行真实数据GPU训练、AMP或多卡速度/显存验证，也没有精度提升结论；用户原有实验、数据和checkpoint未因验证而改写。
 
+### 10.2 共享K/V与batch分块优化验证（2026-11-02）
+
+- 关系头测试由19项增加至23项，连同上述相关回归共178项CPU测试通过。新增检查包括旧复制式注意力与新共享式注意力的输出/梯度一致性、图像和配对之间没有信息混入、每块保留batch轴且共享同一文本内存，以及反向图不保存按配对展开的文本K/V。
+- 另直接加载优化前Git HEAD中的完整评分头实现，使用相同权重对比概率、logit、文本注意力及全部诊断字段，数值一致性检查通过；旧训练状态和Adam optimizer状态恢复后，下一步更新也通过数值一致性检查。检查关闭dropout，允许浮点舍入误差，并非保证GPU训练逐位相同。
+- 原CRS/BCEM/Grab/CRV等回归测试显式关闭关系头以隔离原管线，不再随用户当前实验开关变化；没有为通过测试而修改实际训练配置的开关值。
+- 本次只实现第8.1、8.2节的等价计算优化，不改变CPU近邻选择，不减少候选、不跳过补齐配对、不改模型维度和损失。未停止或重启用户正在运行的训练；已启动进程通常仍运行其加载时的旧代码，使用新版需要自行重新启动或从已保存checkpoint恢复。
+- 当前无法访问CUDA，CPU合成测试不能作为真实GPU训练提速比例。实际每iter耗时和峰值显存需要在重启后的同batch、同配置训练中比较。
+
 优先比较：背景增强后的原CRS、仅当前候选的评分头、无几何配对、完整配对、打乱邻居特征与几何对应、自适应聚合对比硬max。仅更换邻居排列不应改变结果；打乱语义与位置的绑定则是不同实验。
+
+### 10.3 前景Top-64与严格选邻接入验证（2026-11-03）
+
+- 新增`tools/test_script/test_relation_foreground_policy.py`共11项测试，检查前景排序、无效框、严格选邻与诊断策略逐候选一致、微小交叠拒绝、特征梯度、标签/Grab索引对齐、原检测监督不变、遗漏正样本跳过、全遗漏时有限零损失、全局有效数归一化、训练标记以及Grab/BCEM/正确性头组合。连同关系头原23项及相关管线、评估、checkpoint、日志和诊断回归，共206项CPU测试通过。
+- 另运行真实两进程CPU/Gloo DDP测试：一张卡逻辑上没有可训练样本、另一张有2个时，归约后的参数梯度与单进程全局有效样本均值完全匹配；两进程均无有效样本时梯度为0，无通信挂起。这不等于验证了完整模型的多GPU训练性能。
+- 在编号3显卡上加载原第33 epoch关系模型checkpoint，使用新策略严格加载全部权重成功。在真实AerialVG **训练集**样本上完成batch=2前向和反向：原检测候选256、关系候选64，两样本均有保留正标签；损失有限，关系评分头、refer_adapter及BEiT-3都有非零梯度。
+- 同批图像移除GT后执行推理，每图输出64框；逐个目标验证其所有有效邻居与目标、邻居彼此均严格无交叠。该次训练加推理峰值分配显存约6.91 GiB，不代表其他batch、Grab/BCEM组合或正式训练显存。
+- 未执行optimizer更新、未保存/覆盖模型，也未启动正式训练。没有本策略训练后的精度、AMP或多GPU速度结论；请以新实验结果判断，而不是将旧模型的召回统计当成性能承诺。
 
 ## 11 需要验证的假设与局限
 
-1. 六近邻不能保证覆盖文本参考物；远处关系、重复框漏去重及背景候选仍可能造成失败。
+1. 六近邻不能保证覆盖文本参考物；前景Top-64可能删掉目标或参考物，严格零交叠也会排除真实重叠物体。目标召回高不等于参考物召回高，不保证性能提升。
 2. 独立成对读取加权平均没有显式联合证明多个参考条件同时成立；不要把它解释为完整场景逻辑推理。
 3. refer监督只给目标身份，不给邻居关系标签，网络可能忽略邻居/几何、退化为自身匹配，或者学习大小位置捷径。需要对应消融，而不只展示权重图。
 4. 权重可能过早集中、得分与采用系数可能相互适应；本版先不增加额外约束，观察训练及多随机种子结果再决定。
@@ -261,3 +315,61 @@ PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_sco
 7. 模块不依赖teacher不代表teacher对检测覆盖无影响；对照必须统一teacher及检测权重、候选数、BCEM、数据划分、图像尺寸和训练周期。
 8. 旧CRS文本pooler的历史实现本次不修改；关闭新头时保持原行为，而新头使用显式bool padding mask。新头收益不能在没有更细对照时全部归因于几何关系。
 9. 本实现完成不等于论文创新成立或性能提升；需实测精度、耗时、显存和配对绑定消融。验证范围及限制应以实际执行记录为准，不宣称未经运行的GPU/AMP/多卡结论。
+10. 从256个候选改成64个，BCE中的正负比例及均值分母发生变化，即使`refer`权重不改，训练动态也可能变化；定位正样本被筛掉的频率也应监测。跳过定位BCE不等于没有代价，未对这些样本凭GT补框以避免训练/推理不一致。
+
+## 12 已训练模型的成对评分可视化
+
+**目的：** 将实际最终Top-1、其选中的邻居和加权过程放在同一张图上，区分邻居未覆盖参考物、重复框、配对匹配错误或聚合采用错误。诊断不改变模型前向或权重。
+
+```bash
+CUDA_VISIBLE_DEVICES=3 PYTHONPATH=. python tools/visualize_relation_scoring.py \
+  /实验目录/保存的配置.py --checkpoint /实验目录/top1_best.pth \
+  --output-dir /实验目录/relation_visualization_test_100_seed6666 \
+  --split test --num-samples 100 --seed 6666 --device cuda:0
+```
+
+脚本按固定种子不放回随机抽样，不根据GT、模型分数或对错挑选样本。加载原保存配置和完整最佳checkpoint，通过只读forward hook读取关系头当次实际使用的框、邻居索引、配对logit及聚合权重，不另外选邻或重新评分。
+
+GT在送入模型前移除，仅保留在模型外计算IoU和绘图。全部框统一转换为原图xyxy像素：先按有效`img_shape`转换、裁剪和过滤退化框，再除以`scale_factor`；用标准后处理输出逐项校验，并将Top-1映射回过滤前正确的query slot，避免邻居索引错位。
+
+输出内容：
+
+- `index.html`：离线总览，可切换只看正确或错误样本。
+- `images/*.jpg`：完整描述、全图GT/Top-1/各邻居、每个邻居对应的配对logit、sigmoid及权重，以及六组局部放大。局部图可能不包含远处GT，以全图为准。
+- `predictions.jsonl`：原图坐标、实际query slot、5维几何及全部配对数字，便于复核。
+- `pairs.csv`：每个样本每个邻居一行，含权重和加权贡献。
+- `selection.json`、`summary.json`：固定样本索引、抽样设置及该子集指标，子集指标不代表完整test指标。
+
+绿色虚线为GT，红框为Top-1，N1到NK按距离由近至远排列。配对sigmoid并不是经过独立标注监督的关系概率；最终分数严格按`sigmoid(sum(alpha * pair_logit))`计算，不能把配对概率直接加权当作最终分数。query slot指实际传入关系评分器的局部候选槽位；启用Grab或前景Top-K时，不冒充筛选前DETR的原索引，需要原索引时使用第10节的显式映射。
+
+2026-11-03已在编号3显卡上完成`20261102_214540`的最佳模型（第33 epoch）的100个test样本可视化：随机子集Top-1正确50个、错误50个，Top-5为84%，box mIoU为43.72%。100张图片及600行配对记录校验通过；新增5项CPU测试覆盖坐标、退化框索引对齐、回退标记及图片/HTML渲染。本次没有修改训练/评估模型逻辑或checkpoint。
+
+## 13 用户确认的后续选邻约束及20样本诊断（2026-11-03）
+
+**历史诊断与当前状态：** 本节先记录独立诊断，随后已经将前景Top-64和严格选邻接入生产模型，当前行为以第2—9节为准。邻居不仅要与当前候选的IoU严格为0，所选邻居之间也必须两两IoU严格为0。仅排除IoU≥0.8的近重复框并不满足这个要求。选不满K个时，不允许拿重叠框或重复框强行补齐。
+
+最初在独立诊断脚本`tools/visualize_disjoint_neighbors.py`中演示此策略：保持原模型Top-1不变，以全部256个预测框为候选池，按有效缩放图像中的中心距离由近到远贪心选择，遇到与Top-1或任何已选邻居存在正面积交叠的框就跳过。用float64比较交集面积是否精确为0，不用宽松epsilon；边界/角点接触仍是零面积，允许保留。该阶段诊断不使用GT，不加置信度门槛，不沿用旧上下文NMS筛选。
+
+从前一次100个test样本中，以seed=6666不放回选择20个，输出左侧全部256候选、右侧原Top-1及新规则选出的邻居。两张单图分别保存在`all_candidates/`和`strict_neighbors/`，横向拼图保存在`combined/`，`index.html`提供浏览入口，`predictions.jsonl`保留全部256框、原评分、新邻居及零重叠校验数字。
+
+实际结果：20个样本均有256个有效候选，均选满6个新邻居；120个邻居与对应Top-1的IoU及邻居两两IoU全部为0。已对照前次记录校验原Top-1槽位未改变，新增4项CPU测试覆盖微小交叠拒绝、邻居两两约束、边界接触、距离坐标及横向拼图。新邻居未送入评分器重算，不把旧邻居的配对分数冒充新邻居分数，也不据此声称模型性能发生变化。
+
+### 13.1 先按检测前景置信度过滤，再严格选邻的对照
+
+2026-11-03在同样20个样本上追加`--foreground-threshold 0.5`诊断。置信度直接读取关系头输入所对应的DETR二分类logit，使用`softmax[...,0]`，不使用referring score，也不增加检测网络。
+
+只有`p_fg>=0.5`且坐标有效的框进入邻居池，再按距离与两两零交叠规则选至多6个。阈值只限制上下文，不删除原Top-1；没有低置信度回填，也不对新配对重新评分。0.5只是这次可视化对照阈值，不是已经确认的训练阈值。没有额外加入普通NMS、包含关系归组或定位质量头，因此不能声称已保证物体完整性。
+
+输出目录`foreground05_vs_disjoint_neighbors_test20_seed6666`：左图为过滤后的前景候选（query及`p_fg`标在框旁），右图为选出的邻居（同时列出`p_fg`、距离和IoU），两张单图及横向拼图均保留。原始全部256框、检测前景分数与文本定位分数分字段保存在`predictions.jsonl`。
+
+实际20图平均保留8.45个前景候选（范围3到15个），严格选邻共95个；12图选不满6个，其中1图没有合格邻居。全部95个所选框的`p_fg>=0.5`，与Top-1及其他所选邻居的IoU均为0；20个原Top-1与前次分析一致。诊断脚本测试为7项通过；该次诊断本身未修改训练模型、生产选邻规则或权重。
+
+### 13.2 完整test集的前景阈值与Top-K召回诊断
+
+`tools/analyze_foreground_recall.py`已在编号3显卡上以batch=8完成同一最佳模型的4723条test表达式统计。GT仅用于离线统计，不送入模型，不进行NMS或严格选邻；检测前景置信度不是referring score。原定位Top-1复现为53.8641%，box mIoU复现为47.1232%。
+
+候选命中定义为保留框中至少一个与该表达式原refer GT的IoU≥0.5。原256框共覆盖4513个目标（95.5537%），210个原本就未覆盖。全体召回率以4723为分母；条件保留率以4513为分母，二者不能混用。
+
+阈值0.5平均保留8.18框，目标总召回89.0747%，比原可覆盖目标少306个；阈值0.1平均保留17.10框，召回92.3566%；阈值0.01平均保留60.62框，召回94.1774%。按前景分数Top-32召回94.0292%（损失72个），Top-64召回94.7491%（损失38个，条件保留率99.1580%），Top-128召回95.1726%。条件保留率至少99%的最小K为55；这些都是本次test诊断结果，不是val选定的正式超参数。
+
+结果保存在本实验`foreground_recall_test_20261103/`，含报告、阈值/Top-K两条曲线、CSV、逐样本结果及可复用的原始预测统计；另提供IoU≥0.75的更严格框覆盖数据。目标召回不等于参考物召回，也不等于关系头的最终定位准确率；这里是旧模型上的离线诊断，不能保证新训练模型也有同样召回。新增5项数值单测通过。随后按用户要求选择Top-64接入生产代码；由于这项选择参考过test诊断，严格实验报告应披露此过程，不能把同一test再当作完全未触及的调参集。
