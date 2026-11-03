@@ -350,8 +350,8 @@ bcem_num_rays = 16
 检查入口：
 
 ```bash
-PYTHONPATH=. python tools/test_bcem.py
-PYTHONPATH=. python tools/test_bcem_ray.py
+PYTHONPATH=. python tools/test_script/test_bcem.py
+PYTHONPATH=. python tools/test_script/test_bcem_ray.py
 ```
 
 前者覆盖历史扇区、递归与 CRS 接入，后者覆盖线上四点坐标、零横向位移、非均匀径向间距、均值聚合、边界支持、射线数量、梯度、空输入、分块重计算及完整 head 的训练推理接口。性能评价仍需用相同数据、候选数量、训练设置及随机种子的独立训练实验完成。

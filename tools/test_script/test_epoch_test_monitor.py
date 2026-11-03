@@ -1,4 +1,9 @@
 """CPU regressions for optional epoch test logging without model selection."""
+if __package__:
+    from .. import _bootstrap  # noqa: F401
+else:
+    import tools._bootstrap as _bootstrap  # noqa: F401
+
 import ast
 import importlib.util
 import os
@@ -14,7 +19,7 @@ import numpy as np
 import torch
 from mmcv import Config
 # A vendored detectron2 also exposes a top-level `tools` package.
-spec = importlib.util.spec_from_file_location("propvg_training_runner_test", Path(__file__).with_name("train.py"))
+spec = importlib.util.spec_from_file_location("propvg_training_runner_test", _bootstrap.TOOLS_DIR / "train.py")
 runner = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runner)
 

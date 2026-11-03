@@ -1,12 +1,14 @@
 """CPU-only regressions for scene splitting and teacher reindexing."""
 
+if __package__:
+    from .. import _bootstrap  # noqa: F401
+else:
+    import tools._bootstrap as _bootstrap  # noqa: F401
+
 import copy
 import random
-import sys
 import unittest
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from split_aerialsense import (SOURCES, balanced_assignment, build_units,
                               make_payload, scene_key, serialize_payload)
 

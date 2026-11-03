@@ -1,5 +1,10 @@
 """CPU-only checks for the optional 10x refer-GT teacher area filter."""
 
+if __package__:
+    from .. import _bootstrap  # noqa: F401
+else:
+    import tools._bootstrap as _bootstrap  # noqa: F401
+
 import json
 import tempfile
 import unittest

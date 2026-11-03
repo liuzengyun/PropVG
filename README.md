@@ -129,7 +129,7 @@ bash tools/dist_train.sh [PATH_TO_CONFIG] [GPU_NUMBER]
 
 If you want to reproduce the result, download it and then run the following scripts:
 ```bash
-bash tools/dist_test.sh [PATH_TO_CONFIG] [GPU_NUMBER] --load-from [PATH_TO_CHECKPOINT_FILE]
+bash tools/test_script/dist_test.sh [PATH_TO_CONFIG] [GPU_NUMBER] --load-from [PATH_TO_CHECKPOINT_FILE]
 ```
 
 ### Models ZOO
@@ -149,37 +149,37 @@ We release the checkpoint and dataset annotation in the huggingface. [CHECKPOINT
 
 Reproduce the RefCOCO result using this script:
 ```bash
-bash tools/dist_test.sh configs/refcoco/PropVG-refcoco.py 1 --load-from /PATH/TO/PropVG-refcoco.pth --MTD_K 250
+bash tools/test_script/dist_test.sh configs/refcoco/PropVG-refcoco.py 1 --load-from /PATH/TO/PropVG-refcoco.pth --MTD_K 250
 ```
 
 Reproduce the RefCOCO+ result using this script:
 ```bash
-bash tools/dist_test.sh configs/refcoco/PropVG-refcoco+.py 1 --load-from /PATH/TO/PropVG-refcoco+.pth --MTD_K 250
+bash tools/test_script/dist_test.sh configs/refcoco/PropVG-refcoco+.py 1 --load-from /PATH/TO/PropVG-refcoco+.pth --MTD_K 250
 ```
 
 Reproduce the RefCOCOg result using this script:
 ```bash
-bash tools/dist_test.sh configs/refcoco/PropVG-refcocog.py 1 --load-from /PATH/TO/PropVG-refcoco.pth --MTD_K 250
+bash tools/test_script/dist_test.sh configs/refcoco/PropVG-refcocog.py 1 --load-from /PATH/TO/PropVG-refcoco.pth --MTD_K 250
 ```
 
 Reproduce the RefCOCO-Mix result using this script:
 ```bash
-bash tools/dist_test.sh configs/refcoco/PropVG-refcoco-mix.py 1 --load-from /PATH/TO/PropVG-refcoco-mix.pth --score-threshold 0.7 --MTD_K 250
+bash tools/test_script/dist_test.sh configs/refcoco/PropVG-refcoco-mix.py 1 --load-from /PATH/TO/PropVG-refcoco-mix.pth --score-threshold 0.7 --MTD_K 250
 ```
 
 Reproduce the gRefCOCO result using this script:
 ```bash
-bash tools/dist_test.sh configs/gres/PropVG-grefcoco.py 1 --load-from /PATH/TO/PropVG-grefcoco.pth  --score-threshold 0.7 --MTD_K 250
+bash tools/test_script/dist_test.sh configs/gres/PropVG-grefcoco.py 1 --load-from /PATH/TO/PropVG-grefcoco.pth  --score-threshold 0.7 --MTD_K 250
 ```
 
 Reproduce the Ref-ZOM result using this script:
 ```bash
-bash tools/dist_test.sh configs/refzom/PropVG-refzom.py 1 --load-from /PATH/TO/PropVG-refzom.pth --score-threshold 0.7 --MTD_K 100
+bash tools/test_script/dist_test.sh configs/refzom/PropVG-refzom.py 1 --load-from /PATH/TO/PropVG-refzom.pth --score-threshold 0.7 --MTD_K 100
 ```
 
 Reproduce the RRefCOCO result using this script:
 ```bash
-bash tools/dist_test.sh configs/rrefcoco/PropVG-rrefcoco.py 1 --load-from /PATH/TO/PropVG-rrefcoco.pth  --score-threshold 0.7 --MTD_K 100
+bash tools/test_script/dist_test.sh configs/rrefcoco/PropVG-rrefcoco.py 1 --load-from /PATH/TO/PropVG-rrefcoco.pth  --score-threshold 0.7 --MTD_K 100
 ```
 
 

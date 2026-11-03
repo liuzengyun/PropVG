@@ -11,7 +11,7 @@ from torch import nn
 
 
 class PairTextLayer(nn.Module):
-    """One pair token reads full text; project text K/V once per image/layer."""
+    """Independent pair queries share text K/V, keeping the image batch axis."""
     def __init__(self, dim, heads, ffn_dim, dropout):
         super().__init__()
         self.heads, self.head_dim = heads, dim // heads
@@ -30,16 +30,19 @@ class PairTextLayer(nn.Module):
         return (self.key(text + position).reshape(shape).transpose(1, 2),
                 self.value(text).reshape(shape).transpose(1, 2))
 
-    def forward(self, pair, owners, memory, text_valid):
-        q = self.query(pair).reshape(-1, self.heads, self.head_dim)
-        key, value = (item[owners] for item in memory)
-        valid = text_valid[owners]
-        logits = torch.einsum("shd,shld->shl", q, key) / math.sqrt(self.head_dim)
-        logits = logits.float().masked_fill(~valid[:, None], -torch.inf)
+    def forward(self, pair, memory, text_valid):
+        # pair: B,P,D; memory: B,H,L,D/H. Do not expand K/V to B*P
+        # copies: each image supplies one memory to all of its pair queries.
+        b, count, _ = pair.shape
+        q = self.query(pair).reshape(b, count, self.heads, self.head_dim).transpose(1, 2)
+        key, value = memory
+        logits = torch.matmul(q, key.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        valid = text_valid[:, None, None, :]
+        logits = logits.float().masked_fill(~valid, -torch.inf)
         # Empty text is finite and contributes no memory, not an artificial word.
-        logits = torch.where(valid.any(1)[:, None, None], logits, torch.zeros_like(logits))
-        weights = logits.softmax(-1).to(pair.dtype) * valid[:, None].to(pair.dtype)
-        context = torch.einsum("shl,shld->shd", self.attention_dropout(weights), value).flatten(1)
+        logits = torch.where(text_valid.any(-1)[:, None, None, None], logits, torch.zeros_like(logits))
+        weights = logits.softmax(-1).to(pair.dtype) * valid.to(pair.dtype)
+        context = torch.matmul(self.attention_dropout(weights), value).transpose(1, 2).reshape_as(pair)
         pair = self.norm1(pair + self.output_dropout(self.output(context)))
         return self.norm2(pair + self.ffn(pair)), weights.mean(1)
 
@@ -48,7 +51,8 @@ class CandidateRelationScorer(nn.Module):
     def __init__(self, hidden_channels=256, num_neighbors=6, model_dim=256,
                  geometry_dim=64, num_heads=8, num_layers=2, ffn_dim=512,
                  dropout=0.1, duplicate_iou=0.8, chunk_size=256,
-                 geometry_eps=1e-6, log_ratio_clip=5.0):
+                 geometry_eps=1e-6, log_ratio_clip=5.0,
+                 foreground_topk=None, strict_disjoint_neighbors=False):
         super().__init__()
         for name, value in dict(hidden_channels=hidden_channels, num_neighbors=num_neighbors,
                                 model_dim=model_dim, geometry_dim=geometry_dim, num_heads=num_heads,
@@ -61,6 +65,14 @@ class CandidateRelationScorer(nn.Module):
             raise ValueError("Invalid relation duplicate_iou/dropout")
         if not math.isfinite(geometry_eps) or geometry_eps <= 0 or not math.isfinite(log_ratio_clip) or log_ratio_clip <= 0:
             raise ValueError("Relation geometry numerical safeguards must be finite and positive")
+        if foreground_topk is not None and (isinstance(foreground_topk, bool)
+                                            or not isinstance(foreground_topk, int) or foreground_topk < 1):
+            raise ValueError("Relation foreground_topk must be None or a positive integer")
+        if not isinstance(strict_disjoint_neighbors, bool):
+            raise ValueError("Relation strict_disjoint_neighbors must be bool")
+        # Defaults intentionally retain the original policy for archived configs.
+        self.foreground_topk = foreground_topk
+        self.strict_disjoint_neighbors = strict_disjoint_neighbors
         self.num_neighbors, self.model_dim, self.chunk_size = num_neighbors, model_dim, chunk_size
         self.duplicate_iou, self.geometry_eps, self.log_ratio_clip = duplicate_iou, geometry_eps, log_ratio_clip
         self.visual = nn.Sequential(nn.LayerNorm(hidden_channels), nn.Linear(hidden_channels, model_dim))
@@ -80,11 +92,33 @@ class CandidateRelationScorer(nn.Module):
         self.register_buffer("trained_steps", torch.tensor(0, dtype=torch.long))
 
     @torch.no_grad()
-    def select_neighbors(self, boxes, classes, img_metas):
-        """One small CPU transfer, class-agnostic context NMS, then metric KNN.
+    def select_foreground_indices(self, boxes, classes):
+        """Select slots only; REFHead gathers tensors OUTSIDE no_grad.
 
-        Context NMS never removes a target hypothesis. CPU selection avoids a
-        CUDA-to-host scalar synchronization for every step of greedy NMS.
+        No GT or referring scores enter this decision. Invalid boxes rank last
+        and serve only as fixed-batch padding when fewer than K are valid;
+        normal box postprocessing removes them, as in the original pipeline.
+        """
+        if self.foreground_topk is None:
+            return None
+        if classes.shape != boxes.shape[:2] + (2,):
+            raise ValueError("Foreground selection needs aligned B,N,2 detector class logits")
+        raw = boxes.detach().float()
+        xyxy = torch.cat((raw[..., :2] - raw[..., 2:] / 2,
+                          raw[..., :2] + raw[..., 2:] / 2), -1).clamp(0, 1)
+        valid = torch.isfinite(raw).all(-1) & (xyxy[..., 2:] > xyxy[..., :2]).all(-1)
+        foreground = classes.detach().float().softmax(-1)[..., 0]
+        valid &= torch.isfinite(foreground)
+        order = foreground.masked_fill(~valid, -torch.inf).argsort(dim=1, descending=True, stable=True)
+        return order[:, :min(self.foreground_topk, boxes.shape[1])]
+
+    @torch.no_grad()
+    def select_neighbors(self, boxes, classes, img_metas):
+        """One CPU transfer, then strict disjoint KNN or archived context NMS.
+
+        This method only selects neighbors; target pruning is performed by
+        select_foreground_indices. CPU selection avoids per-candidate CUDA
+        scalar synchronization during greedy overlap checks.
         """
         b, n, _ = boxes.shape
         if classes.shape[:2] != (b, n) or classes.shape[-1] != 2 or len(img_metas) != b:
@@ -104,9 +138,15 @@ class CandidateRelationScorer(nn.Module):
                 continue
             finite = np.isfinite(raw).all(1)
             raw = np.where(np.isfinite(raw), raw, 0).astype(np.float64)
-            xyxy = np.concatenate((raw[:, :2] - raw[:, 2:4] / 2,
-                                   raw[:, :2] + raw[:, 2:4] / 2), 1).clip(0, 1)
-            xyxy *= np.array([width, height, width, height])
+            # New strict checks use the same float32 clipping/scaling as box
+            # postprocessing, then float64 areas (no overlap epsilon). Keep
+            # archived policy arithmetic unchanged for old-model evaluation.
+            dtype = np.float32 if self.strict_disjoint_neighbors else np.float64
+            coordinates = raw[:, :4].astype(dtype)
+            xyxy = np.concatenate((coordinates[:, :2] - coordinates[:, 2:4] / 2,
+                                   coordinates[:, :2] + coordinates[:, 2:4] / 2), 1).clip(0, 1)
+            xyxy *= np.array([width, height, width, height], dtype=dtype)
+            xyxy = xyxy.astype(np.float64)
             size, center = xyxy[:, 2:] - xyxy[:, :2], (xyxy[:, 2:] + xyxy[:, :2]) / 2
             valid = finite & (size > 0).all(1)
             candidate_valid[bi] = valid
@@ -114,21 +154,43 @@ class CandidateRelationScorer(nn.Module):
             intersection = np.maximum(hi - lo, 0).prod(-1)
             area = np.maximum(size, 0).prod(-1)
             iou = intersection / np.maximum(area[:, None] + area[None] - intersection, 1e-12)
-            suppressed = np.zeros(n, dtype=bool)
-            for index in np.argsort(-raw[:, 4], kind="stable"):
-                if valid[index] and not suppressed[index]:
-                    context_kept[bi, index] = True
-                    suppressed |= iou[index] >= self.duplicate_iou
+            if self.strict_disjoint_neighbors:
+                # No extra global NMS: each target greedily picks mutually
+                # disjoint neighbors from the already foreground-ranked pool.
+                context_kept[bi] = valid
+            else:
+                suppressed = np.zeros(n, dtype=bool)
+                for index in np.argsort(-raw[:, 4], kind="stable"):
+                    if valid[index] and not suppressed[index]:
+                        context_kept[bi, index] = True
+                        suppressed |= iou[index] >= self.duplicate_iou
             diagonal = math.hypot(width, height)
             displacement = (center[None] - center[:, None]) / diagonal  # neighbour minus centre
             distance = np.sqrt((displacement ** 2).sum(-1))
-            eligible = (context_kept[bi][None] & valid[:, None] & (iou < self.duplicate_iou)
-                        & ~np.eye(n, dtype=bool))
+            overlap_allowed = intersection == 0 if self.strict_disjoint_neighbors else iou < self.duplicate_iou
+            eligible = (context_kept[bi][None] & valid[:, None] & overlap_allowed & ~np.eye(n, dtype=bool))
             distances = np.where(eligible, distance, np.inf)
-            order = np.argsort(distances, axis=1, kind="stable")[:, :min(k, n)]
+            ranked = np.argsort(distances, axis=1, kind="stable")
+            if self.strict_disjoint_neighbors:
+                order = np.zeros((n, min(k, n)), dtype=np.int64)
+                kept = np.zeros(order.shape, dtype=bool)
+                for target in range(n):
+                    selected = []
+                    for candidate in ranked[target]:
+                        if not np.isfinite(distances[target, candidate]):
+                            break
+                        if selected and np.any(intersection[candidate, selected] > 0):
+                            continue
+                        selected.append(int(candidate))
+                        if len(selected) == k:
+                            break
+                    order[target, :len(selected)] = selected
+                    kept[target, :len(selected)] = True
+            else:
+                order = ranked[:, :min(k, n)]
+                kept = np.isfinite(distances[np.arange(n)[:, None], order])
             length = order.shape[1]
             rows = np.arange(n)[:, None]
-            kept = np.isfinite(distances[rows, order])
             indices[bi, :, :length] = np.where(kept, order, -1)
             neighbor_valid[bi, :, :length] = kept
             normalized_size = np.maximum(size, 0) / diagonal
@@ -168,31 +230,33 @@ class CandidateRelationScorer(nn.Module):
         language = language * text_valid[..., None].to(language.dtype)
         positions = self.text_positions(text.shape[1], self.model_dim, language)
         memories = [layer.prepare_memory(language, positions) for layer in self.layers]
-        total = b * n * self.num_neighbors
+        # Chunk along each image's N*K pairs, not across a flattened B*N*K.
+        # A chunk contains B independent groups sharing their own text memory.
+        pairs_per_image = n * self.num_neighbors
         pair_scores, pair_weights, pair_attention = [], [], []
-        flat_indices = selection["neighbor_indices"].reshape(-1)
-        flat_valid = valid.reshape(-1)
-        flat_geometry = selection["geometry"].reshape(-1, 5).to(projected)
-        for start in range(0, total, self.chunk_size):
-            end = min(total, start + self.chunk_size)
+        flat_indices = selection["neighbor_indices"].reshape(b, pairs_per_image)
+        flat_valid = valid.reshape(b, pairs_per_image)
+        flat_geometry = selection["geometry"].reshape(b, pairs_per_image, 5).to(projected)
+        batch_indices = torch.arange(b, device=queries.device)[:, None]
+        for start in range(0, pairs_per_image, self.chunk_size):
+            end = min(pairs_per_image, start + self.chunk_size)
             flat = torch.arange(start, end, device=queries.device)
-            owners = flat // (n * self.num_neighbors)
-            centers = (flat // self.num_neighbors) % n
-            target = projected[owners, centers]
-            neighbor = projected[owners, flat_indices[start:end].clamp(min=0)]
-            neighbor = torch.where(flat_valid[start:end, None], neighbor, torch.zeros_like(neighbor))
-            geometry = self.geometry(flat_geometry[start:end])
+            centers = flat // self.num_neighbors
+            target = projected[:, centers]
+            neighbor = projected[batch_indices, flat_indices[:, start:end].clamp(min=0)]
+            neighbor = torch.where(flat_valid[:, start:end, None], neighbor, torch.zeros_like(neighbor))
+            geometry = self.geometry(flat_geometry[:, start:end])
             pair = self.pair(torch.cat((target, neighbor, neighbor - target, geometry), -1))
             for layer, memory in zip(self.layers, memories):
-                pair, attention = layer(pair, owners, memory, text_valid)
+                pair, attention = layer(pair, memory, text_valid)
             pair_scores.append(self.score(pair).squeeze(-1))
             pair_weights.append(self.weight(pair).squeeze(-1))
             pair_attention.append(attention.detach())
         shape = (b, n, self.num_neighbors)
-        if total:
-            scores = torch.cat(pair_scores).reshape(shape)
-            weight_logits = torch.cat(pair_weights).reshape(shape)
-            attention = torch.cat(pair_attention).reshape(*shape, text.shape[1])
+        if pairs_per_image:
+            scores = torch.cat(pair_scores, dim=1).reshape(shape)
+            weight_logits = torch.cat(pair_weights, dim=1).reshape(shape)
+            attention = torch.cat(pair_attention, dim=1).reshape(*shape, text.shape[1])
         else:
             scores = projected.new_zeros(shape)
             weight_logits = projected.new_zeros(shape)
