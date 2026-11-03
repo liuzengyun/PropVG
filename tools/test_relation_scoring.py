@@ -1,9 +1,4 @@
 """CPU regressions: pair scoring, geometry, gradients and legacy isolation."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
 import math
 import os

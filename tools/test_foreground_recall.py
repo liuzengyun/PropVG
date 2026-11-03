@@ -1,9 +1,4 @@
 """Toy-data checks for foreground proposal recall (not grounding accuracy)."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import unittest
 
 import numpy as np

@@ -1,9 +1,4 @@
 """Regression tests for foreground Top-K, strict KNN, aligned labels and DDP loss."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
 import unittest
 from unittest.mock import patch

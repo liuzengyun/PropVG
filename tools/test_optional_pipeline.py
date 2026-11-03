@@ -1,9 +1,4 @@
 """CPU regressions for optional branches and candidate/score alignment."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
 import importlib
 import os

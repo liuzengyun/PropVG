@@ -254,7 +254,7 @@ CLI覆盖要改展开后的`model.head.*`，只覆盖顶层`relation_neighbors`�
 从头训练新实验保持原BEiT-3预训练设置，不加载PropVG整模型。从已有基线初始化则用`--finetune-from /原基线/top1_best.pth`，并清空冲突的resume/load；新头需要训练，不能把随机初始化当作已经训练的替代模型。
 
 ```bash
-python tools/test_script/eval_aerialvg.py /新实验目录/保存的配置.py \
+python tools/eval_aerialvg.py /新实验目录/保存的配置.py \
   --checkpoint /新实验目录/top1_best.pth --split test
 ```
 
@@ -273,8 +273,8 @@ python tools/test_script/eval_aerialvg.py /新实验目录/保存的配置.py \
 检查命令：
 
 ```bash
-PYTHONWARNINGS=ignore python -m unittest discover -s tools/test_script -p 'test_relation_scoring.py'
-PYTHONWARNINGS=ignore python -m unittest discover -s tools/test_script -p 'test_relation_foreground_policy.py'
+PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_scoring.py'
+PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_foreground_policy.py'
 ```
 
 测试覆盖上下文去重与保留所有目标、6近邻、方向/尺度/padding、缺少邻居、空文本/空候选、mask类型、权重聚合、邻居置换不变性、候选置换等变性、分块输出/梯度、文本投影复用、真实256候选维度、特征联合梯度及框坐标截断、完整REFHead、Grab/BCEM/正确性头组合、旧分支与随机数兼容、训练状态及checkpoint误用拒绝。
@@ -298,7 +298,7 @@ PYTHONWARNINGS=ignore python -m unittest discover -s tools/test_script -p 'test_
 
 ### 10.3 前景Top-64与严格选邻接入验证（2026-11-03）
 
-- 新增`tools/test_script/test_relation_foreground_policy.py`共11项测试，检查前景排序、无效框、严格选邻与诊断策略逐候选一致、微小交叠拒绝、特征梯度、标签/Grab索引对齐、原检测监督不变、遗漏正样本跳过、全遗漏时有限零损失、全局有效数归一化、训练标记以及Grab/BCEM/正确性头组合。连同关系头原23项及相关管线、评估、checkpoint、日志和诊断回归，共206项CPU测试通过。
+- 新增`tools/test_relation_foreground_policy.py`共11项测试，检查前景排序、无效框、严格选邻与诊断策略逐候选一致、微小交叠拒绝、特征梯度、标签/Grab索引对齐、原检测监督不变、遗漏正样本跳过、全遗漏时有限零损失、全局有效数归一化、训练标记以及Grab/BCEM/正确性头组合。连同关系头原23项及相关管线、评估、checkpoint、日志和诊断回归，共206项CPU测试通过。
 - 另运行真实两进程CPU/Gloo DDP测试：一张卡逻辑上没有可训练样本、另一张有2个时，归约后的参数梯度与单进程全局有效样本均值完全匹配；两进程均无有效样本时梯度为0，无通信挂起。这不等于验证了完整模型的多GPU训练性能。
 - 在编号3显卡上加载原第33 epoch关系模型checkpoint，使用新策略严格加载全部权重成功。在真实AerialVG **训练集**样本上完成batch=2前向和反向：原检测候选256、关系候选64，两样本均有保留正标签；损失有限，关系评分头、refer_adapter及BEiT-3都有非零梯度。
 - 同批图像移除GT后执行推理，每图输出64框；逐个目标验证其所有有效邻居与目标、邻居彼此均严格无交叠。该次训练加推理峰值分配显存约6.91 GiB，不代表其他batch、Grab/BCEM组合或正式训练显存。

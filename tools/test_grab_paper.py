@@ -1,9 +1,4 @@
 """CPU checks for detailed GrabVG binding and its Grab-only filtering loss."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
 import math
 import os

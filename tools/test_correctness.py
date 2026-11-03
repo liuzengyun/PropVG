@@ -1,9 +1,4 @@
 """CPU regressions for detached correctness estimation and legacy compatibility."""
-if __package__:
-    from .. import _bootstrap  # noqa: F401
-else:
-    import tools._bootstrap as _bootstrap  # noqa: F401
-
 import copy
 import importlib.util
 import math
