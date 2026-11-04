@@ -52,23 +52,27 @@ enable_grab=False
 enable_mask = False
 # Optional observational Top-1 correctness head; never changes boxes/ranking.
 # False (or absent in old configs) preserves previous checkpoints/experiments.
-enable_correctness = True
+enable_correctness = False
 correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
                    loss_weight=1.0, decision_threshold=0.5)
-# Independent post-CRS refinement. False preserves the previous experiment.
+
+# 基于反事实推理的候选重排序模块，放在CRS之后，增强候选的语义区分能力。
 enable_crv = False
 crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
 crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
 crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
-# Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = False
+
 # Replace CRS after optional background enhancement; False preserves old models.
 enable_relation_scoring = True
 relation_neighbors = 6
+relation_aggregation = "max"  # "adaptive": learned weighting; "max": highest valid pair logit.
 relation_foreground_topk = 64  # Keep detector's num_queries=256; prune only before relation scoring.
 relation_strict_disjoint_neighbors = True
-# New experiments sample four points per stage directly on each ray.
+
+# 背景信息嵌入的候选增强模块
+# Candidate background enhancement before CRS; disable for the PropVG baseline.
+enable_bcem = False
 bcem_sampling_mode = "ray"
 bcem_num_rays = 8
 # Used only by sector mode; 8 reproduces the original direction order.
@@ -135,6 +139,7 @@ model = dict(
               enable_relation_scoring=enable_relation_scoring,
               # chunk_size counts pairs PER IMAGE; all images share the batch axis.
               relation_scoring=dict(num_neighbors=relation_neighbors,
+                                    aggregation=relation_aggregation,
                                     foreground_topk=relation_foreground_topk,
                                     strict_disjoint_neighbors=relation_strict_disjoint_neighbors,
                                     model_dim=256, geometry_dim=64,

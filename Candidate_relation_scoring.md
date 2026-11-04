@@ -1,8 +1,8 @@
-# 候选中心成对关系评分与自适应证据聚合
+# 候选中心成对关系评分与证据聚合
 
 **模块名称：** 候选中心关系评分头（Candidate-Centred Relation Scorer）。
 
-**当前方案（2026-11-03）：** 检测器仍生成256个候选（AerialSense为128），关系头按检测前景置信度保留Top-64。每个保留候选独立作为目标假设，按距离贪心选择至多K=6个邻居，要求邻居与当前候选、邻居彼此均严格零面积交叠。将当前候选、单个邻居、有方向的5维几何和完整文本送入共享配对网络，得到K个匹配logit及K个采用权重，最后加权形成该候选的定位logit。开启时替换CRS，不与CRS分数融合；关闭时仍使用原CRS，且不执行新增筛选。
+**当前方案（2026-11-04）：** 检测器仍生成256个候选（AerialSense为128），关系头按检测前景置信度保留Top-64。每个保留候选独立作为目标假设，按距离贪心选择至多K=6个邻居，要求邻居与当前候选、邻居彼此均严格零面积交叠。将当前候选、单个邻居、有方向的5维几何和完整文本送入共享配对网络，得到K个匹配logit。配置选择`adaptive`（默认，学习权重加权）或`max`（取有效配对最高logit），形成该候选的定位logit。开启时替换CRS，不与CRS分数融合；关闭时仍使用原CRS，且不执行新增筛选。
 
 代码：`propvg/models/heads/candidate_relation_scoring.py`。接入：`REFHead.py` 的 `_score_referring`。版本：`schema_version=1`。
 
@@ -18,7 +18,7 @@
 
 对每个候选j，依次以一个邻居i构成有方向的配对。评分问题是“以j为目标、i为上下文时，是否支持完整描述”，不是“j和i是否有关联”。共享评分器分别处理K组输入，邻居之间没有自注意力、图消息传递或多跳推理。
 
-因此本版不是“目标token加6个邻居token共同交互”，也不运行旧CRS来预选高分候选。每个候选对应K个成对logit，自适应聚合后再对所有候选排名。
+因此本版不是“目标token加6个邻居token共同交互”，也不运行旧CRS来预选高分候选。每个候选对应K个成对logit，按配置聚合后再对所有候选排名。
 
 ### 1.3 与背景增强的分工
 
@@ -47,8 +47,9 @@ BCEM从框外空间特征读取连续环境观测，并回写增强候选特征�
        ├─当前候选 + 一个邻居 + 5维相对几何 → 配对token
        ├─每对独立读取完整文本，两层交叉注意力+FFN
        ├─共享得分头 → K个匹配logit
-       ├─共享权重头 → K个采用logit → 有效邻居softmax
-       └─加权聚合 → 每个候选一个定位logit
+       ├─adaptive：共享权重头 → K个采用logit → 有效邻居softmax → 加权聚合
+       ├─max：仅在有效配对中取最高logit，不使用权重头的输出
+       └─每个候选一个定位logit
           → 训练：同步收集原refer标签；正样本被筛掉时跳过该样本定位BCE
           → 推理：仅保留的M个候选按新logit排序，最高分框作为结果
 
@@ -136,9 +137,11 @@ $$u_{ji}=P\left([v_j;v_i;v_i-v_j;\phi(r_{ji})]\right),$$
 
 文本Key加入一维正余弦位置编码，Value保留投影文本内容；padding不参与读取，整数mask先转bool。全padding或零长度文本使用有限的空读取，不从填充值获得证据。
 
-## 6 自适应聚合与最终定位
+## 6 可配置聚合与最终定位
 
-**目的：** 允许单一强证据或多个邻居共同参与，而不是硬max只更新一个分支。
+**目的：** 在不改变配对评分、选邻及监督的条件下，对照“多个邻居自适应共同参与”和“只采用最强关系证据”。默认`adaptive`保留历史行为，`max`需显式选择。训练与测试使用同一配置。
+
+### 6.1 adaptive：学习采用权重（默认）
 
 共享配对表示h_ji输出两路：
 
@@ -152,6 +155,16 @@ j^*=\arg\max_jS_j.$$
 聚合的是logit，不是sigmoid概率。上下文索引在特征gather时保持一一对应；交换邻居顺序应不改变最终分数。推理通过已有`ranking_priority`传递新logit，避免sigmoid饱和后并列导致排序精度丢失；关系头关闭时，原CRS分支的历史排序完全不改。
 
 权重是训练得到的采用系数，不是“邻居确为参考物”的监督概率，也不能仅凭高权重认定学到了真实关系。
+
+### 6.2 max：选择最强有效配对
+
+$$S_j=\max_{i\in\mathcal N_{\mathrm{eff}}(j)}s_{ji},\qquad p_j=\sigma(S_j).$$
+
+无效补齐槽位先置为负无穷，不能因分数较大而获选。没有真实邻居时，沿用原先的单个零上下文回退配对，保证输出有限。恰好并列时采用槽位顺序中的第一个最大值。
+
+诊断权重为获胜配对的one-hot，文本注意力也取该配对的注意力；不会显示与实际评分无关的自适应权重。`max`只通过获胜配对传回定位梯度，共享评分器仍被所有获胜配对训练；不能保证它比`adaptive`性能更高。
+
+**参数兼容目的：** 两种模式都保留同名、同形状、同注册顺序的权重头，不新增参数或buffer，`schema_version=1`不变。`max`不使用权重头输出，它的参数不产生梯度、不被当前优化器更新；原训练DDP已设置`find_unused_parameters=True`。自定义DDP入口也应保留该设置。不是给权重头额外添加零损失或伪监督。
 
 ## 7 损失与梯度边界
 
@@ -216,11 +229,13 @@ softmax只在L个文本位置上进行；图像之间、配对之间没有注意
 ```python
 enable_relation_scoring = False  # True replaces CRS; missing flag also means False.
 relation_neighbors = 6
+relation_aggregation = "adaptive"  # "adaptive" 或 "max"；旧配置缺省也是 adaptive。
 relation_foreground_topk = 64
 relation_strict_disjoint_neighbors = True
 # model.head 中：
 enable_relation_scoring=enable_relation_scoring,
 relation_scoring=dict(num_neighbors=relation_neighbors, model_dim=256,
+                      aggregation=relation_aggregation,
                       foreground_topk=relation_foreground_topk,
                       strict_disjoint_neighbors=relation_strict_disjoint_neighbors,
                       geometry_dim=64, num_heads=8, num_layers=2, ffn_dim=512,
@@ -230,6 +245,7 @@ relation_scoring=dict(num_neighbors=relation_neighbors, model_dim=256,
 | 参数 | 默认 | 含义 |
 |---|---:|---|
 | num_neighbors | 6 | 每个目标假设的邻居上限，正整数 |
+| aggregation | adaptive | adaptive学习加权；max取最高有效配对logit，训练/推理均生效 |
 | foreground_topk | 新配置64；构造器None | 前景保留数；None不筛目标，兼容旧配置 |
 | strict_disjoint_neighbors | 新配置True；构造器False | 严格零交叠贪心选邻；False用旧NMS/近重复策略 |
 | duplicate_iou | 0.8 | 仅旧策略的上下文去重及目标近重复排除阈值 |
@@ -249,7 +265,9 @@ python tools/train.py configs/aerialvg/PropVG-aerialvg.py \
   model.head.relation_scoring.num_neighbors=6 work_dir=work_dir/aerialvg/PropVG-relation
 ```
 
-CLI覆盖要改展开后的`model.head.*`，只覆盖顶层`relation_neighbors`不会自动重算配置中的引用。原多卡脚本也可使用：在它实际读取的配置里改开关和邻居数即可，脚本本身无需重写。
+CLI覆盖要改展开后的`model.head.*`，只覆盖顶层`relation_neighbors`或`relation_aggregation`不会自动重算配置中的引用。例如`--cfg-options model.head.relation_scoring.aggregation=max`。原多卡脚本也可使用：在它实际读取的配置里改开关、邻居数和聚合模式即可，脚本本身无需重写。
+
+聚合选择不改变损失数量及权重。旧关系模型及旧配置不含`aggregation`时仍按`adaptive`运行，旧CRS基线不受此参数影响。旧关系权重可严格加载到任一聚合模式，优化器参数布局也不变；这只说明格式兼容，不表示两种行为等价。用旧adaptive权重显式改为max是推理消融，公平训练比较应以相同设置分别训练；正常复现实验请使用该实验保存配置。模式保存在配置中，不编码到checkpoint参数，加载器不会自动识别或替换模式。
 
 从头训练新实验保持原BEiT-3预训练设置，不加载PropVG整模型。从已有基线初始化则用`--finetune-from /原基线/top1_best.pth`，并清空冲突的resume/load；新头需要训练，不能把随机初始化当作已经训练的替代模型。
 
@@ -275,9 +293,12 @@ python tools/eval_aerialvg.py /新实验目录/保存的配置.py \
 ```bash
 PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_scoring.py'
 PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_foreground_policy.py'
+PYTHONWARNINGS=ignore python -m unittest discover -s tools -p 'test_relation_aggregation.py'
 ```
 
 测试覆盖上下文去重与保留所有目标、6近邻、方向/尺度/padding、缺少邻居、空文本/空候选、mask类型、权重聚合、邻居置换不变性、候选置换等变性、分块输出/梯度、文本投影复用、真实256候选维度、特征联合梯度及框坐标截断、完整REFHead、Grab/BCEM/正确性头组合、旧分支与随机数兼容、训练状态及checkpoint误用拒绝。
+
+2026-11-04聚合开关验证：新增9项测试，覆盖默认adaptive等价性、无效槽位不能赢得max、获胜分支梯度、配套注意力、空候选/缺邻居回退、并列处理、分块一致性、旧state_dict/优化器布局及checkpoint检查、完整头训练/推理和可选模块组合。与关系评分、前景筛选、原可选管线、correctness、BCEM、Grab、CRV、checkpoint/日志及数据处理等相关回归合计230项CPU测试通过。另外直接读取修改前HEAD的评分器源码作对照：默认模式在eval和含dropout的train状态下，参数、初始化RNG、输出、诊断及参数梯度均逐位一致。此验证不是新模型正式训练或多卡实跑，不代表max已经取得性能提升。
 
 ### 10.1 本次实际验证记录（2026-11-02）
 

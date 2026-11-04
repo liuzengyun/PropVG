@@ -49,6 +49,7 @@ enable_grab = False
 # Optional pairwise relation scorer; False retains CRS.
 enable_relation_scoring = False
 relation_neighbors = 6
+relation_aggregation = "adaptive"  # "adaptive": learned weighting; "max": highest valid pair logit.
 relation_foreground_topk = 64  # Keep detector's num_queries=128; prune only before relation scoring.
 relation_strict_disjoint_neighbors = True
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
@@ -193,6 +194,7 @@ model = dict(
         enable_relation_scoring=enable_relation_scoring,
         # chunk_size counts pairs PER IMAGE; all images share the batch axis.
         relation_scoring=dict(num_neighbors=relation_neighbors,
+                              aggregation=relation_aggregation,
                               foreground_topk=relation_foreground_topk,
                               strict_disjoint_neighbors=relation_strict_disjoint_neighbors,
                               model_dim=256, geometry_dim=64,

@@ -52,7 +52,8 @@ class CandidateRelationScorer(nn.Module):
                  geometry_dim=64, num_heads=8, num_layers=2, ffn_dim=512,
                  dropout=0.1, duplicate_iou=0.8, chunk_size=256,
                  geometry_eps=1e-6, log_ratio_clip=5.0,
-                 foreground_topk=None, strict_disjoint_neighbors=False):
+                 foreground_topk=None, strict_disjoint_neighbors=False,
+                 aggregation="adaptive"):
         super().__init__()
         for name, value in dict(hidden_channels=hidden_channels, num_neighbors=num_neighbors,
                                 model_dim=model_dim, geometry_dim=geometry_dim, num_heads=num_heads,
@@ -70,7 +71,10 @@ class CandidateRelationScorer(nn.Module):
             raise ValueError("Relation foreground_topk must be None or a positive integer")
         if not isinstance(strict_disjoint_neighbors, bool):
             raise ValueError("Relation strict_disjoint_neighbors must be bool")
+        if aggregation not in ("adaptive", "max"):
+            raise ValueError("Relation aggregation must be 'adaptive' or 'max'")
         # Defaults intentionally retain the original policy for archived configs.
+        self.aggregation = aggregation
         self.foreground_topk = foreground_topk
         self.strict_disjoint_neighbors = strict_disjoint_neighbors
         self.num_neighbors, self.model_dim, self.chunk_size = num_neighbors, model_dim, chunk_size
@@ -261,8 +265,18 @@ class CandidateRelationScorer(nn.Module):
             scores = projected.new_zeros(shape)
             weight_logits = projected.new_zeros(shape)
             attention = projected.new_zeros(*shape, text.shape[1])
-        weights = weight_logits.float().masked_fill(~effective, -torch.inf).softmax(-1).to(scores.dtype)
-        logits = (weights * scores).sum(-1, keepdim=True)
+        if self.aggregation == "adaptive":
+            # Preserve the archived forward/gradient path exactly.
+            weights = weight_logits.float().masked_fill(~effective, -torch.inf).softmax(-1).to(scores.dtype)
+            logits = (weights * scores).sum(-1, keepdim=True)
+        else:
+            # Padding cannot win; an empty neighborhood has one effective
+            # zero-context pair. Only the winning pair receives score gradients.
+            logits, winner = scores.masked_fill(~effective, -torch.inf).max(-1, keepdim=True)
+            weights = torch.zeros_like(scores).scatter_(-1, winner, 1)
+            # Keep the adaptive weight head registered for old checkpoints and
+            # optimizer layouts. It is unused here (training DDP uses
+            # find_unused_parameters=True), rather than adding artificial loss.
         # Actual text attention aggregated with the same neighbour weights.
         text_attention = (weights.detach()[..., None] * attention).sum(2)
         details = {"relation_" + key: value.detach() for key, value in selection.items()}
