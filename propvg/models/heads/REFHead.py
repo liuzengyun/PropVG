@@ -29,7 +29,6 @@ from .optional_modules import build_optional_module
 from .counterfactual_refinement import CounterfactualRefinement
 from .background_context import BackgroundContextEnhancement
 from .top1_correctness import Top1CorrectnessHead
-from .candidate_relation_scoring import CandidateRelationScorer
 
 
 class GlobalCrossAttention(nn.Module):
@@ -450,6 +449,8 @@ class REFHead(nn.Module):
         crv=None,
         enable_correctness=False,
         correctness=None,
+        # Accept disabled settings in archived configs, without constructing
+        # the retired replacement head or consuming any random numbers.
         enable_relation_scoring=False,
         relation_scoring=None,
     ):
@@ -458,9 +459,8 @@ class REFHead(nn.Module):
         self.enable_mask = enable_mask
         self.enable_bcem = enable_bcem
         self.enable_crv = enable_crv
-        self.enable_relation_scoring = enable_relation_scoring
-        if enable_relation_scoring and enable_crv:
-            raise ValueError("First relation-scoring experiment replaces CRS; set enable_crv=False")
+        if enable_relation_scoring:
+            raise ValueError("Relation scoring has been removed; use the original CRS configuration")
         self._omitted_parameter_names = []
         self.seg_branch = build_optional_module(
             lambda: SegBranch(hidden_channels, upsample_rate=1), enable_mask,
@@ -550,10 +550,7 @@ class REFHead(nn.Module):
         self.query_embed = nn.Embedding(num_queries, hidden_channels)
         self.query_pos = nn.Embedding(num_queries, hidden_channels)
         self.refer_loss = nn.CrossEntropyLoss()
-        self.mrsm = build_optional_module(
-            lambda: CRS(hidden_channels), not enable_relation_scoring,
-            "mrsm", self._omitted_parameter_names,
-        )
+        self.mrsm = CRS(hidden_channels)
         # GrabVG-style language-conditioned local graph binding.  It refines
         # query features only; proposal boxes and the original PropVG losses
         # remain unchanged.
@@ -596,59 +593,12 @@ class REFHead(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(seed)
                 self.correctness = Top1CorrectnessHead(hidden_channels=hidden_channels, **options)
-        self.relation_scorer = None
-        if enable_relation_scoring:
-            options = dict(relation_scoring or {})
-            seed = int(options.pop("init_seed", 3717))
-            with torch.random.fork_rng(devices=[]):
-                torch.random.default_generator.manual_seed(seed)
-                self.relation_scorer = CandidateRelationScorer(hidden_channels=hidden_channels, **options)
 
-    def _score_referring(self, query, text, text_mask, boxes=None, classes=None, img_metas=None, extra_dict=None):
-        if self.relation_scorer is not None:
-            score, logits, attention, details = self.relation_scorer(query, boxes, text, text_mask, classes, img_metas)
-            if extra_dict is not None:
-                extra_dict.update(details)
-            return score, [attention], logits
+    def _score_referring(self, query, text, text_mask):
         if self.enable_crv or self.correctness is not None:
             return self.mrsm(query, text, text_mask, return_logits=True)
         score, attention = self.mrsm(query, text, text_mask)
         return score, attention, None
-
-    def _select_relation_candidates(self, queries, boxes, classes, source_indices, extra_dict):
-        if self.relation_scorer is None:
-            return queries, boxes, classes, None
-        indices = self.relation_scorer.select_foreground_indices(boxes, classes)
-        if indices is None:
-            return queries, boxes, classes, None
-        # Gather OUTSIDE no_grad so feature/text localization gradients survive.
-        gather = lambda tensor: tensor.gather(1, indices[..., None].expand(-1, -1, tensor.shape[-1]))
-        extra_dict["relation_candidate_indices"] = indices.detach()
-        extra_dict["relation_detector_indices"] = (source_indices.gather(1, indices)
-                                                   if source_indices is not None else indices).detach()
-        return gather(queries), gather(boxes), gather(classes), indices
-
-    def _pruned_relation_loss(self, logits, labels, original_labels, candidate_valid=None):
-        # A filtered-out referent is NOT a genuine all-negative expression.
-        # Keep exactly the same foreground Top-K rule in train and inference;
-        # do not inject GT into the candidate pool to rescue such samples.
-        if candidate_valid is None:
-            candidate_valid = torch.ones_like(labels, dtype=torch.bool)
-        active = (((original_labels.sum(1) == 0) | ((labels * candidate_valid).sum(1) > 0))
-                  & candidate_valid.any(1))
-        elementwise = F.binary_cross_entropy_with_logits(logits.squeeze(-1), labels, reduction="none")
-        per_sample = (elementwise * candidate_valid).sum(1) / candidate_valid.sum(1).clamp(min=1)
-        count = active.float().sum().detach().clone()
-        world_size = 1
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(count)
-            world_size = torch.distributed.get_world_size()
-        # DDP averages gradients; scale local sums to the GLOBAL valid mean.
-        # When every rank misses its referent, retain a graph-connected zero.
-        loss = (per_sample * active).sum() * world_size / count.clamp(min=1.0)
-        metrics = {"metric_relation_refer_valid_samples": count,
-                   "metric_relation_refer_skipped": (~active).float().mean().detach()}
-        return loss * self.loss_weight["refer"], metrics
 
     @staticmethod
     def _crv_refer_gt(targets, img_metas):
@@ -820,12 +770,8 @@ class REFHead(nn.Module):
             lan_feat, lan_mask, img_metas,
         )
         extra_dict.update(background_info)
-        refer_query_embed, bound_boxes, selected_classes, relation_indices = self._select_relation_candidates(
-            refer_query_embed, bound_boxes, selected_classes, selected_indices, extra_dict,
-        )
         refer_label, proposal_word_attnmap, refer_logits = self._score_referring(
-            refer_query_embed, lan_feat, lan_mask, boxes=bound_boxes, classes=selected_classes,
-            img_metas=img_metas, extra_dict=extra_dict,
+            refer_query_embed, lan_feat, lan_mask,
         )
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
@@ -840,27 +786,12 @@ class REFHead(nn.Module):
         # ! refer loss
         # prepare the target for referring
         target_gt_refer_full = self.prepare_referring_targets(indices_foreground[-1], refer_indices, self.num_queries)
-        target_gt_refer_bound = (
+        target_gt_refer = (
             target_gt_refer_full.gather(1, selected_indices) if self.enable_grab else target_gt_refer_full
         )
-        target_gt_refer = (target_gt_refer_bound.gather(1, relation_indices)
-                           if relation_indices is not None else target_gt_refer_bound)
-        relation_metrics = {}
-        if relation_indices is not None:
-            loss_refer, relation_metrics = self._pruned_relation_loss(
-                refer_logits, target_gt_refer, target_gt_refer_full, extra_dict["relation_candidate_valid"],
-            )
-            relation_metrics.update(
-                metric_relation_candidates=refer_logits.new_tensor(refer_logits.shape[1]).detach(),
-                metric_relation_neighbor_count=extra_dict["relation_neighbor_valid"].float().sum(-1).mean(),
-                metric_relation_fallback_rate=extra_dict["relation_fallback"].float().mean(),
-            )
-        elif self.relation_scorer is not None:
-            loss_refer = self.referloss(refer_logits.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
-        else:
-            loss_refer = (
-                F.binary_cross_entropy(refer_label.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
-            )
+        loss_refer = (
+            F.binary_cross_entropy(refer_label.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
+        )
 
         # ! seg loss
         loss_mask = seg_loss(pred_seg, target_mask, self.loss_weight["mask"]) if target_mask is not None else x.sum() * 0.0
@@ -873,9 +804,7 @@ class REFHead(nn.Module):
                     filter_target[bi, qind] = 1.0
             filter_bce = F.binary_cross_entropy_with_logits(filter_scores, filter_target)
             referred_exists = target_gt_refer_full.sum(1) > 0
-            # Grab's keep penalty concerns Grab pruning ONLY, not the later
-            # detector-confidence Top-K policy in the relation branch.
-            referred_kept = target_gt_refer_bound.sum(1) > 0
+            referred_kept = target_gt_refer.sum(1) > 0
             referred_logit = (filter_scores * target_gt_refer_full).sum(1) / target_gt_refer_full.sum(1).clamp(min=1.0)
             missing = referred_exists & (~referred_kept)
             # Paper Eq. 10: average only over pruned referents, not the batch.
@@ -898,10 +827,7 @@ class REFHead(nn.Module):
             "loss_refer": loss_refer,
             "loss_filter": loss_filter,
         }
-        loss_dict.update(relation_metrics)
-
-        # Preserve precision for the new head without changing legacy ranking.
-        ranking_priority = refer_logits if self.relation_scorer is not None else None
+        ranking_priority = None
         if self.enable_crv:
             refer_score, ranking_priority, crv_losses, crv_info = self.crv(
                 multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
@@ -1025,19 +951,13 @@ class REFHead(nn.Module):
             lan_feat, lan_mask, img_metas,
         )
         extra_dict.update(background_info)
-        refer_query_embed, bound_boxes, selected_classes, _ = self._select_relation_candidates(
-            refer_query_embed, bound_boxes, selected_classes, selected_indices, extra_dict,
-        )
-        if self.relation_scorer is not None:
-            self.relation_scorer.require_trained()
         refer_label, proposal_word_attnmap, refer_logits = self._score_referring(
-            refer_query_embed, lan_feat, lan_mask, boxes=bound_boxes, classes=selected_classes,
-            img_metas=img_metas, extra_dict=extra_dict,
+            refer_query_embed, lan_feat, lan_mask,
         )
         extra_dict["attn_map_query"] = proposal_word_attnmap[0]
         refer_score = refer_label
 
-        ranking_priority = refer_logits if self.relation_scorer is not None else None
+        ranking_priority = None
         if self.enable_crv:
             # No GT (including targets['bbox']) is read during inference.
             refer_score, ranking_priority, _, crv_info = self.crv(

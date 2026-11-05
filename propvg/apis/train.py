@@ -106,8 +106,6 @@ def train_model(epoch, cfg, model, optimizer, loader):
             for key in tuple(losses):
                 if key.startswith("metric_correctness_"):
                     correctness_values[key[len("metric_"):]] = losses.pop(key).detach()
-        relation_values = {key[len("metric_"):]: losses.pop(key).detach()
-                           for key in tuple(losses) if key.startswith("metric_relation_")}
         # loss = loss_det
         optimizer.zero_grad()
         if cfg.use_fp16:
@@ -121,13 +119,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
         if correctness_values and correctness_values["correctness_valid_samples"].item() > 0:
             base_model = model.module if hasattr(model, "module") else model
             base_model.head.correctness.mark_optimizer_step()
-        base_model = model.module if hasattr(model, "module") else model
-        relation_scorer = getattr(getattr(base_model, "head", None), "relation_scorer", None)
-        valid_relation_samples = relation_values.get("relation_refer_valid_samples")
-        if relation_scorer is not None and (valid_relation_samples is None or valid_relation_samples.item() > 0):
-            relation_scorer.mark_optimizer_step()
         crv_values.update(correctness_values)
-        crv_values.update(relation_values)
 
         if cfg.distributed:
             loss_det = reduce_mean(loss_det)

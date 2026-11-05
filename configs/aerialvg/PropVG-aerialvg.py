@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-RelationScoring"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-BASE"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -62,13 +62,6 @@ crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
 crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
 crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
-
-# Replace CRS after optional background enhancement; False preserves old models.
-enable_relation_scoring = True
-relation_neighbors = 6
-relation_aggregation = "max"  # "adaptive": learned weighting; "max": highest valid pair logit.
-relation_foreground_topk = 64  # Keep detector's num_queries=256; prune only before relation scoring.
-relation_strict_disjoint_neighbors = True
 
 # 背景信息嵌入的候选增强模块
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
@@ -136,15 +129,6 @@ model = dict(
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
-              enable_relation_scoring=enable_relation_scoring,
-              # chunk_size counts pairs PER IMAGE; all images share the batch axis.
-              relation_scoring=dict(num_neighbors=relation_neighbors,
-                                    aggregation=relation_aggregation,
-                                    foreground_topk=relation_foreground_topk,
-                                    strict_disjoint_neighbors=relation_strict_disjoint_neighbors,
-                                    model_dim=256, geometry_dim=64,
-                                    num_heads=8, num_layers=2, ffn_dim=512, dropout=0.1,
-                                    duplicate_iou=0.8, chunk_size=256),
               enable_correctness=enable_correctness, correctness=correctness,
               enable_crv=enable_crv,
               crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,

@@ -22,7 +22,24 @@ from tqdm import tqdm
 from propvg.datasets import build_dataset, build_dataloader, extract_data
 from propvg.models import build_model
 from propvg.utils import load_checkpoint
-from visualize_relation_scoring import pixel_boxes
+
+
+def pixel_boxes(normalized_cxcywh, meta):
+    """Use the evaluator's valid-image clipping BEFORE original-image rescale."""
+    boxes = normalized_cxcywh.detach().float().cpu()
+    xyxy = torch.cat((boxes[:, :2] - boxes[:, 2:] / 2,
+                      boxes[:, :2] + boxes[:, 2:] / 2), dim=-1)
+    height, width = meta['img_shape'][:2]
+    xyxy *= xyxy.new_tensor([width, height, width, height])
+    xyxy[:, 0::2].clamp_(min=0, max=width)
+    xyxy[:, 1::2].clamp_(min=0, max=height)
+    valid = (xyxy[:, 2:] > xyxy[:, :2]).all(-1)
+    scale = torch.as_tensor(meta['scale_factor'], dtype=xyxy.dtype).reshape(-1)
+    if scale.numel() == 1:
+        scale = scale.repeat(4)
+    if scale.numel() != 4 or not torch.isfinite(scale).all() or (scale <= 0).any():
+        raise ValueError('Expected positive scalar/four-element scale_factor')
+    return xyxy / scale, valid
 
 
 def proposal_ious(boxes, gt):
@@ -172,9 +189,6 @@ def save_report(output, meta, scores, boxes, gt, ious, valid, top1_queries, samp
     summary = dict(meta, samples=count, oracle=oracle,
                    grounding_top1_accuracy=100. * float((top1_ious >= .5).mean()),
                    grounding_top1_miou=100. * float(top1_ious.mean()),
-                   # Backward-compatible aliases for previous relation reports.
-                   relation_top1_accuracy=100. * float((top1_ious >= .5).mean()),
-                   relation_top1_miou=100. * float(top1_ious.mean()),
                    conditional_retention_milestones=milestones,
                    absolute_recall_milestones=absolute_milestones,
                    note='Proposal recall, NOT grounding Top-1 accuracy. No NMS, neighbor-IoU rules or confidence filters are applied inside the model. Test curves are descriptive, not a validation-selected operating point.')
@@ -245,9 +259,6 @@ def main():
     if (cfg.model.head.get('enable_grab', False) or cfg.model.head.get('enable_crv', False)
             or cfg.model.head.get('num_queries') != 256):
         raise ValueError('This analysis expects all 256 original proposals with Grab and CRV off')
-    if (cfg.model.head.get('enable_relation_scoring', False)
-            and cfg.model.head.get('relation_scoring', {}).get('foreground_topk') is not None):
-        raise ValueError('Use the archived unpruned config; foreground Top-K is measured OFFLINE only')
     if cfg.model.post_params.get('with_nms', False):
         raise ValueError('Proposal recall analysis requires the original non-NMS evaluation')
     cfg.distributed, cfg.rank, cfg.world_size = False, 0, 1
@@ -269,7 +280,7 @@ def main():
         captured.update(boxes=raw['pred_bbox_allobj'].detach().float().cpu().clone(),
                         foreground=raw['pred_class_allobj'].detach().float().softmax(-1)[..., 0].cpu())
         return outputs
-    # Observe the actual head result for either CRS or relation scoring. No
+    # Observe the actual CRS head result. No
     # parameters/features/scores are changed, and the method is restored below.
     # A plain wrapper is important here: Mock/patch side_effect records each
     # call's GPU feature tensors and can exhaust VRAM over a full split.
@@ -310,7 +321,7 @@ def main():
     ious = proposal_ious(boxes, gt)
     summary = save_report(output, dict(split=args.split, checkpoint=str(Path(args.checkpoint).resolve()),
                                       config=str(Path(args.config).resolve()), batch_size=args.batch_size,
-                                      scoring_head='relation' if model.head.relation_scorer is not None else 'CRS'),
+                                      scoring_head='CRS'),
                           scores, boxes, gt, ious, valid, queries, sample_metadata,
                           referring_priority=np.asarray(all_referring_priority))
     print('Grounding checks:', summary['grounding_top1_accuracy'], summary['grounding_top5_accuracy'], summary['grounding_top1_miou'])

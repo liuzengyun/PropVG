@@ -4,10 +4,28 @@ import unittest
 import numpy as np
 import torch
 
-from analyze_foreground_recall import proposal_ious, recall_curves, prediction_rank_priority
+from analyze_foreground_recall import proposal_ious, recall_curves, prediction_rank_priority, pixel_boxes
 
 
 class ForegroundRecallTests(unittest.TestCase):
+    def test_pixel_conversion_clips_before_rescaling_and_keeps_slots(self):
+        boxes = torch.tensor([[.5, .5, .5, .5], [1.2, .5, .1, .1], [0., .5, .5, 1.]])
+        meta = dict(img_shape=(80, 120), scale_factor=[2., 4., 2., 4.])
+        pixels, valid = pixel_boxes(boxes, meta)
+        torch.testing.assert_close(pixels, torch.tensor([[15., 5., 45., 15.],
+                                                        [60., 9., 60., 11.],
+                                                        [0., 0., 15., 20.]]))
+        self.assertEqual(valid.tolist(), [True, False, True])
+
+    def test_pixel_conversion_scalar_scale_and_invalid_scales(self):
+        boxes = torch.tensor([[.5, .5, 1., 1.]])
+        pixels, valid = pixel_boxes(boxes, dict(img_shape=(80, 120), scale_factor=2.))
+        torch.testing.assert_close(pixels, torch.tensor([[0., 0., 60., 40.]]))
+        self.assertTrue(valid.all())
+        for scale in (0., -1., float('nan'), [1., 2.]):
+            with self.subTest(scale=scale), self.assertRaisesRegex(ValueError, 'scale_factor'):
+                pixel_boxes(boxes, dict(img_shape=(80, 120), scale_factor=scale))
+
     def test_grounding_ranking_matches_legacy_and_logit_evaluator_with_filtered_slots(self):
         valid = torch.ones(40, dtype=torch.bool)
         valid[[3, 15]] = False

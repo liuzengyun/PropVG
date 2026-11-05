@@ -647,7 +647,6 @@ class CRVTests(unittest.TestCase):
     def test_head_forwards_epoch_and_validation_waits_for_crv_start(self):
         options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
         options.update(num_queries=8, enable_crv=True, enable_bcem=False, enable_grab=False, enable_correctness=False,
-                       enable_relation_scoring=False,
                        crv=dict(scorer_dim=16, scorer_heads=4, grid_size=4, topk=5, start_epoch=3))
         head = build_head(options)
         x = torch.randn(1, 768, 8, 8)
@@ -774,7 +773,6 @@ class CRVTests(unittest.TestCase):
     def test_full_head_base_rng_losses_gradients_and_updates_are_unchanged(self):
         options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
         options["enable_correctness"] = False
-        options["enable_relation_scoring"] = False
         options["num_queries"] = 8
         options["crv"] = dict(scorer_dim=16, scorer_heads=4, grid_size=4, topk=5)
         for with_context in (False, True):

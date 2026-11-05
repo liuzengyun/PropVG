@@ -52,25 +52,17 @@ def _validate_crv_checkpoint(model, state):
                          "To start CRV training from a baseline, use --finetune-from instead of --load-from/--resume-from.")
 
 
-def _validate_relation_checkpoint(model, state):
-    """Never evaluate a baseline with a random replacement scorer, or vice versa."""
+def _validate_crs_checkpoint(model, state):
+    """Do not fall back to random CRS weights when loading a task checkpoint."""
     base = model.module if hasattr(model, "module") else model
-    scorer = getattr(getattr(base, "head", None), "relation_scorer", None)
-    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
-    prefix = "head.relation_scorer."
+    scorer = getattr(getattr(base, "head", None), "mrsm", None)
     if scorer is None:
-        if any(key.startswith(prefix) for key in normalized):
-            raise ValueError("Checkpoint uses relation scoring; enable_relation_scoring must match its saved config. "
-                             "The replacement checkpoint has no trained CRS to silently fall back to.")
         return
-    expected = {prefix + key: value for key, value in scorer.state_dict().items()}
-    version, steps = normalized.get(prefix + "schema_version"), normalized.get(prefix + "trained_steps")
-    if (not expected.keys() <= normalized.keys() or version is None or int(version) != int(scorer.schema_version)
-            or steps is None or int(steps) <= 0
-            or any(normalized[key].shape != value.shape for key, value in expected.items() if key in normalized)):
-        raise ValueError("Enabled relation scoring requires a complete trained compatible checkpoint. "
-                         "To train the replacement from an old baseline use --finetune-from, "
-                         "not --load-from/--resume-from. For old-model testing disable enable_relation_scoring.")
+    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
+    expected = {"head.mrsm." + key for key in scorer.state_dict()}
+    if not expected.issubset(normalized):
+        raise ValueError("Checkpoint has incomplete CRS weights; it cannot be used for evaluation or resume. "
+                         "Use a compatible CRS checkpoint, or --finetune-from to initialize new training.")
 
 
 def _load_optimizer_state(model, optimizer, checkpoint, model_state):
@@ -219,7 +211,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
         state = de_parallel(state)
     _validate_crv_checkpoint(model, state)
     _validate_correctness_checkpoint(model, state)
-    _validate_relation_checkpoint(model, state)
+    _validate_crs_checkpoint(model, state)
     try:
         model.load_state_dict(state, strict=True)
     except:

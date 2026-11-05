@@ -14,7 +14,7 @@ from propvg.models import build_head
 from propvg.models.heads.grab_binding import GrabGraphBinding
 from propvg.models.det_seg.mix_ref_unimodel_OMG import MIXRefUniModel_OMG
 from propvg.apis.test import aerialvg_box_metrics
-from propvg.utils.checkpoint import _load_optimizer_state, _optimizer_parameter_names
+from propvg.utils.checkpoint import _load_optimizer_state, _optimizer_parameter_names, _validate_crs_checkpoint
 
 
 class OptionalPipelineTests(unittest.TestCase):
@@ -24,7 +24,6 @@ class OptionalPipelineTests(unittest.TestCase):
         cls.options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
         cls.options["enable_crv"] = False  # Keep baseline regressions independent of the user's run switch.
         cls.options["enable_correctness"] = False
-        cls.options["enable_relation_scoring"] = False  # Isolate the original CRS pipeline.
         # These regressions isolate legacy Grab/mask behavior from BCEM.
         cls.options["enable_bcem"] = False
         cls.options["num_queries"] = 8
@@ -109,6 +108,36 @@ class OptionalPipelineTests(unittest.TestCase):
             head.forward_train(x, target, **args)
         with self.assertRaisesRegex(ValueError, "enable_mask=True"):
             head.forward_test(x, targets=target, with_mask=True, **args)
+
+    def test_archived_disabled_replacement_options_preserve_crs_and_rng(self):
+        baseline = self.head(False, False)
+        baseline_rng = torch.get_rng_state().clone()
+        options = dict(self.options, enable_grab=False, enable_mask=False,
+                       enable_relation_scoring=False,
+                       relation_scoring=dict(num_neighbors=6, aggregation="max", foreground_topk=64))
+        torch.manual_seed(713)
+        archived = build_head(options)
+        torch.testing.assert_close(torch.get_rng_state(), baseline_rng, rtol=0, atol=0)
+        self.assertEqual(list(archived.state_dict()), list(baseline.state_dict()))
+        for name, value in archived.state_dict().items():
+            torch.testing.assert_close(value, baseline.state_dict()[name], rtol=0, atol=0)
+        self.assertIsNotNone(archived.mrsm)
+        with self.assertRaisesRegex(ValueError, "has been removed"):
+            build_head(dict(options, enable_relation_scoring=True))
+
+    def test_task_checkpoint_requires_complete_crs_including_ddp(self):
+        model = torch.nn.Module()
+        model.head = self.head(False, False)
+        state = model.state_dict()
+        _validate_crs_checkpoint(model, state)
+        _validate_crs_checkpoint(model, {"module." + key: value for key, value in state.items()})
+        incomplete = {key: value for key, value in state.items() if not key.startswith("head.mrsm.")}
+        with self.assertRaisesRegex(ValueError, "incomplete CRS"):
+            _validate_crs_checkpoint(model, incomplete)
+        missing_one = dict(state)
+        missing_one.pop(next(key for key in state if key.startswith("head.mrsm.")))
+        with self.assertRaisesRegex(ValueError, "incomplete CRS"):
+            _validate_crs_checkpoint(model, missing_one)
 
     def test_old_and_named_optimizer_resume_preserve_next_update(self):
         x, target, args = self.inputs()
