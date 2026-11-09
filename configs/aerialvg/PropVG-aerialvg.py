@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-BASE"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays-16"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -63,11 +63,27 @@ crv_grid_size = 48  # Pool complete original/intervened feature maps; no local c
 crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
+# CRS -> shared-reference relational refinement. Disabled preserves old models.
+# Train alongside CRS; independent of teacher/auxiliary GT; not with CRV.
+enable_relation_refinement = False
+relation_detach_inputs = True  # True: added final loss trains only stage 2; False: joint gradients.
+relation_target_topk = 32
+relation_reference_topk = 64  # Detector confidence Top-K FIRST, then duplicate removal.
+relation_refinement = dict(
+    target_topk=relation_target_topk, reference_topk=relation_reference_topk,
+    detach_inputs=relation_detach_inputs,
+    duplicate_iou=0.8, model_dim=128, num_heads=4,
+    prior_temperature=1.0, relation_temperature=1.0, prior_uniform_mix=0.2,
+    discriminability_floor=0.1, initial_strength=0.1, max_strength=2.0,
+    loss_weight=1.0, aggregation="competitive",
+    use_geometry=True, use_reference_semantics=True,
+)
+
 # 背景信息嵌入的候选增强模块
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = False
+enable_bcem = True
 bcem_sampling_mode = "ray"
-bcem_num_rays = 8
+bcem_num_rays = 16
 # Used only by sector mode; 8 reproduces the original direction order.
 bcem_num_sectors = 4
 
@@ -130,6 +146,8 @@ model = dict(
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_correctness=enable_correctness, correctness=correctness,
+              enable_relation_refinement=enable_relation_refinement,
+              relation_refinement=relation_refinement,
               enable_crv=enable_crv,
               crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
                        start_epoch=crv_start_epoch,

@@ -201,7 +201,7 @@ class BCEMRayTests(unittest.TestCase):
         options = copy.deepcopy(Config.fromfile('configs/aerialvg/PropVG-aerialvg.py').model.head)
         options['enable_crv'] = False  # This test covers BCEM, not post-CRS refinement.
         # Isolate BCEM even when the user's current config enables other heads.
-        options.update(enable_correctness=False)
+        options.update(enable_correctness=False, enable_relation_refinement=False)
         options.update(enable_bcem=True, num_queries=8)
         options['bcem'].update(sampling_mode='ray', num_rays=16, min_valid_points=2, context_dim=16)
         head = build_head(options)

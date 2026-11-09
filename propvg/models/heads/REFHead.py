@@ -29,6 +29,7 @@ from .optional_modules import build_optional_module
 from .counterfactual_refinement import CounterfactualRefinement
 from .background_context import BackgroundContextEnhancement
 from .top1_correctness import Top1CorrectnessHead
+from .two_stage_relation import TwoStageRelationRefinement
 
 
 class GlobalCrossAttention(nn.Module):
@@ -453,12 +454,16 @@ class REFHead(nn.Module):
         # the retired replacement head or consuming any random numbers.
         enable_relation_scoring=False,
         relation_scoring=None,
+        enable_relation_refinement=False,
+        relation_refinement=None,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
         self.enable_mask = enable_mask
         self.enable_bcem = enable_bcem
         self.enable_crv = enable_crv
+        if enable_relation_refinement and enable_crv:
+            raise ValueError("Use either two-stage relation refinement or CRV, not two sequential rerankers")
         if enable_relation_scoring:
             raise ValueError("Relation scoring has been removed; use the original CRS configuration")
         self._omitted_parameter_names = []
@@ -593,12 +598,34 @@ class REFHead(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(seed)
                 self.correctness = Top1CorrectnessHead(hidden_channels=hidden_channels, **options)
+        # No allocation/RNG draws when disabled. Enabling the new stage also
+        # preserves initialization of every existing branch and CPU/CUDA RNG.
+        self.relation_refiner = None
+        if enable_relation_refinement:
+            options = dict(relation_refinement or {})
+            seed = int(options.pop("init_seed", 4717))
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(seed)
+                self.relation_refiner = TwoStageRelationRefinement(hidden_channels=hidden_channels, **options)
 
     def _score_referring(self, query, text, text_mask):
-        if self.enable_crv or self.correctness is not None:
+        if self.enable_crv or self.correctness is not None or self.relation_refiner is not None:
             return self.mrsm(query, text, text_mask, return_logits=True)
         score, attention = self.mrsm(query, text, text_mask)
         return score, attention, None
+
+    def _refine_relations(self, queries, boxes, classes, text, text_mask, scores, logits,
+                          img_metas, decoder_queries, decoder_boxes, decoder_classes, source_indices):
+        # Grab filters TARGET hypotheses. References must still come from the
+        # original DETR pool, not the text-conditioned/pruned target pool.
+        reference_queries = self.refer_adapter(decoder_queries) if self.enable_grab else queries
+        return self.relation_refiner(
+            queries, boxes, classes, text, text_mask, scores, logits, img_metas,
+            reference_queries=reference_queries,
+            reference_boxes=decoder_boxes if self.enable_grab else boxes,
+            reference_classes=decoder_classes if self.enable_grab else classes,
+            source_indices=source_indices,
+        )
 
     @staticmethod
     def _crv_refer_gt(targets, img_metas):
@@ -828,6 +855,19 @@ class REFHead(nn.Module):
             "loss_filter": loss_filter,
         }
         ranking_priority = None
+        if self.relation_refiner is not None:
+            relation = self._refine_relations(
+                refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,
+                refer_label, refer_logits, img_metas, inter_states[-1], outputs_coord[-1],
+                outputs_class[-1], selected_indices,
+            )
+            refer_score, ranking_priority = relation["scores"], relation["ranking_priority"]
+            value, metrics = self.relation_refiner.loss(relation, targets["bbox"], img_metas)
+            loss_dict["loss_relation_final"] = value
+            metrics.update(relation["metrics"])
+            loss_dict.update({"metric_relation_refinement_" + key: val for key, val in metrics.items()})
+            if "diagnostics" in relation:
+                extra_dict["relation_refinement_samples"] = relation["diagnostics"]
         if self.enable_crv:
             refer_score, ranking_priority, crv_losses, crv_info = self.crv(
                 multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
@@ -958,6 +998,15 @@ class REFHead(nn.Module):
         refer_score = refer_label
 
         ranking_priority = None
+        if self.relation_refiner is not None and int(self.relation_refiner.trained_steps) > 0:
+            relation = self._refine_relations(
+                refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,
+                refer_label, refer_logits, img_metas, inter_states[-1], outputs_coord[-1],
+                outputs_class[-1], selected_indices,
+            )
+            refer_score, ranking_priority = relation["scores"], relation["ranking_priority"]
+            if "diagnostics" in relation:
+                extra_dict["relation_refinement_samples"] = relation["diagnostics"]
         if self.enable_crv:
             # No GT (including targets['bbox']) is read during inference.
             refer_score, ranking_priority, _, crv_info = self.crv(

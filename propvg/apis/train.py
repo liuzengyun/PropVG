@@ -49,6 +49,11 @@ def clip_training_gradients(model, max_norm):
     head = getattr(base_model, "head", base_model)
     independent = [branch for branch in (getattr(head, "crv", None), getattr(head, "correctness", None))
                    if branch is not None]
+    relation = getattr(head, "relation_refiner", None)
+    if relation is not None and relation.detach_inputs:
+        # Detaching the loss is insufficient on its own: including new head
+        # gradients in a global norm would still change the CRS update scale.
+        independent.append(relation)
     if not independent:
         return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
     independent_parameters = [list(branch.parameters()) for branch in independent]
@@ -99,6 +104,14 @@ def train_model(epoch, cfg, model, optimizer, loader):
                 elif key.startswith("metric_crv_"):
                     crv_values[key[len("metric_"):]] = losses.pop(key).detach()
         correctness_values = {}
+        relation_values = {}
+        if "loss_relation_final" in losses:
+            value = losses.pop("loss_relation_final")
+            loss = loss + value
+            relation_values["loss_relation_final"] = value.detach()
+            for key in tuple(losses):
+                if key.startswith("metric_relation_refinement_"):
+                    relation_values[key[len("metric_"):]] = losses.pop(key).detach()
         if "loss_correctness" in losses:
             value = losses.pop("loss_correctness")
             loss = loss + value
@@ -120,6 +133,10 @@ def train_model(epoch, cfg, model, optimizer, loader):
             base_model = model.module if hasattr(model, "module") else model
             base_model.head.correctness.mark_optimizer_step()
         crv_values.update(correctness_values)
+        if relation_values and relation_values["relation_refinement_supervised_samples"].item() > 0:
+            base_model = model.module if hasattr(model, "module") else model
+            base_model.head.relation_refiner.mark_optimizer_step()
+        crv_values.update(relation_values)
 
         if cfg.distributed:
             loss_det = reduce_mean(loss_det)

@@ -65,6 +65,23 @@ def _validate_crs_checkpoint(model, state):
                          "Use a compatible CRS checkpoint, or --finetune-from to initialize new training.")
 
 
+def _validate_relation_refinement_checkpoint(model, state):
+    """Old configs remain valid; an enabled new stage needs its exact policy."""
+    base = model.module if hasattr(model, "module") else model
+    stage = getattr(getattr(base, "head", None), "relation_refiner", None)
+    if stage is None:
+        return
+    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
+    expected = {"head.relation_refiner." + key: value for key, value in stage.state_dict().items()}
+    if not expected.keys() <= normalized.keys() or any(normalized[key].shape != value.shape for key, value in expected.items()):
+        raise ValueError("Enabled two-stage relation refinement requires its complete checkpoint. "
+                         "To start joint training from baseline weights use --finetune-from; "
+                         "for old-model evaluation disable model.head.enable_relation_refinement.")
+    for key in ("schema_version", "policy_signature"):
+        if not torch.equal(normalized["head.relation_refiner." + key].cpu(), getattr(stage, key).cpu()):
+            raise ValueError("Two-stage relation refinement checkpoint policy differs from config: " + key)
+
+
 def _load_optimizer_state(model, optimizer, checkpoint, model_state):
     """Resume across removal of inactive branches without shifting Adam states."""
     saved = checkpoint["optimizer"]
@@ -183,6 +200,12 @@ def load_pretrained_checkpoint(model, finetune_from=None, amp=False, dataset=Non
     # # finetuning on RES since pretraining is only performed on REC
     # if model_seq_embed_dim != state_seq_embed_dim:
     #     state_copy.pop("head.transformer.seq_positional_encoding.embedding.weight")
+    # Baseline -> new stage intentionally leaves the new branch initialized.
+    # If a stage IS supplied, never overwrite its policy buffer with weights
+    # trained under a different same-shape Top-K/aggregation configuration.
+    if any((key[7:] if key.startswith("module.") else key).startswith("head.relation_refiner.")
+           for key in state_copy):
+        _validate_relation_refinement_checkpoint(model, state_copy)
     missing_keys, unexpected_keys = model.load_state_dict(state_copy, strict=False)
     if is_main():
         logger = get_root_logger()
@@ -212,6 +235,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
     _validate_crv_checkpoint(model, state)
     _validate_correctness_checkpoint(model, state)
     _validate_crs_checkpoint(model, state)
+    _validate_relation_refinement_checkpoint(model, state)
     try:
         model.load_state_dict(state, strict=True)
     except:

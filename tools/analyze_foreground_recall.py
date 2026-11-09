@@ -257,8 +257,9 @@ def main():
     torch.manual_seed(6666); torch.backends.cudnn.benchmark = False
     cfg = Config.fromfile(args.config)
     if (cfg.model.head.get('enable_grab', False) or cfg.model.head.get('enable_crv', False)
+            or cfg.model.head.get('enable_relation_refinement', False)
             or cfg.model.head.get('num_queries') != 256):
-        raise ValueError('This analysis expects all 256 original proposals with Grab and CRV off')
+        raise ValueError('This CRS baseline analysis expects 256 proposals with Grab, CRV and relation refinement off')
     if cfg.model.post_params.get('with_nms', False):
         raise ValueError('Proposal recall analysis requires the original non-NMS evaluation')
     cfg.distributed, cfg.rank, cfg.world_size = False, 0, 1

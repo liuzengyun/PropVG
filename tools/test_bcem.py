@@ -564,6 +564,7 @@ class BCEMHeadIntegrationTests(unittest.TestCase):
         cls.options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
         cls.options["enable_crv"] = False  # Isolate BCEM, regardless of the current experiment config.
         cls.options["enable_correctness"] = False
+        cls.options["enable_relation_refinement"] = False
         cls.options["enable_grab"] = False  # Full-query tests; Grab coexistence is tested separately below.
         # Integration checks exercise BCEM even when the user's experiment config
         # currently selects a baseline run.

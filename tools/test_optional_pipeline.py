@@ -24,6 +24,7 @@ class OptionalPipelineTests(unittest.TestCase):
         cls.options = copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
         cls.options["enable_crv"] = False  # Keep baseline regressions independent of the user's run switch.
         cls.options["enable_correctness"] = False
+        cls.options["enable_relation_refinement"] = False
         # These regressions isolate legacy Grab/mask behavior from BCEM.
         cls.options["enable_bcem"] = False
         cls.options["num_queries"] = 8
