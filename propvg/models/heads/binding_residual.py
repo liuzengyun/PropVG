@@ -46,14 +46,15 @@ def binding_statistics(semantics, geometry, valid):
 
 
 class BindingInteractionResidualScoring(nn.Module):
-    def __init__(self, hidden_channels=256, num_groups=8, reference_topk=64,
-                 duplicate_iou=0.8, model_dim=128, num_heads=4, kmeans_iters=6,
+    def __init__(self, hidden_channels=256, reference_topk=64,
+                 duplicate_iou=0.8, model_dim=128, num_heads=4,
                  chunk_size=32, initial_strength=0.1, max_strength=2.0,
                  final_loss_weight=1.0, binding_loss_weight=0.1,
-                 negative_topk=8, detach_inputs=False, binding_mode="residual"):
+                 negative_topk=8, detach_inputs=False, binding_mode="residual",
+                 target_topn=5):
         super().__init__()
         if any(int(x) != x or x < 1 for x in
-               (num_groups, reference_topk, model_dim, num_heads, kmeans_iters, chunk_size, negative_topk)):
+               (reference_topk, model_dim, num_heads, chunk_size, negative_topk, target_topn)):
             raise ValueError("BIRS counts/dimensions must be positive integers")
         if model_dim % num_heads or not 0 < duplicate_iou <= 1:
             raise ValueError("BIRS requires model_dim divisible by num_heads and 0 < duplicate_iou <= 1")
@@ -63,8 +64,8 @@ class BindingInteractionResidualScoring(nn.Module):
             raise ValueError("At least one BIRS loss must be enabled")
         if binding_mode not in ("residual", "paired", "crs_control"):
             raise ValueError("Unknown BIRS binding_mode")
-        self.num_groups, self.reference_topk = int(num_groups), int(reference_topk)
-        self.duplicate_iou, self.kmeans_iters = duplicate_iou, int(kmeans_iters)
+        self.target_topn, self.reference_topk = int(target_topn), int(reference_topk)
+        self.duplicate_iou = duplicate_iou
         self.chunk_size, self.negative_topk = int(chunk_size), int(negative_topk)
         self.detach_inputs, self.binding_mode = bool(detach_inputs), binding_mode
         self.final_loss_weight, self.binding_loss_weight = final_loss_weight, binding_loss_weight
@@ -83,10 +84,12 @@ class BindingInteractionResidualScoring(nn.Module):
                                               nn.LayerNorm(model_dim), nn.Tanh())
         self.strength_logit = nn.Parameter(torch.tensor(math.log(initial_strength / (max_strength - initial_strength))))
         self.register_buffer("trained_steps", torch.tensor(0, dtype=torch.long))
-        self.register_buffer("schema_version", torch.tensor(1, dtype=torch.long))
-        policy = dict(hidden_channels=hidden_channels, num_groups=num_groups, reference_topk=reference_topk,
+        # Version 3 intentionally rejects old clustering / Top-N-only-BCE BIRS.
+        self.register_buffer("schema_version", torch.tensor(3, dtype=torch.long))
+        policy = dict(hidden_channels=hidden_channels, reference_topk=reference_topk,
                       duplicate_iou=duplicate_iou, model_dim=model_dim, num_heads=num_heads,
-                      kmeans_iters=kmeans_iters, max_strength=max_strength, binding_mode=binding_mode)
+                      max_strength=max_strength, binding_mode=binding_mode,
+                      target_topn=int(target_topn), final_loss_scope="all_valid_candidates")
         digest = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).digest()
         self.register_buffer("policy_signature", torch.tensor(list(digest), dtype=torch.uint8))
 
@@ -120,32 +123,6 @@ class BindingInteractionResidualScoring(nn.Module):
         return torch.nan_to_num(xyxy), valid
 
     @torch.no_grad()
-    def cluster(self, queries, valid):
-        """Deterministic spherical K-means; shared parameters, no group ID embeddings."""
-        b, n, d = queries.shape
-        g = min(self.num_groups, n)
-        q = F.normalize(torch.nan_to_num(queries.detach().float()), dim=-1)
-        mean = F.normalize((q * valid[..., None]).sum(1) / valid.sum(1).clamp(min=1)[:, None], dim=-1)
-        distance = (q - mean[:, None]).square().sum(-1).masked_fill(~valid, -1)
-        indices = distance.argmax(-1)
-        rows = torch.arange(b, device=q.device)
-        centers, minimum = [], torch.full_like(distance, float("inf"))
-        for _ in range(g):
-            center = q[rows, indices]
-            centers.append(center)
-            minimum = torch.minimum(minimum, (q - center[:, None]).square().sum(-1))
-            indices = minimum.masked_fill(~valid, -1).argmax(-1)
-        centers = torch.stack(centers, 1)
-        for _ in range(self.kmeans_iters):
-            assignment = (q @ centers.transpose(1, 2)).argmax(-1)
-            weights = F.one_hot(assignment, g).to(q.dtype) * valid[..., None]
-            counts = weights.sum(1)
-            pooled = weights.transpose(1, 2) @ q / counts.clamp(min=1)[..., None]
-            centers = torch.where(counts[..., None] > 0, F.normalize(pooled, dim=-1), centers)
-        assignment = (q @ centers.transpose(1, 2)).argmax(-1)
-        return assignment.masked_fill(~valid, -1)
-
-    @torch.no_grad()
     def select_references(self, boxes, classes, valid):
         """Detector Top-K FIRST, then greedy near-duplicate suppression; never refill."""
         fg = classes.detach().float().softmax(-1)[..., 0]
@@ -173,6 +150,77 @@ class BindingInteractionResidualScoring(nn.Module):
 
     def forward(self, queries, boxes, classes, text, text_mask, scores, logits, img_metas,
                 reference_queries=None, reference_boxes=None, reference_classes=None, source_indices=None):
+        return self._forward_topn(queries, boxes, classes, text, text_mask, scores, logits, img_metas,
+                                  reference_queries, reference_boxes, reference_classes, source_indices)
+
+    def _forward_topn(self, queries, boxes, classes, text, text_mask, scores, logits, img_metas,
+                      reference_queries, reference_boxes, reference_classes, source_indices):
+        if not self.training and int(self.trained_steps) == 0:
+            return dict(scores=scores, final_logits=logits, ranking_priority=None)
+        xyxy, valid = self.clipped_boxes(boxes, img_metas)
+        valid = valid & torch.isfinite(queries).all(-1)
+        b, n = valid.shape
+        k = min(n, self.target_topn)
+        if not k:
+            raise ValueError("BIRS requires at least one candidate slot")
+        selected, before = [], []
+        for bi in range(b):
+            ids = valid[bi].nonzero(as_tuple=True)[0]
+            order = ids[scores[bi, ids, 0].detach().float().cpu().argsort(descending=True).to(ids.device)]
+            before.append(order)
+            # Unique invalid slots pad short samples; never repeat a live query
+            # index, which would overwrite its residual during scatter-back.
+            invalid = (~valid[bi]).nonzero(as_tuple=True)[0]
+            selected.append(torch.cat((order, invalid))[:k])
+        selected = torch.stack(selected)
+        selected_valid = valid.gather(1, selected)
+
+        def gather(value):
+            return value.gather(1, selected[..., None].expand(-1, -1, value.shape[-1]))
+
+        source = (torch.arange(n, device=queries.device)[None].expand(b, -1)
+                  if source_indices is None else source_indices)
+        core = self._score_selected(
+            gather(queries), gather(boxes), gather(classes), text, text_mask, gather(scores), gather(logits), img_metas,
+            reference_queries=queries if reference_queries is None else reference_queries,
+            reference_boxes=boxes if reference_boxes is None else reference_boxes,
+            reference_classes=classes if reference_classes is None else reference_classes,
+            source_indices=source.gather(1, selected),
+        )
+        output = dict(core)
+        for key in ("raw_binding", "paired", "null", "delta", "eligible", "legal_references"):
+            value = core[key]
+            shape = (b, n) + tuple(value.shape[2:])
+            index = selected.reshape(b, k, *([1] * (value.ndim-2))).expand_as(value)
+            output[key] = value.new_zeros(shape).scatter(1, index, value)
+        candidate_mask = torch.zeros_like(valid).scatter(1, selected, selected_valid)
+        base_scores = scores.detach() if self.detach_inputs else scores
+        base_logits = logits.detach() if self.detach_inputs else logits
+        final = base_logits.squeeze(-1) + output["delta"]
+        probability = torch.where(output["delta"] == 0, base_scores.squeeze(-1), final.sigmoid())
+        priority = torch.zeros_like(final)
+        after = []
+        for bi, old in enumerate(before):
+            head = old[:k]
+            if bool((output["delta"][bi, head] != 0).any()):
+                head = head[final[bi, head].detach().argsort(descending=True, stable=True)]
+            # Hard boundary: outsiders cannot enter Top-N, regardless of their
+            # uncalibrated probability relative to a corrected candidate.
+            order = torch.cat((head, old[k:]))
+            after.append(order)
+            priority[bi, order] = torch.arange(len(order), 0, -1, device=final.device, dtype=final.dtype)
+        output.update(scores=probability[..., None], final_logits=final[..., None], ranking_priority=priority[..., None],
+                      boxes=xyxy, valid=valid, groups=torch.where(candidate_mask, 0, -1),
+                      candidate_mask=candidate_mask, target_indices=selected, target_valid=selected_valid,
+                      before_orders=before, after_orders=after, base_scores=base_scores.detach().squeeze(-1))
+        if self.capture_diagnostics:
+            output["diagnostics"] = {key: value.detach().cpu() for key, value in output.items() if torch.is_tensor(value)}
+            for key in ("reference_boxes", "reference_confidence"):
+                output["diagnostics"][key] = core["diagnostics"][key]
+        return output
+
+    def _score_selected(self, queries, boxes, classes, text, text_mask, scores, logits, img_metas,
+                        reference_queries=None, reference_boxes=None, reference_classes=None, source_indices=None):
         # A newly enabled/untrained branch must not randomize baseline evaluation.
         if not self.training and int(self.trained_steps) == 0:
             return dict(scores=scores, final_logits=logits, ranking_priority=None)
@@ -187,8 +235,8 @@ class BindingInteractionResidualScoring(nn.Module):
         ref_xyxy, ref_valid = self.clipped_boxes(reference_boxes, img_metas)
         valid = valid & torch.isfinite(queries).all(-1)
         ref_valid = ref_valid & torch.isfinite(reference_queries).all(-1)
-        groups = self.cluster(queries, valid)
-        g = min(n, self.num_groups)
+        groups = torch.zeros_like(valid, dtype=torch.long).masked_fill(~valid, -1)
+        g = 1
         membership = F.one_hot(groups.clamp(min=0), g).to(queries.dtype) * valid[..., None]
         prototypes = membership.transpose(1, 2) @ torch.nan_to_num(queries)
         prototypes = prototypes / membership.sum(1).clamp(min=1)[..., None]
@@ -289,7 +337,9 @@ class BindingInteractionResidualScoring(nn.Module):
         iou = pairwise_iou(output["boxes"], torch.stack(ground_truth)[:, None]).squeeze(-1)
         valid, eligible = output["valid"], output["eligible"]
         labels = refer_labels.detach().to(z)
-        active = present & ((labels > 0) & valid).any(1) & eligible.any(1)
+        # Full-candidate localization supervision is independent of shortlist
+        # coverage and available references. Outside Top-N, z is the CRS logit.
+        active = present & ((labels > 0) & valid).any(1)
         per_sample = (F.binary_cross_entropy_with_logits(z, labels, reduction="none") * valid).sum(1)
         per_sample = per_sample / valid.sum(1).clamp(min=1)
         final_sum = (per_sample * active).sum() + zero
@@ -336,4 +386,7 @@ class BindingInteractionResidualScoring(nn.Module):
                        corrected=((~old & new) & present).float().sum() / denom,
                        harmed=((old & ~new) & present).float().sum() / denom,
                        rank_changed=z.new_tensor(changed).mean())
+        scope = valid & output["candidate_mask"]
+        metrics.update(target_count=scope.float().sum(1).mean(),
+                       refer_in_topn=(((labels > 0) & scope).any(1) & present).float().sum() / denom)
         return losses, metrics

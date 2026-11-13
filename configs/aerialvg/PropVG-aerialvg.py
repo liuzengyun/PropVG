@@ -64,11 +64,14 @@ crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refin
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
 
-# BIRS: 默认关闭。旧 CRS、Grab、BCEM 及其权重加载行为保持不变。
-# 开启时与旧 CRV / relation_refinement 互斥；全部候选仍参与最终排名。
+# BIRS: 关闭时旧 CRS、Grab、BCEM 及其权重加载行为保持不变。
+# Top-N竞争集合内重排；N=5时不改变同模型的Top-5成员。参考池仍独立。
+# 融合定位BCE监督全部有效候选，不因正候选缺席Top-N而跳过。
 enable_birs = True
-birs = dict(num_groups=8, reference_topk=64, duplicate_iou=0.8,
-            model_dim=128, num_heads=4, kmeans_iters=6, chunk_size=32,
+birs_target_topn = 5
+birs = dict(target_topn=birs_target_topn,
+            reference_topk=64, duplicate_iou=0.8,
+            model_dim=128, num_heads=4, chunk_size=32,
             initial_strength=0.1, max_strength=2.0,
             final_loss_weight=1.0, binding_loss_weight=0.1,
             negative_topk=8, detach_inputs=False)

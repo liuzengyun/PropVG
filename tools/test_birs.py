@@ -23,7 +23,7 @@ class BIRSTests(unittest.TestCase):
 
     def module(self, **kwargs):
         torch.manual_seed(122)
-        options = dict(hidden_channels=16, model_dim=16, num_heads=4, num_groups=1, reference_topk=8)
+        options = dict(hidden_channels=16, model_dim=16, num_heads=4, target_topn=8, reference_topk=8)
         options.update(kwargs)
         return BindingInteractionResidualScoring(**options)
 
@@ -176,17 +176,109 @@ class BIRSTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _validate_birs_checkpoint(model,{})
         with self.assertRaises(ValueError):
-            _validate_birs_checkpoint(wrapper(self.module(num_groups=2)),state)
+            _validate_birs_checkpoint(wrapper(self.module(target_topn=2)),state)
         _validate_birs_checkpoint(wrapper(None),{})
 
-    def test_cluster_deterministic_and_all_invalid(self):
-        m,args=self.module(num_groups=4),self.inputs()
-        valid=torch.ones(1,8,dtype=torch.bool)
+    def test_deterministic_forward_and_all_invalid(self):
+        m,args=self.module(),list(self.inputs())
         rng=torch.get_rng_state()
-        first=m.cluster(args[0],valid)
+        first=m(*args)
         torch.testing.assert_close(rng,torch.get_rng_state())
-        self.assertTrue(torch.equal(first,m.cluster(args[0],valid)))
-        self.assertTrue((m.cluster(args[0],~valid)==-1).all())
+        second=m(*args)
+        torch.testing.assert_close(first["scores"],second["scores"],rtol=0,atol=0)
+        args[1]=torch.zeros_like(args[1])
+        out=m(*args)
+        self.assertFalse(out["valid"].any())
+        self.assertEqual(len(out["after_orders"][0]),0)
+
+    def test_topn_no_clustering_full_reference_pool_and_membership(self):
+        m,args=self.module(target_topn=5),self.inputs()
+        self.assertFalse(hasattr(m,"cluster"))
+        out=m(*args)
+        self.assertEqual(out["target_indices"].tolist(),[[0,1,2,3,4]])
+        self.assertEqual(out["scores"].shape,(1,8,1))
+        self.assertEqual(int(out["candidate_mask"].sum()),5)
+        self.assertIn(6,out["reference_indices"][0].tolist())
+        self.assertEqual(set(out["before_orders"][0][:5].tolist()),set(out["after_orders"][0][:5].tolist()))
+        torch.testing.assert_close(out["before_orders"][0][5:],out["after_orders"][0][5:],rtol=0,atol=0)
+        outside=~out["candidate_mask"]
+        torch.testing.assert_close(out["scores"][outside],args[5][outside],rtol=0,atol=0)
+        self.assertTrue((out["delta"][outside]==0).all())
+        # Simulate an extreme residual that pushes candidate logits below an
+        # outsider: priorities, not probabilities, enforce the hard boundary.
+        def forced(module,inputs,result):
+            return result*300
+        handle=m.geometry_binding.register_forward_hook(forced)
+        exaggerated=m(*args);handle.remove()
+        self.assertEqual(set(exaggerated["after_orders"][0][:5].tolist()),{0,1,2,3,4})
+
+    def test_topn_losses_scope_and_missing_matched_positive(self):
+        m,args=self.module(target_topn=5),self.inputs()
+        targets,labels=self.supervision();out=m(*args)
+        losses,info=m.loss(out,targets,args[-1],labels)
+        expected=torch.nn.functional.binary_cross_entropy_with_logits(
+            out["final_logits"].squeeze(-1)[out["valid"]],labels[out["valid"]])
+        torch.testing.assert_close(losses["loss_birs_final"],expected)
+        z=torch.zeros_like(labels);z[0,6]=1
+        missing,info=m.loss(out,targets,args[-1],z)
+        expected=torch.nn.functional.binary_cross_entropy_with_logits(
+            out["final_logits"].squeeze(-1)[out["valid"]],z[out["valid"]])
+        torch.testing.assert_close(missing["loss_birs_final"],expected)
+        self.assertEqual(float(missing["loss_birs_binding"]),0)
+        self.assertEqual(float(info["refer_in_topn"]),0)
+        self.assertEqual(float(info["supervised_samples"]),1)
+        sum(missing.values()).backward()
+        self.assertNotEqual(float(args[6].grad[0,6]),0)
+        self.assertTrue(all(p.grad is not None for p in m.parameters()))
+
+    def test_topn_short_samples_unique_padding_and_original_source_mapping(self):
+        m,args=self.module(target_topn=5),list(self.inputs())
+        original_boxes=args[1].detach().clone();original_q=args[0];original_class=args[2]
+        args[1]=original_boxes.clone();args[1][:,3:]=0
+        out=m(*args)
+        ids=out["target_indices"][0]
+        self.assertEqual(len(ids.unique()),5)
+        self.assertEqual(int(out["target_valid"].sum()),3)
+        self.assertEqual(len(out["after_orders"][0]),3)
+        # Grab-like pruned target pool with explicit full-detector query IDs.
+        full=self.inputs();source=torch.tensor([[2,3,4,6]])
+        pruned=[x[:,source[0]] if i in (0,1,2,5,6) else x for i,x in enumerate(full)]
+        out=m(*pruned,reference_queries=full[0],reference_boxes=full[1],reference_classes=full[2],source_indices=source)
+        for local,query in enumerate(source[0]):
+            matches=out["reference_indices"][0]==query
+            self.assertFalse(out["legal_references"][0,local,matches].any())
+
+    def test_topn_checkpoint_policy_and_detachment(self):
+        m=self.module(target_topn=5)
+        self.assertEqual(int(m.schema_version),3)
+        other=self.module(target_topn=8)
+        self.assertFalse(torch.equal(m.policy_signature,other.policy_signature))
+        for obsolete in (dict(candidate_mode="cluster"),dict(num_groups=8),dict(kmeans_iters=6)):
+            with self.assertRaises(TypeError):
+                self.module(**obsolete)
+        wrapper=nn.Module();wrapper.head=nn.Module();wrapper.head.birs=m
+        state={k:v.clone() for k,v in wrapper.state_dict().items()}
+        state["head.birs.schema_version"].fill_(2)
+        with self.assertRaises(ValueError):
+            _validate_birs_checkpoint(wrapper,state)
+        m,args=self.module(target_topn=5,detach_inputs=True),self.inputs()
+        t,l=self.supervision();out=m(*args);losses,_=m.loss(out,t,args[-1],l)
+        sum(losses.values()).backward()
+        self.assertTrue(all(args[i].grad is None or args[i].grad.abs().sum()==0 for i in (0,1,2,3,6)))
+        self.assertGreater(float(m.semantic_binding[0].weight.grad.abs().sum()),0)
+
+    def test_full_bce_survives_no_binding_evidence_and_uses_all_candidates(self):
+        m,args=self.module(target_topn=5),list(self.inputs())
+        args[4]=torch.ones_like(args[4])
+        out=m(*args);targets,labels=self.supervision()
+        losses,metrics=m.loss(out,targets,args[-1],labels)
+        expected=torch.nn.functional.binary_cross_entropy_with_logits(
+            args[6].squeeze(-1)[out["valid"]],labels[out["valid"]])
+        torch.testing.assert_close(losses["loss_birs_final"],expected)
+        self.assertEqual(float(metrics["supervised_samples"]),1)
+        self.assertEqual(float(metrics["binding_samples"]),0)
+        sum(losses.values()).backward()
+        self.assertTrue(all(p.grad is not None for p in m.parameters()))
 
     def test_ddp_global_count_scaling_and_rank_without_supervision(self):
         m,args=self.module(),self.inputs()
@@ -266,7 +358,7 @@ class BIRSTests(unittest.TestCase):
         self.assertEqual(set(old.state_dict()),set(off.state_dict()))
         off.load_state_dict(old.state_dict(),strict=True)
         torch.manual_seed(100)
-        on=build_head(dict(options,enable_birs=True,birs=dict(num_groups=1)))
+        on=build_head(dict(options,enable_birs=True,birs=dict(target_topn=5)))
         self.assertTrue(torch.equal(rng,torch.get_rng_state()))
         for key,value in old.state_dict().items():
             self.assertTrue(torch.equal(value,on.state_dict()[key]),key)
@@ -276,7 +368,7 @@ class BIRSTests(unittest.TestCase):
 
     def test_real_head_cpu_train_and_test(self):
         options=self.head_options()
-        options.update(enable_birs=True,birs=dict(num_groups=1,reference_topk=8,model_dim=16,num_heads=4))
+        options.update(enable_birs=True,birs=dict(target_topn=5,reference_topk=8,model_dim=16,num_heads=4))
         head=build_head(options)
         x=torch.randn(1,768,8,8)
         metas=[dict(img_shape=(96,128),pad_shape=(128,128),refer_target_index=[0])]

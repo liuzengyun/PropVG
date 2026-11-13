@@ -1,249 +1,223 @@
-# 面向航拍外观混淆的关系绑定交互残差评分（BIRS）
+# 航拍视觉指代的文本条件竞争集合与关系绑定细化（BIRS）
 
-## 1. 模块定位与动机
+## 1. 当前方案与动机
 
-**名称：** Binding Interaction Residual Scoring，关系绑定交互残差评分。
+当前新实验使用 **Top-N 关系细化 + 全候选融合 BCE**。只为 CRS Top-N 计算绑定残差，但对全部有效候选计算融合定位 BCE；不再维护此前的聚类/Top-N-only-BCE BIRS 兼容路径。BIRS 仍为 Binding Interaction Residual Scoring（关系绑定交互残差评分），放在 CRS 之后，不替换 CRS，不修改预测框，不重跑图像编码器或检测解码器。
 
-本模块置于原 CRS 之后，以预测候选的外观分组组织竞争者，以完整文本引导参考物语义与相对几何的绑定评分，再向 CRS logit 加入组内中心化的残差。不重跑图像编码器或检测解码器，不替换 CRS，不修改预测框，也不向候选特征回写。
+航拍小目标的细粒度外观信息有限，密集场景中经常存在颜色、类别、尺度相似的实例。第一阶段匹配可以找到“像描述的一组目标”，但不一定确定具体实例。广域俯视/斜俯视图像又允许观察较多物体及其配置，因此参考物的语义与相对位置可能提供补充证据。
 
-航拍密集场景中，多辆车可能具有相似的颜色、类别和尺度。此前候选聚类可视化提示：高分竞争者可能聚集在相似的特征簇内；这只是少量样本上的诊断，不等同于对整个数据集的统计结论。仅判断“存在黑色 SUV”和“左上方有物体”，无法保证模型判断的是“黑色 SUV 位于左上方”。因此，本模块要检验：**某种参考物语义是否绑定在支持当前目标假设的相对位置上，而不只是两类证据分别存在。**
+核心问题不是分别判断“有黑车”和“左侧有物体”，而是判断“黑车是否绑定在左侧”。实际绑定相对于重绑定对照的增益，用于补充原图文匹配。
 
-一个直观例子：两个白车候选周围均有黑车、红车。参考物集合相同不意味着场景配置相同；“黑车在左、红车在右”与“红车在左、黑车在右”应能得到不同的绑定证据。另一方面，当所有参考物的语义都一样时，仅靠交换语义—位置对应不应凭空生成可辨识证据。
+**为何不用外观聚类？** 外观特征相似不等于竞争当前描述。上一轮 epoch34 诊断中，test 有832条“CRS错误但Top-5含正确候选”的样本，正确候选与错误Top-1同簇仅271条。新方案直接用 CRS Top-N 定义文本条件下的竞争集合，避免聚类边界限制绑定排序监督。
 
-### 1.1 与 BCEM、Grab 的分工
+Top-N 筛选和中心化本身不是创新；关系绑定与条件竞争集合的组合需要消融和查新验证，不能保证原创或性能提升。这是针对航拍困难的设计，不是只适用于无人机的数学机制；重绑定只是统计关联对照，不是已识别的真实因果效应。
 
-- BCEM 在 CRS 之前读取框外空间背景并增强候选表示，BIRS 不访问其空间采样路径，也不读取视觉特征图。
-- Grab 可先增强/筛选目标候选；BIRS 的参考支路仍读取未被 Grab 筛除的原检测候选池，避免潜在参考物丢失。
-- BIRS 只做评分残差。没有 BCEM、Grab 或 teacher 时也能运行；它们不是开启 BIRS 的前提。
+## 2. 与现有模块的关系
 
-### 1.2 创新性与解释边界
+- 原 CRS 始终保留，原定位损失照常监督。
+- 可选 Grab / BCEM 的原流程保持；BCEM 在 CRS 前增强表示，BIRS 不读取其空间路径或图像特征图。
+- Grab 若筛掉部分目标候选，参考支路仍读原检测池的 refer_adapter 特征，不从 Grab 筛选结果裁剪参考。
+- 不需要 teacher、关系标签、额外参考物 GT、文本人工拆解或外部模型。
+- BIRS 与旧 CRV / two-stage relation refinement 互斥，避免多个重排器叠加。
+- 关闭 enable_birs 时不构建新模块，不增加损失、参数或collective。
 
-关系建模、候选分组、双线性交互、均值中心化及置换对照本身都不是新概念。本实现的研究假设是：**以外观竞争组为条件，利用语义—相对位置的配对增益，而非独立边际匹配，改进航拍指代评分。**需要实验证明绑定结构而非参数量带来了收益，不能凭代码实现宣称原创性已得到保证。
+## 3. 完整数据流与维度
 
-本模块没有进行真实物理世界干预，也没有识别因果效应；“重绑定对照”是统计关联对照。骨干和 CRS 本来就有隐式上下文交互，不能声称原模型只看外观。
-
-相关工作与后续查新重点：[MAttNet](https://arxiv.org/abs/1801.08186)、[AerialVG](https://arxiv.org/abs/2504.07836)、[CORE-3DVG](https://proceedings.neurips.cc/paper_files/paper/2023/hash/9b91ee0da3bcd61905fcd89e770168fc-Abstract-Conference.html)、[BindCLIP](https://arxiv.org/abs/2609.23717)。这些工作与关系理解、反事实/组合绑定相关，不应将其已有思想归为本模块首次提出。
-
-## 2. 完整数据流与维度
-
-记批大小为 B，目标候选数 N，原始候选池大小 P，文本长度 L，候选维度 C=256，BIRS 维度 D=128，组数 G=8，参考上限 R=64。不开 Grab 时通常 N=P=256；开启 Grab 后 N 可改变，但不会被 BIRS 再裁成 Top-5/Top-8。
+B为批大小，M为进入CRS的候选数，P为原检测候选数，L为文本长度；常用M=P=256、L=64、C=256。K=min(target_topn,M)，默认K=5；参考上限R=64，内部D=128。不足K个有效框时只使用实际有效候选，不复制或注入GT。
 
 ```text
-BEiT-3 → 原 SimFPN → 原 Deformable DETR
-                         ├─ 检测框 [B,P,4]、检测分类 logits [B,P,2]
-                         └─ decoder queries [B,P,256]
-                                     ↓
-                   可选 Grab → refer_adapter → 可选 BCEM
-                                     ↓
-                        目标候选 Q [B,N,256]
-                                     ├──────── 原 CRS + 完整文本 T [B,L,256]
-                                     │                     ↓
-                                     │             原 logits ℓ [B,N,1]
-                                     ↓
-                      stop-grad 球面 K-means 分组 [B,N]
-                                     ↓
-                       可求导的组原型 [B,G,256] → [B,G,128]
+BEiT-3 → SimFPN → Deformable DETR
+                       ↓
+              queries [B,P,256] + 框 + 检测分类
+                       ↓
+              可选Grab → refer_adapter → 可选BCEM
+                       ↓
+              原CRS(Q [B,M,256], T [B,L,256])
+                       ↓
+               原logits / 概率 [B,M,1]
+                       ↓
+             按原CRS概率取Top-N [B,K]
+                       ↓
+         目标特征 [B,K,256]、框 [B,K,4]
+                       ↓
+             平均原型 [B,1,256] → [B,1,128]
 
-原检测池 → 检测置信度 Top-64 → IoU 去重 → 参考有效掩码 [B,R]
-                                     ↓
-参考特征 [B,R,256] → 128维投影 → 读取完整文本 → [B,R,128]
-                                     ↓
-                  组原型条件下的参考语义 H [B,G,R,128]
+原检测池 → 检测置信度Top-64 → 去重 → R个槽位/有效掩码
+                       ↓
+        参考特征投影 → 读取完整文本 → [B,R,128]
+                       ↓
+       原型条件的参考语义 H [B,1,R,128]
 
-目标框 × 参考框 → 相对几何 [B,N,R,9]
-             → 非线性几何编码 + 文本/组条件 → Ψ [B,N,R,128]
-                                     ↓
-           实际语义—位置配对 − 均匀重绑定期望 → d [B,N]
-                                     ↓
-                 有效候选组内中心化 × 可学习强度 → δ [B,N]
-                                     ↓
-                         ℓ_final = ℓ + δ → sigmoid
-                                     ↓
-                     全部保留候选按最终得分排序，输出框
+Top-N目标框 × 参考框 → 相对几何 [B,K,R,9]
+                → 文本/原型条件非线性编码 Ψ [B,K,R,128]
+                       ↓
+             实际绑定 − 重绑定期望 [B,K]
+                       ↓
+         有效集合内中心化 × 可学习β → 残差 [B,K]
+                       ↓
+            修正Top-N内部logit并排序
+                       ↓
+       重排后的Top-N + 原CRS其余候选的原顺序
 ```
 
-实际按 `chunk_size=32` 个目标分块计算几何和交互，控制单次算子的临时张量规模；不构造 R×R 的重绑定矩阵。训练时 autograd 仍会保留各块反向所需的激活，不能声称总反向显存降为单个分块大小。主要关系计算量约 O(BNRD)，参考物只读一次文本。没有 sklearn、新外部模型和文本人工拆解。
+实现只为K个目标计算绑定，不为全部M个目标计算；全部M个输出槽位仍保留用于旧后处理。raw_binding、delta等诊断量回填到原query索引，集合外为零，candidate_mask标明计算范围。参考池始终独立，不随K缩小。目标侧关系计算量约O(BKRD)，参考文本读取约O(BRLD)；没有R×R显式置换矩阵。分块只控制单次临时工作集，训练反向仍保留各块所需激活。
 
-## 3. 每个操作及其目的
+## 4. 每一步的目的与精确规则
 
-### 3.1 目标候选分组：组织外观竞争，不选择“最高均分簇”
+### 4.1 文本条件竞争集合与共享原型
 
-对送入 CRS 的候选特征做 L2 归一化，使用确定性最远点初始化的球面 K-means。聚类分配停止梯度，组原型由组内原特征平均得到；联合训练时，原型平均仍可回传梯度。
+按原评估的有效框过滤、CPU概率降序排序规则取Top-N。选择索引停止梯度；选中特征的梯度按detach_inputs开关决定。没有重新训练一个筛选器，不在训练时加入GT候选。
 
-分组特征是 `refer_adapter` 后、可选 BCEM 后的特征，不是原始 decoder 特征，也不是 t-SNE 二维坐标。它并非纯外观表征，可能含上下文。G 是上限，实际非空组可以少于 G；组编号没有语义，所有组共享参数。
+Top-N特征平均得到一个共享原型z，代替外观聚类原型。目的：让同一条描述的实际竞争者使用一致的参考语义条件。默认不再执行K-means，也不依赖num_groups或kmeans_iters。
 
-目的：让相似候选共享同一套参考语义解释，并约束残差主要用于组内消歧。**不根据簇均分丢弃整簇，不根据 GT 分组，不把簇编号当类别。**
+### 4.2 独立参考池
 
-### 3.2 参考池：检测置信度 Top-K 后去重
+检测前景置信度为softmax(class_logits)[...,0]。有效检测框先取Top-64，再按置信度贪心抑制IoU≥0.8的近重复框，不从Top-64外补齐。
 
-前景置信度沿用当前二分类检测头：`softmax(class_logits)[...,0]`。先取有效原检测框中前 R 个，再按置信度从高到低抑制 IoU≥0.8 的近重复框，不从 Top-R 之外补齐。参考池不由 CRS 的文本匹配得分裁剪。
+对每个目标排除同源query及IoU≥0.8的自身近重复；真实部分重叠允许。框从相对有效图像的cxcywh转换为xyxy并裁剪，几何不用pad_shape。选择、框坐标和检测分数停止梯度。
 
-参考池以固定槽位加掩码保存，不足 R 个时不伪造新参考物。对每个目标候选排除同源 query 与 IoU≥0.8 的自身近重复框；真实的部分重叠仍允许。此处不采用“任何 IoU>0 都删除”，因为真实参考物可能重叠。
+目的：参考物自身不必像目标，不能也用CRS Top-N作为参考池。
 
-目的：减少重复检测造成的证据重复，同时保留文本不直接指向的参考物。框和检测分数的选择始终停止梯度。
+### 4.3 完整文本与语义—几何编码
 
-### 3.3 完整文本读取与组条件语义
+参考特征与完整文本投影到128维，参考token读取有效文本token，得到v_j。padding不参与；全padding样本不产生有效残差。
 
-参考特征和文本分别线性投影到 D=128。参考 token 作为 query，对完整有效文本 token 做一次多头交叉注意力，得到文本相关的参考表示 v_j。padding 位置不参与注意力；全 padding 样本不产生残差。
+参考语义：
+$$H_j=\tanh\{\operatorname{LN}[\operatorname{GELU}(W_h[v_j;z;v_j\odot z])]\}.$$
 
-对每个外观组原型 z_g，定义：
+对目标i和参考j，构造9维几何：
+$$r_{ij}=[\Delta_x,\Delta_y,\Delta_x/d,\Delta_y/d,\log(1+d),
+\log(w_j/w_i),\log(h_j/h_i),\tanh((x_j-x_i)/w_i),\tanh((y_j-y_i)/h_i)].$$
 
-$$H_{gj}=\tanh\left(\operatorname{LN}\left(\operatorname{GELU}\left(W_h[v_j;z_g;v_j\odot z_g]\right)\right)\right).$$
+前两维为像素中心差除以有效图像短边，d为该归一化距离；方向坐标向右、向下为正。宽高比对数截断[-8,8]，分母有数值下限。非线性MLP编码后，与“原型+有效文本投影平均值”交互，输出Ψ_ij。
 
-目的：相同参考物对不同目标外观组可能具有不同的描述作用。该表示不显式解析主语、颜色词、关系词或参考物标签。
+目的：保留“什么物体在什么相对位置”的绑定。不能只线性编码dx、dy：在参考维度中心化时目标中心会被消掉，导致不同目标难以区分。
 
-### 3.4 相对几何：必须非线性编码
+### 4.4 实际配对减重绑定期望
 
-框从归一化 cxcywh 转为 xyxy，按 `img_shape` 有效图像裁剪，绝不使用 padding 尺寸解释位置。设短边 s=min(W,H)，目标中心 c_i、参考中心 c_j，宽高分别为 w、h。使用 9 维向量：
+对目标i的同一个合法参考集合J_i，m_i=|J_i|：
+$$p_i=\frac{1}{m_i\sqrt D}\sum_{j\in J_i}H_j^\top\Psi_{ij},\qquad
+n_i=\frac{\bar H_i^\top\bar\Psi_i}{\sqrt D},\qquad d_i=p_i-n_i.$$
 
-$$r_{ij}=[\Delta_x,\Delta_y,\Delta_x/d,\Delta_y/d,
-\log(1+d),\log(w_j/w_i),\log(h_j/h_i),
-\tanh((x_j-x_i)/w_i),\tanh((y_j-y_i)/h_i)].$$
+等价计算：
+$$d_i=\frac{1}{m_i\sqrt D}\sum_{j\in J_i}(H_j-\bar H_i)^\top(\Psi_{ij}-\bar\Psi_i).$$
 
-其中前两维为像素中心差除以 s，d 为其欧氏距离；对数宽高比截断到 [-8,8]，分母设置数值下限。图像 y 轴向下，正 Δy 表示参考物更靠下。方向是连续值，不人为添加关系词。
+n_i是均匀随机重绑定的精确期望，无需抽样。两侧均值使用相同合法参考集合。若分数只有独立的语义项+位置项，则残差为零；参考语义完全相同时也应为零。少于两个合法参考时不产生绑定。没有把所有置换标成负样本，也没有删除真实物体。
 
-经两层 GELU MLP 后，与“组原型+有效文本投影的平均值”构成条件交互，输出有界的几何嵌入 Ψ_ij∈[-1,1]^D。
+### 4.5 残差与硬边界排序
 
-**为什么不能只线性编码 dx、dy？** 对同一参考集合，把 `x_j-x_i` 在参考维度中心化会消掉 x_i，导致不同目标候选的几何变得一样。方向归一化、局部尺度 tanh 和非线性 MLP 用于避免这一代数退化；是否学到有用关系仍需检验。
-
-### 3.5 实际绑定与重绑定对照
-
-对目标 i，只在相同的合法参考集合 J_i 内计算所有统计量，M_i=|J_i|。设 g_i 为其组编号：
-
-$$E_i(j,k)=\frac{H_{g_i j}^{\top}\Psi_{ik}}{\sqrt D},\qquad
-p_i=\frac1{M_i}\sum_{j\in J_i}E_i(j,j).$$
-
-对参考语义—位置对应做均匀随机置换，其平均得分无需采样即可精确计算：
-
-$$n_i=\frac1{M_i^2}\sum_{j,k\in J_i} E_i(j,k)
-=\frac{\bar H_i^{\top}\bar\Psi_i}{\sqrt D}.$$
-
-绑定增益：
-
-$$d_i=p_i-n_i
-=\frac1{M_i\sqrt D}\sum_{j\in J_i}
-(H_{g_i j}-\bar H_i)^{\top}(\Psi_{ij}-\bar\Psi_i).$$
-
-目的：消除“某种参考语义普遍高分”和“某个位置普遍高分”这两类独立边际因素。若配对分数只有 a_j+b_k+c_i，那么 d_i=0。参考语义完全相同时也不能产生绑定增益。
-
-这不表示所有置换都不合理，也不把它们逐一标为负样本。只有实际目标 GT 监督模型最终该支持哪个候选。少于两个合法参考物时 d_i 和最终残差置零。
-
-### 3.6 残差融合：保留 CRS，而非仅使用新评分
-
-在同组且至少有两个合法参考物的候选中计算均值 μ_g；若组内有效候选不足两个，该组不修正。
-
-$$\delta_i=\beta(d_i-\mu_{g_i}),\qquad
-\beta=\beta_{\max}\sigma(a),\qquad
+至少两个目标候选能产生合法绑定时，在这些有效候选内中心化：
+$$\delta_i=\beta(d_i-\bar d),\quad\beta=\beta_{max}\sigma(a),\quad
 \ell_i^{final}=\ell_i^{CRS}+\delta_i.$$
 
-默认 β 初始 0.1，上界 2.0，通过损失学习。最终概率是 sigmoid(ℓ_final)，用于排序的内部 `ranking_priority` 仅编码最终 logit 的排序，**不是置信度**。
+β初始0.1，上界2，仍通过损失学习；没有新增门控。无有效绑定的候选δ=0。中心化减去共同常数时不改变这些候选内部的排序，主要限制平均logit漂移、影响BCE校准，不应把它当作额外消歧能力。
 
-中心化目的：防止给整个外观组统一加分，迫使新增分支提供组内差异；它自身不会生成辨识信息。β 可以减小以抑制无用残差，不强迫模块参与，不承诺能避免所有改错。
+最终用：
+**Top-N内按修正logit重排 + 集合外按原CRS顺序接在后面。**
 
-残差为零的位置直接保留原概率；整张图残差均为零时保留原评估器的概率排序及 tie 行为。未完成任何有效监督更新的 BIRS 在 eval 下直接回退原 CRS，不以随机权重重排。
+通过现有ranking_priority接口编码完整顺序。不能简单对所有修正后的概率再次排序，否则集合外候选仍可能插进来。概率仍是sigmoid(logit)，ranking_priority是序数，不是置信度；评估/可视化必须优先使用ranking_logits/ranking_priority。
 
-## 4. 训练监督、权重与梯度
+N=5保证同一checkpoint重排前后Top-5成员相同，因而其Top-5 Acc相同；N>5允许改变Top-5，但Top-N成员不变。联合训练仍可能改变CRS，不能保证相对于独立BASE的Top-5不变。
 
-原 `loss_det`、`loss_refer`、可选 Grab filter / mask / correctness 损失保持原算法与权重。BIRS 新增两项：
+## 5. 损失、监督与梯度
 
-| 损失 | 默认权重 | 监督内容 | 目的 |
-|---|---:|---|---|
-| `loss_birs_final` | 1.0 | 最终融合 logit 对原 Hungarian refer 正负标签的 BCE | 直接检验并优化加残差后的定位结果 |
-| `loss_birs_binding` | 0.1 | 同组 GT 正候选与高 CRS 得分、完全不重叠负候选之间的 softplus 排序 | 让绑定分支独立学到目标证据，减少 β 变小导致分支没有学习信号的问题 |
+原loss_det、loss_refer、可选Grab/filter/mask/correctness保持原算法与权重，原CRS损失仍对全部原候选计算。
 
-两项日志值已经乘权重，不应再额外乘一次。第一项在有效候选上做均值、再按有效样本平均；没有 referent、原匹配正候选缺失或整个样本无可用残差时跳过新增监督。
+| 新增损失 | 默认权重 | 范围与目的 |
+|---|---:|---|
+| loss_birs_final | 1.0 | 全部有效候选上的融合BCE，沿用原Hungarian refer标签，直接监督最终定位 |
+| loss_birs_binding | 0.1 | Top-N内合法正负对，softplus(d_neg-d_pos)，独立训练绑定分支 |
 
-绑定排序正样本必须同时是原 Hungarian refer 正标签、IoU≥0.5、可产生有效残差。负样本必须与原 refer GT 的 IoU **恰为 0**、同组且有效，再按原 CRS 得分取前 `negative_topk=8` 个。其他候选不进入这项排序监督，包括 0<IoU<0.5 的候选；没有合法正负对时跳过。正样本仍由 Hungarian 匹配约束，不因 IoU 高就把额外候选改成 refer 正标签。
+日志值已乘权重。设全部候选有效掩码为v_i，原Hungarian refer标签为y_i，融合BCE为：
 
-$$\mathcal L_{binding}=\operatorname{mean}_{(p,n)}\operatorname{softplus}(d_n-d_p).$$
+$$\mathcal L_{final}^{(b)}=\frac{\sum_{i=1}^{M}v_i\operatorname{BCEWithLogits}(\ell_i^{final},y_i)}{\max(1,\sum_{i=1}^{M}v_i)}.$$
 
-只从 `refer_target_index` 读取原 refer GT；teacher/辅助 GT 继续按原逻辑参与原检测损失，但不作为 BIRS 的目标、参考物标签或关系监督。GT 只在 `loss()` 内读取；前向分组、参考选择、几何、评分和推理均不读取 GT。
+再按全局有效样本数平均。**分母是全部有效候选数（通常256），不是Top-N数；有效样本也不要求正候选在Top-N。**只要求存在原refer GT且其原匹配正候选在全部有效框中。不因没有绑定参考而跳过融合BCE。
 
-### 4.1 联合训练与截断开关
+集合外候选的最终logit就是原CRS logit，因此GT匹配正候选在前五之外时仍得到直接定位梯度，前五中的错误候选也仍受负标签监督。此时绑定分支没有集合外正候选的残差计算，不能把“全候选BCE”解释为“全候选绑定正例监督”。无合法绑定正负对时仅跳过绑定排序损失，不跳过融合BCE。
 
-- `detach_inputs=False`（默认）：新增损失可影响 CRS、refer_adapter、BCEM/Grab、检测 query 和骨干的特征路径。预测框、检测分类分数的选择、聚类分配不接收 BIRS 直接梯度；但共享特征的变化仍可能间接影响检测结果。
-- `detach_inputs=True`：BIRS 的候选、参考特征、文本、原 CRS logit/概率全部截断，只训练 BIRS。原损失继续训练原模型。梯度裁剪对独立 BIRS 与原模型分别计算，避免通过全局梯度范数间接改变原参数更新尺度。
+绑定正候选仍须原Hungarian正标签、IoU≥0.5且可产生合法绑定；负候选须与原refer GT的IoU恰为0且有效，按原CRS得分最多取negative_topk个。其他候选不进入此排序项；没有合法对则跳过。共享集合替代同簇限制，其他正负规则不变。
 
-分组及参考选择没有随机采样；新分支采用独立、恢复现场的 CPU 初始化随机流，不改变已有参数的初始化或 CPU/CUDA RNG。DDP 的两项新增损失按全局有效样本数归一化；无监督的 rank 保留连接所有新参数的零梯度图，避免不一致的分支/collective。
+仅loss()读取原refer GT；teacher或辅助GT不作为BIRS关系标签。DDP按全局有效样本数归一化，缺监督rank也保留新参数的连接零梯度图。
 
-## 5. 配置、训练和旧模型兼容
+- detach_inputs=False：联合训练；新增损失可回传原CRS及候选/文本特征路径，框和离散选择无直接梯度。
+- detach_inputs=True：候选、参考、文本及原CRS概率/logit截断，仅训练BIRS；梯度裁剪独立，原损失继续训练原模型。
 
-配置位置：`configs/aerialvg/PropVG-aerialvg.py`。默认如下，**没有自动替你打开新实验**：
+本次修正撤销了此前“融合BCE只在Top-5内平均”的变化，恢复全候选监督范围、候选维度分母和全局有效样本覆盖，不额外调损失权重。残差很小时仍相当于额外增加一次定位监督；相对于不含BIRS的BASE，训练目标并不相同，收益不能直接归因为绑定机制。
+
+## 6. 配置、训练与旧模型兼容
+
+当前配置：
 
 ```python
-enable_birs = False
+enable_birs = True          # False完全沿用原模型
+birs_target_topn = 5
 birs = dict(
-    num_groups=8, reference_topk=64, duplicate_iou=0.8,
-    model_dim=128, num_heads=4, kmeans_iters=6, chunk_size=32,
+    target_topn=birs_target_topn,
+    reference_topk=64, duplicate_iou=0.8,
+    model_dim=128, num_heads=4, chunk_size=32,
     initial_strength=0.1, max_strength=2.0,
     final_loss_weight=1.0, binding_loss_weight=0.1,
     negative_topk=8, detach_inputs=False,
 )
-# 传入 model.head 的是 enable_birs 和 birs。
 ```
 
-参数目的：G 控制竞争分组粒度，R 控制参考支路规模，duplicate_iou 用于参考去重及排除自身近重复，D/heads 控制分支容量，kmeans_iters 控制聚类迭代，chunk_size 调整单次算子的临时工作集及调度开销，不改变数学做法、也不保证训练总显存按块数下降；其余为融合强度、监督权重、负样本数及梯度策略。
-
-开启 `enable_birs=True`，保持 `enable_crv=False`、`enable_relation_refinement=False`，为实验设置独立 work_dir 后，沿用原训练命令：
+原CRV和relation_refinement保持关闭。启动方式不变，建议设置独立work_dir：
 
 ```bash
 conda activate propvg
 CUDA_VISIBLE_DEVICES=1 python tools/train.py configs/aerialvg/PropVG-aerialvg.py
 ```
 
-若从已训练 baseline 开始新训练，使用 `--finetune-from /绝对路径/top1_best.pth`，不要用 `--load-from` 或 `--resume-from` 冒充已有 BIRS 权重。已有 BIRS 的恢复/测试应使用训练时归档配置与对应 checkpoint。BIRS checkpoint 保存全部原模型和新分支参数，沿用已有保存和最佳 Top-1 选择逻辑。
+兼容范围：
 
-默认关闭时不构建 BIRS，不新增参数、buffer、损失、DDP collective；旧配置没有 `enable_birs` 时构造函数同样默认 False。旧模型仍按其原归档配置测试，不必补配置。开启时校验新权重完整性、结构版本和推理策略摘要（组数、参考数、去重阈值等），防止相同 tensor 形状但策略不一致被静默加载。纯训练开关 `detach_inputs` 和损失权重不进入推理策略摘要。
+- enable_birs=False（旧配置没有此参数时也默认False）：仍沿用原PropVG/Grab/BCEM/correctness等已有路径，既有非BIRS模型可以继续训练/测试，不要求新增BIRS参数。
+- 当前BIRS只保留Top-N计算路径，移除candidate_mode、num_groups、kmeans_iters以及聚类实现。旧BIRS配置可能直接报未知参数；不维护修改前版本和1113v1的生产代码兼容。
+- 当前schema=3，策略摘要包含全候选损失口径和target_topn。旧BIRS权重不能直接用当前配置--load-from/--resume-from，也不应以恢复训练代替新对照。
+- 归档实验源码、归档配置和权重没有删除；如需要复查旧实验，可在对应归档环境运行，而非要求当前代码复现旧BIRS。
+- 从相同BEiT-3初始化重新训练本组对照。需要基线权重初始化时，可使用不含BIRS的baseline配合--finetune-from；完整新BIRS训练后仍保存原模型+BIRS的整体参数。
+- 未完成有效监督优化的BIRS在eval时回退原CRS。这里trained_steps记录有新增监督的优化步，不保证每一步都有绑定正负对。
 
-## 6. 可验证接口与实验分析
+## 7. 诊断接口、日志与验证
 
-核心代码：`propvg/models/heads/binding_residual.py`；接入：`REFHead._binding_residual()`；训练接入：`propvg/apis/train.py`。单元测试：
-
-```bash
-PYTHONPATH=. python tools/test_birs.py
-```
-
-按需捕获，不在普通训练时将大张量搬到 CPU：
+核心文件：propvg/models/heads/binding_residual.py；接入点仍是REFHead._binding_residual()。保持原诊断接口：
 
 ```python
-base = model.module if hasattr(model, "module") else model
-with base.head.birs.diagnostics():
-    # 正常执行模型前向。
-    # REFHead 返回的 extra_dict["birs_samples"] 中可获得以下张量。
+with model.head.birs.diagnostics():
+    # 正常前向后查看extra_dict["birs_samples"]
     ...
 ```
 
-记录包括原得分、最终 logit、paired/null/raw_binding、delta、组编号、参考原 query 下标/置信度/框、有效参考掩码及每个目标的合法参考集合。最终候选不做额外过滤；已有后处理继续同步过滤退化框与排序分数。
+新增candidate_mask、target_indices、target_valid，明确哪些原query参与Top-N。其他字段保留全候选原索引，包括原分数、最终logit、raw_binding、paired/null、delta、组标记（选中为0，未选中为-1）、参考池与合法参考掩码。
 
-训练日志新增 `birs_strength`、`birs_eligible`、`birs_delta_abs`、`birs_reference_count`、`birs_corrected`、`birs_harmed`、`birs_rank_changed`、全局有效监督/绑定样本数。corrected/harmed 是当前训练样本上的 Top-1 改对/改错比例，不是验证集准确率，也不是纠错成功概率；DDP 日志按各 rank 的比例平均。
+日志含义：birs_supervised_samples现在是全局每batch可计算全候选融合BCE的样本数，正常32条有refer GT且匹配正框有效时应接近32，不再等于32×refer_in_topn。birs_binding_samples仍统计有合法绑定对的样本数。birs_target_count与birs_refer_in_topn分别表示计算绑定的目标数、原匹配正候选进集合的比例（不是IoU Top-N召回率）。原birs_eligible与delta_abs仍按全部候选槽位平均，Top-N版数值自然更小，不应误判为分支关闭。
 
-至少验证以下对照，而非只看总 Top-1：
+验证重点：
 
-1. 同训练预算的原 CRS vs CRS+BIRS，保持数据划分、teacher、检测损失、图像尺寸、随机种子不变。
-2. 净纠正数、改对数、改错数；Top-1/Top-5/mIoU；按组内竞争、参考数、原候选召回率分层统计。
-3. `binding_mode="paired"`：只用实际配对、不减重绑定期望。`"crs_control"`：残差和绑定损失强制零，用于接入/额外监督控制；它不是原 baseline，因为联合模式下仍有新增 final BCE。
-4. `num_groups=1` 对照取消分组；打乱“参考特征—参考框”对应，但保留边际集合，检验模型是否真正使用正确绑定。
-5. 替换为重复相同参考语义后，绑定残差应归零；验证少于两参考时回退；验证不同 padding 不改变几何。
-6. 统计 GPU 时间、峰值显存和增参量；比较联合/截断梯度，避免把主干训练变化误认作评分机制本身的提升。
+1. N=5时每图前后Top-5集合相同、集合外顺序不变，极端残差也不能让外部候选插入。
+2. 只对Top-N执行几何/绑定，不运行聚类；参考物仍能来自Top-N以外。
+3. 匹配正候选在Top-N之外时，全候选融合BCE仍非零且对集合外正logit有梯度，只有绑定排序损失跳过；分母仍为全部有效候选。
+4. 不维护旧BIRS兼容；验证False路径的旧参数/RNG/前向/梯度不受影响，既有非BIRS权重可严格加载。
+5. 统计与独立BASE的整体性能，以及同checkpoint前后改对/改错；联合训练时二者含义不同。
+6. 记录全候选融合监督样本数、匹配正候选Top-N覆盖率、合法绑定对比例、β、残差和CRS分差，不能只看loss。\n7. 无可用参考物或全padding文本时残差为零，但只要存在有效refer正框，融合BCE仍计算；GT不存在或无有效匹配正框时跳过新增监督。
+8. 保留paired与crs_control对照；crs_control残差/绑定loss为零，只保留新增全候选BCE，可控制额外定位监督的影响。BASE、本控制和完整模块需同配置独立训练，不能只靠测试时消融区分训练收益。
 
-## 7. 局限及失败时的判断
+单元测试：PYTHONPATH=.:tools python -m unittest test_birs。
 
-- 特征分组可能不对应外观类别，且组边界随训练变化；组内中心化也不能保证组间绝不发生排名变化。
-- Top-64 及去重可能遗漏真实参考物；参考池也可能包含背景候选。模块没有额外目标类别监督，不能保证其都是实体。
-- 当前平均配对统计可能稀释少数关键参考物；其优势需通过上述绑定打乱对照证明，不能仅凭公式认定成功。
-- 没有显式词语解析或关系标签，方向语义只能从 refer GT 间接学习；无关系描述时应由学习到的残差/强度抑制无用证据，但未保证逐样本精确关闭。
-- 标注存在多个同样符合文本的实体时，单框 GT 会把合理候选当负例；BIRS 不能消除这类评测歧义。
-- 正候选 IoU 不足、同组无完全不重叠负候选时，绑定损失可能缺少监督，应看 binding_samples，不能只看平均 loss。
-- sigmoid 的全局 β 不是逐样本可靠性门控，也不是置信度；当表现下降时先检查配对敏感性与改错数，不应反复增加复杂门控来掩盖分支无辨识力。
-- 联合训练且残差很小时，新增 final BCE 近似增加一次 CRS 定位监督，改变有效检测/定位损失比例。必须加入 `crs_control` 对照，不能把重加权带来的收益误认作绑定建模的收益。
-- 本实现不保证性能提升、因果正确性或原创性。只有充分消融、误差分析和独立查新才能支撑论文结论。
+## 8. 局限与下一步实验
 
-## 8. 本次实现验证记录（2026-11-12）
+- Top-N里没有正确候选时，重排无法修复；Top-5 Acc≈90%仅表示约90%的样本前五至少有一个正确框。
+- 原Hungarian正候选不在集合中时，融合BCE仍监督其CRS logit；绑定排序项缺少集合内正例，仍跳过，不偷偷改标签或向Top-N注入GT。
+- 正候选和完全不重叠负候选共存的样本可能有限，要观察有效监督数量。
+- 绑定得分方向未必正确，不能仅靠增大β解决；参考物可能是背景，正确配置也未必满足文本。
+- 无关系描述、多解标注、参考物漏检、原CRS过度自信仍是限制。
+- 硬边界排序与跨集合概率数值未必一致，所有下游排序必须遵循priority接口。
+- 本次只修正全候选融合BCE口径并删除旧BIRS兼容分支，没有增加门控、损失类型、外部监督或文本解析。推理仍有硬边界，BCE直接监督logit而非排序操作本身。性能是否提高需重新训练验证。
 
-- BIRS 独立测试 18 项通过。
-- 新分支测试覆盖重绑定精确期望、独立边际消除、合法参考集合一致性、单参考回退、同语义零残差、非线性几何避免平移消失、分块/padding 一致性、梯度路径、损失接入与权重、checkpoint 策略校验、诊断接口以及完整检测头前后向。
-- 与本次修改前保存的 `REFHead.py` 快照比较：BIRS 关闭、Grab/BCEM 四种开关组合下，参数、RNG、训练预测/损失、参数梯度、测试预测逐位一致。
-- 原 optional pipeline、Grab、BCEM ray、correctness 共 45 项回归测试通过；原 two-stage relation 的 36 项测试通过。
-- 空闲第二张 4090 上，以随机 `[1,768,36,36]` 输入、256 queries 运行检测头前向/反向/一次 Adam 优化与测试；覆盖基础、BCEM+截断、Grab+BCEM 三种组合，新分支默认增加 281,601 个参数。随机 Grab 丢失 refer 正候选的情况按设计跳过新增监督，eval 回退；此项不等同于真实数据性能测试。
-- 两进程 CPU DDP/Gloo 连续两步：一个 rank 无 refer GT，两个 rank 梯度一致，并与全局有效样本的单进程梯度对齐。
-- 没有启动完整训练或跑全量验证集；性能、实际训练吞吐与论文层面的创新性尚未由这些功能测试证明。
+## 9. 本次验证范围
+
+104项测试通过，覆盖全候选BCE数值及其梯度、正候选在Top-N外、没有绑定参考时的监督保留、Top-N硬边界、独立参考池及原PropVG/Grab/BCEM/correctness等回归路径。
+
+GPU两样本测试验证联合/截断梯度下全256候选BCE；集合外正logit的梯度与全候选平均公式一致。两进程CPU DDP连续两步通过：两个rank都参与融合BCE，只有一个rank存在绑定配对，参数梯度仍同步。加入BIRS前BASE归档配置及真实检测头权重严格加载，初始化RNG和检测头推理输出与归档实现逐位一致。
+
+本次未启动完整训练，未停止用户运行中的实验，也未修改既有实验归档。

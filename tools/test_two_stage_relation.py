@@ -359,6 +359,7 @@ class RelationHeadIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(2)
         cls.options=copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
+        cls.options["enable_birs"]=False
         cls.options.update(num_queries=8,enable_grab=False,enable_bcem=False,enable_mask=False,enable_crv=False,
                            enable_correctness=False,enable_relation_refinement=False,
                            relation_refinement=dict(target_topk=4,reference_topk=6,model_dim=16,num_heads=4,

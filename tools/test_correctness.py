@@ -201,6 +201,7 @@ class CorrectnessIntegrationTests(unittest.TestCase):
     def setUpClass(cls):
         torch.set_num_threads(2)
         cls.options = copy.deepcopy(Config.fromfile('configs/aerialvg/PropVG-aerialvg.py').model.head)
+        cls.options["enable_birs"] = False
         cls.options.update(num_queries=8, enable_mask=False, enable_crv=False, enable_relation_refinement=False,
                            correctness=dict(hidden_dim=16, topk=5))
         cls.options['bcem'] = dict(context_dim=16, sampling_mode='ray', num_rays=4,
