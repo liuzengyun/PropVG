@@ -30,6 +30,7 @@ from .counterfactual_refinement import CounterfactualRefinement
 from .background_context import BackgroundContextEnhancement
 from .top1_correctness import Top1CorrectnessHead
 from .two_stage_relation import TwoStageRelationRefinement
+from .binding_residual import BindingInteractionResidualScoring
 
 
 class GlobalCrossAttention(nn.Module):
@@ -456,12 +457,16 @@ class REFHead(nn.Module):
         relation_scoring=None,
         enable_relation_refinement=False,
         relation_refinement=None,
+        enable_birs=False,
+        birs=None,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
         self.enable_mask = enable_mask
         self.enable_bcem = enable_bcem
         self.enable_crv = enable_crv
+        if enable_birs and (enable_crv or enable_relation_refinement):
+            raise ValueError("BIRS cannot be combined with CRV or two-stage relation refinement")
         if enable_relation_refinement and enable_crv:
             raise ValueError("Use either two-stage relation refinement or CRV, not two sequential rerankers")
         if enable_relation_scoring:
@@ -607,12 +612,30 @@ class REFHead(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(seed)
                 self.relation_refiner = TwoStageRelationRefinement(hidden_channels=hidden_channels, **options)
+        self.birs = None
+        if enable_birs:
+            options = dict(birs or {})
+            seed = int(options.pop("init_seed", 6817))
+            with torch.random.fork_rng(devices=[]):
+                torch.random.default_generator.manual_seed(seed)
+                self.birs = BindingInteractionResidualScoring(hidden_channels=hidden_channels, **options)
 
     def _score_referring(self, query, text, text_mask):
-        if self.enable_crv or self.correctness is not None or self.relation_refiner is not None:
+        if self.enable_crv or self.correctness is not None or self.relation_refiner is not None or self.birs is not None:
             return self.mrsm(query, text, text_mask, return_logits=True)
         score, attention = self.mrsm(query, text, text_mask)
         return score, attention, None
+
+    def _binding_residual(self, queries, boxes, classes, text, text_mask, scores, logits,
+                          img_metas, decoder_queries, decoder_boxes, decoder_classes, source_indices):
+        # Grab may prune targets, but must not remove the original reference pool.
+        return self.birs(
+            queries, boxes, classes, text, text_mask, scores, logits, img_metas,
+            reference_queries=self.refer_adapter(decoder_queries) if self.enable_grab else queries,
+            reference_boxes=decoder_boxes if self.enable_grab else boxes,
+            reference_classes=decoder_classes if self.enable_grab else classes,
+            source_indices=source_indices,
+        )
 
     def _refine_relations(self, queries, boxes, classes, text, text_mask, scores, logits,
                           img_metas, decoder_queries, decoder_boxes, decoder_classes, source_indices):
@@ -855,6 +878,19 @@ class REFHead(nn.Module):
             "loss_filter": loss_filter,
         }
         ranking_priority = None
+        if self.birs is not None:
+            binding = self._binding_residual(
+                refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,
+                refer_label, refer_logits, img_metas, inter_states[-1], outputs_coord[-1],
+                outputs_class[-1], selected_indices,
+            )
+            refer_score, ranking_priority = binding["scores"], binding["ranking_priority"]
+            birs_losses, birs_metrics = self.birs.loss(binding, targets["bbox"], img_metas, target_gt_refer)
+            loss_dict.update(birs_losses)
+            loss_dict.update({"metric_birs_" + key: value for key, value in birs_metrics.items()})
+            refer_logits = binding["final_logits"]
+            if "diagnostics" in binding:
+                extra_dict["birs_samples"] = binding["diagnostics"]
         if self.relation_refiner is not None:
             relation = self._refine_relations(
                 refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,
@@ -998,6 +1034,16 @@ class REFHead(nn.Module):
         refer_score = refer_label
 
         ranking_priority = None
+        if self.birs is not None:
+            binding = self._binding_residual(
+                refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,
+                refer_label, refer_logits, img_metas, inter_states[-1], outputs_coord[-1],
+                outputs_class[-1], selected_indices,
+            )
+            refer_score, ranking_priority = binding["scores"], binding["ranking_priority"]
+            refer_logits = binding["final_logits"]
+            if "diagnostics" in binding:
+                extra_dict["birs_samples"] = binding["diagnostics"]
         if self.relation_refiner is not None and int(self.relation_refiner.trained_steps) > 0:
             relation = self._refine_relations(
                 refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,

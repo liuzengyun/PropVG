@@ -50,6 +50,9 @@ def clip_training_gradients(model, max_norm):
     independent = [branch for branch in (getattr(head, "crv", None), getattr(head, "correctness", None))
                    if branch is not None]
     relation = getattr(head, "relation_refiner", None)
+    birs = getattr(head, "birs", None)
+    if birs is not None and birs.detach_inputs:
+        independent.append(birs)
     if relation is not None and relation.detach_inputs:
         # Detaching the loss is insufficient on its own: including new head
         # gradients in a global norm would still change the CRS update scale.
@@ -104,6 +107,15 @@ def train_model(epoch, cfg, model, optimizer, loader):
                 elif key.startswith("metric_crv_"):
                     crv_values[key[len("metric_"):]] = losses.pop(key).detach()
         correctness_values = {}
+        birs_values = {}
+        if "loss_birs_final" in losses:
+            for key in tuple(losses):
+                if key.startswith("loss_birs_"):
+                    value = losses.pop(key)
+                    loss = loss + value
+                    birs_values[key] = value.detach()
+                elif key.startswith("metric_birs_"):
+                    birs_values[key[len("metric_"):]] = losses.pop(key).detach()
         relation_values = {}
         if "loss_relation_final" in losses:
             value = losses.pop("loss_relation_final")
@@ -129,6 +141,10 @@ def train_model(epoch, cfg, model, optimizer, loader):
         if cfg.grad_norm_clip:
             clip_training_gradients(model, cfg.grad_norm_clip)
         optimizer.step()
+        if birs_values and birs_values["birs_supervised_samples"].item() > 0:
+            base_model = model.module if hasattr(model, "module") else model
+            base_model.head.birs.mark_optimizer_step()
+        crv_values.update(birs_values)
         if correctness_values and correctness_values["correctness_valid_samples"].item() > 0:
             base_model = model.module if hasattr(model, "module") else model
             base_model.head.correctness.mark_optimizer_step()

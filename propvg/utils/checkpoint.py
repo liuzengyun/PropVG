@@ -82,6 +82,22 @@ def _validate_relation_refinement_checkpoint(model, state):
             raise ValueError("Two-stage relation refinement checkpoint policy differs from config: " + key)
 
 
+def _validate_birs_checkpoint(model, state):
+    """Enabled BIRS must not silently load random/incompatible branch weights."""
+    base = model.module if hasattr(model, "module") else model
+    branch = getattr(getattr(base, "head", None), "birs", None)
+    if branch is None:
+        return
+    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
+    expected = {"head.birs." + key: value for key, value in branch.state_dict().items()}
+    if not expected.keys() <= normalized.keys() or any(normalized[key].shape != value.shape for key, value in expected.items()):
+        raise ValueError("Enabled BIRS requires its complete checkpoint. For baseline initialization use "
+                         "--finetune-from; for old-model evaluation set enable_birs=False.")
+    for key in ("schema_version", "policy_signature"):
+        if not torch.equal(normalized["head.birs." + key].cpu(), getattr(branch, key).cpu()):
+            raise ValueError("BIRS checkpoint policy differs from config: " + key)
+
+
 def _load_optimizer_state(model, optimizer, checkpoint, model_state):
     """Resume across removal of inactive branches without shifting Adam states."""
     saved = checkpoint["optimizer"]
@@ -191,6 +207,8 @@ def load_pretrained_checkpoint(model, finetune_from=None, amp=False, dataset=Non
     if is_paral_state(state) and not is_paral_model(model):
         state = de_parallel(state)
     state_copy = copy.deepcopy(state)
+    if any((key[7:] if key.startswith("module.") else key).startswith("head.birs.") for key in state_copy):
+        _validate_birs_checkpoint(model, state_copy)
     # state_copy.pop("lan_enc.embedding.weight")
 
     # model_seq_embed_dim = model.head.transformer.seq_positional_encoding.embedding.weight.size(
@@ -236,6 +254,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
     _validate_correctness_checkpoint(model, state)
     _validate_crs_checkpoint(model, state)
     _validate_relation_refinement_checkpoint(model, state)
+    _validate_birs_checkpoint(model, state)
     try:
         model.load_state_dict(state, strict=True)
     except:

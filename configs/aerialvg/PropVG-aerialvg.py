@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-bcem-rays-16"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-birs"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -63,6 +63,17 @@ crv_grid_size = 48  # Pool complete original/intervened feature maps; no local c
 crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
+
+# BIRS: 默认关闭。旧 CRS、Grab、BCEM 及其权重加载行为保持不变。
+# 开启时与旧 CRV / relation_refinement 互斥；全部候选仍参与最终排名。
+enable_birs = True
+birs = dict(num_groups=8, reference_topk=64, duplicate_iou=0.8,
+            model_dim=128, num_heads=4, kmeans_iters=6, chunk_size=32,
+            initial_strength=0.1, max_strength=2.0,
+            final_loss_weight=1.0, binding_loss_weight=0.1,
+            negative_topk=8, detach_inputs=False)
+
+
 # CRS -> shared-reference relational refinement. Disabled preserves old models.
 # Train alongside CRS; independent of teacher/auxiliary GT; not with CRV.
 enable_relation_refinement = False
@@ -81,9 +92,9 @@ relation_refinement = dict(
 
 # 背景信息嵌入的候选增强模块
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = True
+enable_bcem = False
 bcem_sampling_mode = "ray"
-bcem_num_rays = 16
+bcem_num_rays = 12
 # Used only by sector mode; 8 reproduces the original direction order.
 bcem_num_sectors = 4
 
@@ -147,6 +158,7 @@ model = dict(
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_correctness=enable_correctness, correctness=correctness,
               enable_relation_refinement=enable_relation_refinement,
+              enable_birs=enable_birs, birs=birs,
               relation_refinement=relation_refinement,
               enable_crv=enable_crv,
               crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
