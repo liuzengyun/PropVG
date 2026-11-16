@@ -45,11 +45,15 @@ def _validate_crv_checkpoint(model, state):
     if crv is None or not hasattr(crv, "schema_version"):
         return
     normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
-    expected = {"head.crv." + name for name in crv.state_dict()}
+    expected = {"head.crv." + name: value for name, value in crv.state_dict().items()}
     version = normalized.get("head.crv.schema_version")
-    if not expected.issubset(normalized) or version is None or int(version) != int(crv.schema_version):
+    if not expected.keys() <= normalized.keys() or version is None or int(version) != int(crv.schema_version) \
+            or any(normalized[key].shape != value.shape for key, value in expected.items()):
         raise ValueError("Enabled CRV requires a complete compatible CRV checkpoint. "
                          "To start CRV training from a baseline, use --finetune-from instead of --load-from/--resume-from.")
+    if hasattr(crv, "policy_signature") and not torch.equal(
+            normalized["head.crv.policy_signature"].cpu(), crv.policy_signature.cpu()):
+        raise ValueError("CRV checkpoint policy differs from configuration")
 
 
 def _validate_crs_checkpoint(model, state):
@@ -207,6 +211,8 @@ def load_pretrained_checkpoint(model, finetune_from=None, amp=False, dataset=Non
     if is_paral_state(state) and not is_paral_model(model):
         state = de_parallel(state)
     state_copy = copy.deepcopy(state)
+    if any((key[7:] if key.startswith("module.") else key).startswith("head.crv.") for key in state_copy):
+        _validate_crv_checkpoint(model, state_copy)
     if any((key[7:] if key.startswith("module.") else key).startswith("head.birs.") for key in state_copy):
         _validate_birs_checkpoint(model, state_copy)
     # state_copy.pop("lan_enc.embedding.weight")

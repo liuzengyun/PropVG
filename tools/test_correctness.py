@@ -302,7 +302,7 @@ class CorrectnessIntegrationTests(unittest.TestCase):
     def test_correctness_coexists_with_crv_without_changing_crv_gradients_or_ranking(self):
         options = dict(self.options, enable_grab=False, enable_bcem=False, enable_crv=True,
                        crv=dict(scorer_dim=16, scorer_heads=4, scorer_layers=1, grid_size=4,
-                                topk=5, uncertainty_threshold=0.))
+                                num_groups=10, min_targets=3, max_targets=5))
         torch.manual_seed(1301)
         baseline = build_head(dict(options, enable_correctness=False))
         torch.manual_seed(1301)

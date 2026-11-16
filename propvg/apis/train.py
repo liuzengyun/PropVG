@@ -48,7 +48,7 @@ def clip_training_gradients(model, max_norm):
     base_model = model.module if hasattr(model, "module") else model
     head = getattr(base_model, "head", base_model)
     independent = [branch for branch in (getattr(head, "crv", None), getattr(head, "correctness", None))
-                   if branch is not None]
+                   if branch is not None and not getattr(branch, "joint_training", False)]
     relation = getattr(head, "relation_refiner", None)
     birs = getattr(head, "birs", None)
     if birs is not None and birs.detach_inputs:
@@ -97,8 +97,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss = loss_det + loss_mask + loss_label_nt + loss_refer + loss_filter
         crv_values = {}
         if "loss_crv_cf" in losses:
-            # Preserve old CRV fields while collecting optional new losses and
-            # diagnostics; CRV-disabled baseline logging is unchanged.
+            # Collect the independent CRV loss terms and diagnostics;
+            # CRV-disabled baseline logging is unchanged.
             for key in tuple(losses):
                 if key.startswith("loss_crv_"):
                     value = losses.pop(key)
@@ -141,6 +141,9 @@ def train_model(epoch, cfg, model, optimizer, loader):
         if cfg.grad_norm_clip:
             clip_training_gradients(model, cfg.grad_norm_clip)
         optimizer.step()
+        if crv_values and crv_values.get("crv_supervised_samples", torch.tensor(0.)).item() > 0:
+            base_model = model.module if hasattr(model, "module") else model
+            base_model.head.crv.mark_optimizer_step()
         if birs_values and birs_values["birs_supervised_samples"].item() > 0:
             base_model = model.module if hasattr(model, "module") else model
             base_model.head.birs.mark_optimizer_step()

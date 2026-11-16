@@ -921,6 +921,7 @@ class REFHead(nn.Module):
             loss_dict.update(crv_losses)
             for key in self.crv.metric_names:
                 loss_dict["metric_crv_" + key] = crv_info["crv_" + key]
+            refer_logits = crv_info["crv_final_logits"]
             extra_dict.update(crv_info)
 
         pred_dict = {
@@ -934,6 +935,8 @@ class REFHead(nn.Module):
             pred_dict["ranking_priority"] = ranking_priority.detach()
         if self.birs is not None and self.birs.version == "v3":
             pred_dict["candidate_output_mask"] = binding["output_mask"].detach()
+        if self.enable_crv:
+            pred_dict["candidate_output_mask"] = crv_info["crv_output_mask"]
         if self.correctness is not None:
             observation = self.correctness(refer_query_embed, bound_boxes, lan_feat, lan_mask,
                                            refer_score, refer_logits, selected_classes, img_metas, ranking_priority)
@@ -1068,6 +1071,7 @@ class REFHead(nn.Module):
                 multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
                 refer_label, refer_logits, img_metas, refer_query_embed,
             )
+            refer_logits = crv_info["crv_final_logits"]
             extra_dict.update(crv_info)
 
         pred_dict = {
@@ -1081,6 +1085,8 @@ class REFHead(nn.Module):
             pred_dict["ranking_priority"] = ranking_priority.detach()
         if self.birs is not None and self.birs.version == "v3":
             pred_dict["candidate_output_mask"] = binding["output_mask"].detach()
+        if self.enable_crv:
+            pred_dict["candidate_output_mask"] = crv_info["crv_output_mask"]
         if self.correctness is not None:
             self.correctness.require_trained()
             observation = self.correctness(refer_query_embed, bound_boxes, lan_feat, lan_mask,

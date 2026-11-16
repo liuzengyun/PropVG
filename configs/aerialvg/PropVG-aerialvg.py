@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-birs3+bcem"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-crv1116"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -56,11 +56,11 @@ enable_correctness = False
 correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
                    loss_weight=1.0, decision_threshold=0.5)
 
-# 基于反事实推理的候选重排序模块，放在CRS之后，增强候选的语义区分能力。
+# 聚类自适应Top-N的全图mask CRV；联合训练，无熵/不确定性门控。
+# 开启CRV实验时同时设置 enable_birs=False；其他模块开关自行保持。
 enable_crv = False
-crv_topk = 5  # Reorder only these candidates; Top-5 membership is preserved.
+crv_num_groups = 10
 crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
-crv_uncertainty_threshold = 0.5  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
 
@@ -68,7 +68,7 @@ crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 
 # v1：第一版，所有有效候选按外观聚类，簇内原型/中心化，全局重排。
 # v2：第二版，CRS Top-N共用原型，只在Top-N内部重排（保留全候选BCE修复）。
 # v3：聚类自适应Top-N + 稀疏关系读取 + 显式重绑定对照，仅输出Top-N。
-enable_birs = True
+enable_birs = False
 birs_version = "v3"  # "v1" / "v2" / "v3"；不改变 enable_bcem 等其他开关。
 birs_target_topn = 5
 birs_num_groups = 8  # v1/v3使用；不是只保留得分最高的一簇。
@@ -107,7 +107,7 @@ relation_refinement = dict(
 
 # 背景信息嵌入的候选增强模块
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = True
+enable_bcem = False
 bcem_sampling_mode = "ray"
 bcem_num_rays = 16
 # Used only by sector mode; 8 reproduces the original direction order.
@@ -176,19 +176,17 @@ model = dict(
               enable_birs=enable_birs, birs=birs,
               relation_refinement=relation_refinement,
               enable_crv=enable_crv,
-              crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
+              crv=dict(num_groups=crv_num_groups, kmeans_iters=6,
+                       seed_topk=3, min_targets=3, max_targets=32,
+                       grid_size=crv_grid_size,
                        start_epoch=crv_start_epoch,
                        scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
-                       inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
-                       uncertainty_temperature=1.0, gate_initial_probability=0.5,
-                       uncertainty_threshold=crv_uncertainty_threshold,
-                       cf_temperature=1.0,  # Independent CRV ranking only; fusion calibrates CF logits.
-                       negative_gt_coverage=0.01, gt_loss_weight=0.5,
-                       cf_loss_weight=1, fusion_loss_weight=1.0,
-                       gate_loss_weight=1.0, gate_dim=64,
-                       calibration_eps=1e-4, calibration_min_scale=0.1,
+                       inner_scale=1.5, outer_scale=2.0,
+                       initial_strength=0.1, max_strength=2.0,
+                       negative_gt_coverage=0.01, gt_loss_weight=0.1,
+                       cf_loss_weight=0.1, fusion_loss_weight=1.0,
                        positive_margin=1.0, ranking_margin=0.5,
-                       safety_margin=0.5, safety_weight=2.0, repair_weight=2.0),
+                       checkpoint_chunks=True),
               enable_bcem=enable_bcem,
               bcem=dict(context_dim=128, num_heads=4, num_sectors=bcem_num_sectors,
                         sampling_mode=bcem_sampling_mode, num_rays=bcem_num_rays,

@@ -52,11 +52,10 @@ enable_mask = False
 enable_correctness = False
 correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
                    loss_weight=1.0, decision_threshold=0.5)
-# Independent post-CRS refinement; disabled to retain the previous pipeline.
+# Joint cluster-adaptive full-scene CRV; disabled retains the previous pipeline.
 enable_crv = False
-crv_topk = 5
+crv_num_groups = 10
 crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
-crv_uncertainty_threshold = 0.6  # Only grouped entropy above this enables refinement.
 crv_start_epoch = 22  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
 img_size = 586
@@ -189,19 +188,16 @@ model = dict(
         enable_correctness=enable_correctness,
         correctness=correctness,
         enable_crv=enable_crv,
-        crv=dict(topk=crv_topk, uncertainty_topn=5, grid_size=crv_grid_size,
+        crv=dict(num_groups=crv_num_groups, kmeans_iters=6,
+                 seed_topk=3, min_targets=3, max_targets=32, grid_size=crv_grid_size,
                  start_epoch=crv_start_epoch,
                  scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
-                 inner_scale=1.5, outer_scale=2.0, duplicate_iou=0.8,
-                 uncertainty_temperature=1.0, gate_initial_probability=0.02,
-                 uncertainty_threshold=crv_uncertainty_threshold,
-                 cf_temperature=1.0,  # Independent CRV ranking only; fusion calibrates CF logits.
+                 inner_scale=1.5, outer_scale=2.0,
+                 initial_strength=0.1, max_strength=2.0,
                  negative_gt_coverage=0.01, gt_loss_weight=0.1,
                  cf_loss_weight=0.1, fusion_loss_weight=1.0,
-                 gate_loss_weight=1.0, gate_dim=64,
-                 calibration_eps=1e-4, calibration_min_scale=0.1,
                  positive_margin=1.0, ranking_margin=0.5,
-                 safety_margin=0.5, safety_weight=2.0, repair_weight=2.0),
+                 checkpoint_chunks=True),
     ),
     post_params=dict(
         score_weighted=False,
