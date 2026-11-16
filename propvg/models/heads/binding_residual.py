@@ -51,10 +51,14 @@ class BindingInteractionResidualScoring(nn.Module):
                  chunk_size=32, initial_strength=0.1, max_strength=2.0,
                  final_loss_weight=1.0, binding_loss_weight=0.1,
                  negative_topk=8, detach_inputs=False, binding_mode="residual",
-                 target_topn=5):
+                 target_topn=5, version="v2", num_groups=8, kmeans_iters=6):
         super().__init__()
+        if version not in ("v1", "v2"):
+            raise ValueError("BIRS version must be 'v1' (clustering) or 'v2' (CRS Top-N)")
+        self.version = version
         if any(int(x) != x or x < 1 for x in
-               (reference_topk, model_dim, num_heads, chunk_size, negative_topk, target_topn)):
+               (reference_topk, model_dim, num_heads, chunk_size, negative_topk, target_topn,
+                num_groups, kmeans_iters)):
             raise ValueError("BIRS counts/dimensions must be positive integers")
         if model_dim % num_heads or not 0 < duplicate_iou <= 1:
             raise ValueError("BIRS requires model_dim divisible by num_heads and 0 < duplicate_iou <= 1")
@@ -65,6 +69,7 @@ class BindingInteractionResidualScoring(nn.Module):
         if binding_mode not in ("residual", "paired", "crs_control"):
             raise ValueError("Unknown BIRS binding_mode")
         self.target_topn, self.reference_topk = int(target_topn), int(reference_topk)
+        self.num_groups, self.kmeans_iters = int(num_groups), int(kmeans_iters)
         self.duplicate_iou = duplicate_iou
         self.chunk_size, self.negative_topk = int(chunk_size), int(negative_topk)
         self.detach_inputs, self.binding_mode = bool(detach_inputs), binding_mode
@@ -84,12 +89,17 @@ class BindingInteractionResidualScoring(nn.Module):
                                               nn.LayerNorm(model_dim), nn.Tanh())
         self.strength_logit = nn.Parameter(torch.tensor(math.log(initial_strength / (max_strength - initial_strength))))
         self.register_buffer("trained_steps", torch.tensor(0, dtype=torch.long))
-        # Version 3 intentionally rejects old clustering / Top-N-only-BCE BIRS.
-        self.register_buffer("schema_version", torch.tensor(3, dtype=torch.long))
+        # Keep archived v1 and corrected v2 policy signatures unchanged. Schema
+        # numbers describe checkpoint semantics, NOT the user-facing v1/v2 name.
+        self.register_buffer("schema_version", torch.tensor(1 if version == "v1" else 3, dtype=torch.long))
         policy = dict(hidden_channels=hidden_channels, reference_topk=reference_topk,
                       duplicate_iou=duplicate_iou, model_dim=model_dim, num_heads=num_heads,
                       max_strength=max_strength, binding_mode=binding_mode,
                       target_topn=int(target_topn), final_loss_scope="all_valid_candidates")
+        if version == "v1":
+            policy.pop("target_topn")
+            policy.pop("final_loss_scope")
+            policy.update(num_groups=num_groups, kmeans_iters=kmeans_iters)
         digest = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).digest()
         self.register_buffer("policy_signature", torch.tensor(list(digest), dtype=torch.uint8))
 
@@ -137,6 +147,32 @@ class BindingInteractionResidualScoring(nn.Module):
             keep[:, j + 1:] &= ~(keep[:, j:j + 1] & (overlap[:, j, j + 1:] >= self.duplicate_iou))
         return indices, keep, picked, fg.gather(1, indices)
 
+    @torch.no_grad()
+    def cluster(self, queries, valid):
+        """Archived v1 deterministic spherical K-means; no GT or RNG draws."""
+        b, n, _ = queries.shape
+        g = min(self.num_groups, n)
+        q = F.normalize(torch.nan_to_num(queries.detach().float()), dim=-1)
+        mean = F.normalize((q * valid[..., None]).sum(1) / valid.sum(1).clamp(min=1)[:, None], dim=-1)
+        distance = (q - mean[:, None]).square().sum(-1).masked_fill(~valid, -1)
+        indices = distance.argmax(-1)
+        rows = torch.arange(b, device=q.device)
+        centers, minimum = [], torch.full_like(distance, float("inf"))
+        for _ in range(g):
+            center = q[rows, indices]
+            centers.append(center)
+            minimum = torch.minimum(minimum, (q - center[:, None]).square().sum(-1))
+            indices = minimum.masked_fill(~valid, -1).argmax(-1)
+        centers = torch.stack(centers, 1)
+        for _ in range(self.kmeans_iters):
+            assignment = (q @ centers.transpose(1, 2)).argmax(-1)
+            weights = F.one_hot(assignment, g).to(q.dtype) * valid[..., None]
+            counts = weights.sum(1)
+            pooled = weights.transpose(1, 2) @ q / counts.clamp(min=1)[..., None]
+            centers = torch.where(counts[..., None] > 0, F.normalize(pooled, dim=-1), centers)
+        assignment = (q @ centers.transpose(1, 2)).argmax(-1)
+        return assignment.masked_fill(~valid, -1)
+
     @staticmethod
     def geometry(target, reference, aspect):
         tc, rc = (target[..., :2] + target[..., 2:]) / 2, (reference[..., :2] + reference[..., 2:]) / 2
@@ -150,6 +186,17 @@ class BindingInteractionResidualScoring(nn.Module):
 
     def forward(self, queries, boxes, classes, text, text_mask, scores, logits, img_metas,
                 reference_queries=None, reference_boxes=None, reference_classes=None, source_indices=None):
+        if self.version == "v1":
+            output = self._score_selected(queries, boxes, classes, text, text_mask, scores, logits, img_metas,
+                                          reference_queries, reference_boxes, reference_classes, source_indices)
+            if "valid" in output:
+                output["candidate_mask"] = output["valid"]
+                output["target_indices"] = torch.arange(queries.shape[1], device=queries.device)[None].expand(queries.shape[0], -1)
+                output["target_valid"] = output["valid"]
+                if self.capture_diagnostics:
+                    for key in ("candidate_mask", "target_indices", "target_valid"):
+                        output["diagnostics"][key] = output[key].detach().cpu()
+            return output
         return self._forward_topn(queries, boxes, classes, text, text_mask, scores, logits, img_metas,
                                   reference_queries, reference_boxes, reference_classes, source_indices)
 
@@ -235,8 +282,12 @@ class BindingInteractionResidualScoring(nn.Module):
         ref_xyxy, ref_valid = self.clipped_boxes(reference_boxes, img_metas)
         valid = valid & torch.isfinite(queries).all(-1)
         ref_valid = ref_valid & torch.isfinite(reference_queries).all(-1)
-        groups = torch.zeros_like(valid, dtype=torch.long).masked_fill(~valid, -1)
-        g = 1
+        if self.version == "v1":
+            groups = self.cluster(queries, valid)
+            g = min(n, self.num_groups)
+        else:
+            groups = torch.zeros_like(valid, dtype=torch.long).masked_fill(~valid, -1)
+            g = 1
         membership = F.one_hot(groups.clamp(min=0), g).to(queries.dtype) * valid[..., None]
         prototypes = membership.transpose(1, 2) @ torch.nan_to_num(queries)
         prototypes = prototypes / membership.sum(1).clamp(min=1)[..., None]
@@ -340,6 +391,10 @@ class BindingInteractionResidualScoring(nn.Module):
         # Full-candidate localization supervision is independent of shortlist
         # coverage and available references. Outside Top-N, z is the CRS logit.
         active = present & ((labels > 0) & valid).any(1)
+        if self.version == "v1":
+            # Preserve the first experiment's loss eligibility, including the
+            # no-binding fallback; v2 deliberately removed this restriction.
+            active = active & eligible.any(1)
         per_sample = (F.binary_cross_entropy_with_logits(z, labels, reduction="none") * valid).sum(1)
         per_sample = per_sample / valid.sum(1).clamp(min=1)
         final_sum = (per_sample * active).sum() + zero

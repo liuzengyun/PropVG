@@ -193,7 +193,8 @@ class BIRSTests(unittest.TestCase):
 
     def test_topn_no_clustering_full_reference_pool_and_membership(self):
         m,args=self.module(target_topn=5),self.inputs()
-        self.assertFalse(hasattr(m,"cluster"))
+        self.assertEqual(m.version, "v2")
+        m.cluster = lambda *args: self.fail("v2 must not execute clustering")
         out=m(*args)
         self.assertEqual(out["target_indices"].tolist(),[[0,1,2,3,4]])
         self.assertEqual(out["scores"].shape,(1,8,1))
@@ -253,9 +254,10 @@ class BIRSTests(unittest.TestCase):
         self.assertEqual(int(m.schema_version),3)
         other=self.module(target_topn=8)
         self.assertFalse(torch.equal(m.policy_signature,other.policy_signature))
-        for obsolete in (dict(candidate_mode="cluster"),dict(num_groups=8),dict(kmeans_iters=6)):
-            with self.assertRaises(TypeError):
-                self.module(**obsolete)
+        with self.assertRaises(TypeError):
+            self.module(candidate_mode="cluster")
+        with self.assertRaises(ValueError):
+            self.module(version="unknown")
         wrapper=nn.Module();wrapper.head=nn.Module();wrapper.head.birs=m
         state={k:v.clone() for k,v in wrapper.state_dict().items()}
         state["head.birs.schema_version"].fill_(2)
@@ -266,6 +268,48 @@ class BIRSTests(unittest.TestCase):
         sum(losses.values()).backward()
         self.assertTrue(all(args[i].grad is None or args[i].grad.abs().sum()==0 for i in (0,1,2,3,6)))
         self.assertGreater(float(m.semantic_binding[0].weight.grad.abs().sum()),0)
+
+    def test_version1_clusters_all_candidates_and_separates_checkpoint_policy(self):
+        m, args = self.module(version="v1", num_groups=2, target_topn=1), self.inputs()
+        rng = torch.get_rng_state()
+        out = m(*args)
+        torch.testing.assert_close(rng, torch.get_rng_state())
+        self.assertEqual(int(m.schema_version), 1)
+        self.assertTrue(torch.equal(out["candidate_mask"], out["valid"]))
+        self.assertEqual(int(out["candidate_mask"].sum()), 7)
+        self.assertEqual(out["groups"][0, 7].item(), -1)
+        self.assertTrue(((out["groups"][out["valid"]] >= 0) & (out["groups"][out["valid"]] < 2)).all())
+        self.assertTrue(torch.equal(out["groups"], m.cluster(args[0], out["valid"])))
+        for i in out["groups"][out["valid"]].unique():
+            use = out["eligible"] & (out["groups"] == i)
+            self.assertLess(float(out["delta"][use].sum().abs()), 1e-6)
+        t, labels = self.supervision()
+        losses, _ = m.loss(out, t, args[-1], labels)
+        sum(losses.values()).backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters()))
+        wrapper = nn.Module(); wrapper.head = nn.Module(); wrapper.head.birs = m
+        _validate_birs_checkpoint(wrapper, wrapper.state_dict())
+        wrong = nn.Module(); wrong.head = nn.Module(); wrong.head.birs = self.module(version="v2")
+        with self.assertRaises(ValueError):
+            _validate_birs_checkpoint(wrong, wrapper.state_dict())
+
+    def test_v2_default_unchanged_and_v1_untrained_and_empty_fallback(self):
+        default, explicit = self.module(), self.module(version="v2", num_groups=3, kmeans_iters=2)
+        for key, value in default.state_dict().items():
+            torch.testing.assert_close(value, explicit.state_dict()[key], rtol=0, atol=0)
+        args = list(self.inputs())
+        out = self.module(version="v1").eval()(*args)
+        self.assertIsNone(out["ranking_priority"])
+        self.assertTrue(torch.equal(out["scores"], args[5]))
+        args[1] = torch.zeros_like(args[1])
+        m = self.module(version="v1")
+        out = m(*args)
+        t, labels = self.supervision()
+        losses, metrics = m.loss(out, t, args[-1], labels)
+        self.assertEqual(float(metrics["supervised_samples"]), 0)
+        self.assertEqual(float(sum(losses.values())), 0)
+        sum(losses.values()).backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in m.parameters()))
 
     def test_full_bce_survives_no_binding_evidence_and_uses_all_candidates(self):
         m,args=self.module(target_topn=5),list(self.inputs())
@@ -344,6 +388,7 @@ class BIRSTests(unittest.TestCase):
 
     def head_options(self):
         options=copy.deepcopy(Config.fromfile("configs/aerialvg/PropVG-aerialvg.py").model.head)
+        options.pop("birs", None)  # Legacy fixtures do not inherit the active v3 policy.
         options.update(enable_grab=False,enable_bcem=False,enable_crv=False,enable_correctness=False,
                        enable_relation_refinement=False,num_queries=8)
         return options

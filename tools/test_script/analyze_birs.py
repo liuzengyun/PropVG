@@ -121,6 +121,10 @@ def main():
     def hook(module,inputs,result):
         captured.clear()
         captured.update({key:result[key].detach().cpu() for key in wanted})
+        # V3 keeps full logits for BCE but exports only its adaptive prefix.
+        for key in ("output_mask", "candidate_mask", "target_indices", "target_valid"):
+            if key in result:
+                captured[key] = result[key].detach().cpu()
 
     handle=stage.register_forward_hook(hook)
     output.mkdir(parents=True)
@@ -149,14 +153,16 @@ def main():
                         valid=detail["valid"]
                         ids=valid.nonzero(as_tuple=True)[0]
                         before=ids[detail["base_scores"][ids].argsort(descending=True)]
-                        after=ids[detail["ranking_priority"].reshape(-1)[ids].argsort(descending=True,stable=True)]
+                        final_valid=valid & detail.get("output_mask",valid)
+                        final_ids=final_valid.nonzero(as_tuple=True)[0]
+                        after=final_ids[detail["ranking_priority"].reshape(-1)[final_ids].argsort(descending=True,stable=True)]
                         h,w=meta["img_shape"][:2]
                         boxes=detail["boxes"]*torch.tensor([w,h,w,h])
                         intersection=(torch.minimum(boxes[:,2:],target[2:])-torch.maximum(boxes[:,:2],target[:2])).clamp(min=0).prod(1)
                         iou=intersection/((boxes[:,2:]-boxes[:,:2]).clamp(min=0).prod(1)+(target[2:]-target[:2]).clamp(min=0).prod()-intersection).clamp(min=1e-6)
                         actual=pred["ranking_logits"].reshape(-1).cpu().argsort(descending=True,stable=True)
                         torch.testing.assert_close(pred["boxes"][actual].float().cpu(),boxes[after],rtol=1e-5,atol=2e-3)
-                        torch.testing.assert_close(pred["scores"].reshape(-1).cpu(),detail["final_logits"].reshape(-1)[valid].sigmoid(),rtol=1e-5,atol=1e-7)
+                        torch.testing.assert_close(pred["scores"].reshape(-1).cpu(),detail["final_logits"].reshape(-1)[final_valid].sigmoid(),rtol=1e-5,atol=1e-7)
                         row=dict(dataset_index=index,filename=meta["filename"],expression=sample["expression"],
                                  eligible_fraction=float(detail["eligible"].float().mean()),delta_abs_mean=float(detail["delta"].abs().mean()),
                                  raw_binding_std=float(detail["raw_binding"].std()),reference_count=int(detail["reference_valid"].sum()))

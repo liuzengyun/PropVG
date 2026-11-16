@@ -274,6 +274,12 @@ class MIXRefUniModel_OMG(OneStageModel):
                 # and removes empty boxes. Apply that same post-clip mask to
                 # referring scores, whether optional logits exist or not.
                 kept = results_per_image.pred_boxes.nonempty()
+                if "candidate_output_mask" in pred:
+                    # V3 outputs ONLY its adaptive prefix. Apply the same
+                    # query mask to Boxes, detector/referring scores and ranks.
+                    output_mask = pred["candidate_output_mask"][ind].bool()
+                    r = r[output_mask[kept]]
+                    kept = kept & output_mask
                 refer_score = refer_pred[ind, :, 0][kept]
                 if rank_logits is not None:
                     rank_logits = rank_logits[kept]
