@@ -21,7 +21,8 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
                  seed_topk=3, min_targets=5, max_targets=32, reference_topk=64,
                  duplicate_iou=0.8, model_dim=128, num_heads=4, chunk_size=8,
                  permutations=2, initial_strength=0.1, max_strength=2.0,
-                 final_mix=0.5, detach_inputs=False, checkpoint_chunks=True):
+                 final_mix=0.5, detach_inputs=False, checkpoint_chunks=True,
+                 cf_loss_weight=0.0, cf_margin=0.2, attention_soft_mix=0.0):
         nn.Module.__init__(self)
         if version != "v3":
             raise ValueError("AdaptiveBindingResidualScoring requires version='v3'")
@@ -35,12 +36,17 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
             raise ValueError("Invalid BIRS v3 dimensions or duplicate IoU")
         if not 0 < initial_strength < max_strength or not 0 < final_mix < 1:
             raise ValueError("BIRS v3 requires 0 < initial_strength < max_strength and 0 < final_mix < 1")
+        if (not all(math.isfinite(v) for v in (cf_loss_weight, cf_margin, attention_soft_mix))
+                or cf_loss_weight < 0 or cf_margin < 0 or not 0 <= attention_soft_mix <= 1):
+            raise ValueError("BIRS v3 requires finite nonnegative CF weight/margin and soft mix in [0,1]")
         self.version = version
         self.num_groups, self.kmeans_iters = int(num_groups), int(kmeans_iters)
         self.seed_topk, self.min_targets, self.max_targets = int(seed_topk), int(min_targets), int(max_targets)
         self.reference_topk, self.duplicate_iou = int(reference_topk), float(duplicate_iou)
         self.chunk_size, self.permutations = int(chunk_size), int(permutations)
         self.final_mix, self.detach_inputs = float(final_mix), bool(detach_inputs)
+        self.cf_loss_weight, self.cf_margin = float(cf_loss_weight), float(cf_margin)
+        self.attention_soft_mix = float(attention_soft_mix)
         self.max_strength, self.checkpoint_chunks = float(max_strength), bool(checkpoint_chunks)
         self.capture_diagnostics = False
         self.target_projection = nn.Linear(hidden_channels, model_dim)
@@ -63,6 +69,12 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
                       max_strength=max_strength, final_mix=final_mix,
                       reference_source="pre_bcem_decoder", permutation="legal_cyclic_v1",
                       output="prefix_only", loss="full_valid_two_stage_bce")
+        # Loss-only settings do not change inference or parameter layout. Keep
+        # the old signature byte-for-byte when soft mixing is absent/zero so
+        # historical v3 checkpoints remain testable with their original cfg.
+        # A nonzero mix DOES change inference, hence must match the checkpoint.
+        if self.attention_soft_mix:
+            policy["attention_soft_mix"] = self.attention_soft_mix
         digest = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).digest()
         self.register_buffer("policy_signature", torch.tensor(list(digest), dtype=torch.uint8))
 
@@ -77,6 +89,19 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
         count = (1+ranks*ordered > cumulative).sum(-1, keepdim=True).clamp(min=1)
         tau = (cumulative.gather(-1, count-1)-1)/count
         return (z-tau).clamp(min=0).masked_fill(~allowed, 0).to(logits.dtype)
+
+    def reference_weights(self, logits, allowed):
+        """Retain sparse selection, optionally add a differentiable soft path.
+
+        Use the same mixture at train/test. The null slot stays legal and can
+        still receive most mass; neither invalid references nor GT enter it.
+        Zero mix uses exactly the historical arithmetic (no multiply/add).
+        """
+        sparse = self.sparse_weights(logits, allowed)
+        if not self.attention_soft_mix:
+            return sparse, sparse
+        soft = F.softmax(logits.float().masked_fill(~allowed, float('-inf')), -1).to(sparse.dtype)
+        return (1-self.attention_soft_mix)*sparse+self.attention_soft_mix*soft, sparse
 
     @torch.no_grad()
     def select_targets(self, queries, valid, scores):
@@ -137,11 +162,36 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
         read = self.read_norm(tokens+read).reshape(b, k, r, d)
         sentence = sentence[:, None].expand(-1, k, -1)
         null = self.null_logit(torch.cat((target, sentence), -1))
-        attention = self.sparse_weights(torch.cat((self.evidence_logit(read).squeeze(-1), null), -1),
-                                        torch.cat((legal, legal.new_ones(b, k, 1)), -1))
+        attention, sparse = self.reference_weights(
+            torch.cat((self.evidence_logit(read).squeeze(-1), null), -1),
+            torch.cat((legal, legal.new_ones(b, k, 1)), -1))
         pooled = (attention[..., :-1, None]*read).sum(-2)  # Null VALUE is zero.
         support = self.support(torch.cat((target, sentence, pooled), -1)).squeeze(-1)
-        return support, attention
+        return support, attention, (sparse[..., :-1] > 0).sum(-1)
+
+    def filter_references(self, legal, target_boxes, reference_boxes):
+        return legal
+
+    def control_positions(self, geo, perm, target_boxes, reference_boxes, aspect):
+        return geo.gather(2, perm[..., None].expand_as(geo))
+
+    def control_reference_mask(self, legal, attention):
+        return legal
+
+    @property
+    def needs_control_masks(self):
+        return bool(self.cf_loss_weight)
+
+    def valid_control(self, geo, positions, legal, reference, perm, target_boxes, reference_boxes, aspect):
+        return (((positions-geo).abs().amax(-1) > 1e-6) & legal).any(-1)
+
+    def binding_evidence(self, actual, counter, eligible, control_masks):
+        return torch.where(eligible, actual-counter.mean(-1), torch.zeros_like(actual))
+
+    @property
+    def crs_bce_weight(self):
+        # Match the user's archived 20261118_084936 v3 experiment.
+        return 1.0
 
     def forward(self, queries, boxes, classes, text, text_mask, scores, logits, img_metas,
                 reference_queries=None, reference_boxes=None, reference_classes=None, source_indices=None):
@@ -175,36 +225,52 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
         aspect = queries.new_tensor([[m['img_shape'][1]/min(m['img_shape'][:2]),
                                      m['img_shape'][0]/min(m['img_shape'][:2])] for m in img_metas])
         factual, controls, attentions, control_attentions, legal_parts = [], [], [], [], []
+        sparse_counts, cf_control_masks = [], []
         for start in range(0, k, self.chunk_size):
             stop = min(k, start+self.chunk_size)
             legal = ref_keep[:, None] & selected_valid[:, start:stop, None] & text_valid[:, None, None]
             legal &= source[:, start:stop, None] != ref_indices[:, None]
             legal &= pairwise_iou(target_boxes[:, start:stop], ref_boxes) < self.duplicate_iou
+            legal = self.filter_references(legal, target_boxes[:, start:stop], ref_boxes)
             geo = self.geometry(target_boxes[:, start:stop], ref_boxes, aspect)
-            branch_scores, branch_attentions = [], []
+            branch_scores, branch_attentions, branch_sparse_counts = [], [], []
+            changed_controls = []
             for number in range(self.permutations+1):
                 positions = geo
                 if number:
-                    perm = self.permutation_indices(legal, source[:, start:stop], number-1)
-                    positions = geo.gather(2, perm[..., None].expand_as(geo))
+                    control_legal = self.control_reference_mask(legal, branch_attentions[0])
+                    perm = self.permutation_indices(control_legal, source[:, start:stop], number-1)
+                    positions = self.control_positions(geo, perm, target_boxes[:, start:stop], ref_boxes, aspect)
+                    if self.needs_control_masks:
+                        # An index rotation is not useful if it leaves all
+                        # legal geometric values unchanged. This validity test
+                        # is deterministic, GT-free, and not differentiable.
+                        with torch.no_grad():
+                            changed_controls.append(self.valid_control(
+                                geo, positions, legal, reference, perm,
+                                target_boxes[:, start:stop], ref_boxes, aspect))
                 # The same geometry encoder, relation reader and sparse selector
                 # are rerun for both factual and counterfactual arrangements.
                 geometry = self.geometry_projection(positions)
                 inputs = (target[:, start:stop], reference, geometry, t, padding, sentence, legal)
                 if self.training and self.checkpoint_chunks:
-                    score, attention = checkpoint(self._score, *inputs, use_reentrant=False)
+                    score, attention, sparse_count = checkpoint(self._score, *inputs, use_reentrant=False)
                 else:
-                    score, attention = self._score(*inputs)
+                    score, attention, sparse_count = self._score(*inputs)
                 branch_scores.append(score)
                 branch_attentions.append(attention)
+                branch_sparse_counts.append(sparse_count)
             factual.append(branch_scores[0]); controls.append(torch.stack(branch_scores[1:], -1))
             attentions.append(branch_attentions[0]); legal_parts.append(legal)
+            sparse_counts.append(branch_sparse_counts[0])
+            if self.needs_control_masks:
+                cf_control_masks.append(torch.stack(changed_controls, -1))
             if self.capture_diagnostics:
                 control_attentions.append(torch.stack(branch_attentions[1:], 2))
         actual, counter = torch.cat(factual, 1), torch.cat(controls, 1)
         attention, legal = torch.cat(attentions, 1), torch.cat(legal_parts, 1)
         eligible_selected = selected_valid & (legal.sum(-1) >= 2)
-        evidence = torch.where(eligible_selected, actual-counter.mean(-1), torch.zeros_like(actual))
+        evidence = self.binding_evidence(actual, counter, eligible_selected, cf_control_masks)
         strength = self.max_strength*self.strength_logit.sigmoid()
         selected_delta = evidence*strength
         if not self.training and int(self.trained_steps) == 0:
@@ -232,13 +298,36 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
                       delta=delta, eligible=scatter(eligible_selected), strength=strength,
                       legal_references=scatter(legal), reference_indices=ref_indices, reference_valid=ref_keep,
                       base_scores=scores.detach().squeeze(-1), selected_attention=attention,
-                      selected_support=actual, selected_controls=counter)
+                      selected_support=actual, selected_controls=counter,
+                      selected_sparse_reference_count=torch.cat(sparse_counts, 1))
+        if self.needs_control_masks:
+            output['cf_valid_controls'] = torch.cat(cf_control_masks, 1) & eligible_selected[..., None]
         if self.capture_diagnostics:
             output['diagnostics'] = {name: value.detach().cpu() for name, value in output.items() if torch.is_tensor(value)}
             output['diagnostics'].update(reference_boxes=ref_boxes.detach().cpu(),
                                          reference_confidence=confidence.detach().cpu(),
                                          selected_control_attention=torch.cat(control_attentions, 1).detach().cpu())
         return output
+
+    def counterfactual_terms(self, output, labels, active):
+        """One hinge per matched positive; average within each image first.
+
+        No GT is added to the candidate set. Positives outside the prefix,
+        missing GT, and unchanged/no-reference controls do not get CF labels.
+        The gap is unscaled by beta, allowing direct scorer supervision.
+        """
+        factual, controls = output['selected_support'], output['selected_controls']
+        valid_controls = output['cf_valid_controls']
+        count = valid_controls.sum(-1)
+        mean_control = (controls*valid_controls).sum(-1)/count.clamp(min=1)
+        gap = factual-mean_control
+        positive = ((labels.gather(1, output['target_indices']) > 0)
+                    & output['target_valid'] & (count > 0) & active[:, None])
+        positive_count = positive.sum(-1).clamp(min=1)
+        per_image = (F.relu(self.cf_margin-gap)*positive).sum(-1)/positive_count
+        mean_gap = (gap.detach()*positive).sum(-1)/positive_count
+        margin_met = ((gap.detach() >= self.cf_margin)*positive).sum(-1)/positive_count
+        return per_image, positive.any(-1), mean_gap, margin_met, positive, valid_controls
 
     def loss(self, output, targets, img_metas, refer_labels):
         valid = output['valid']
@@ -252,17 +341,30 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
         present = torch.tensor(present, device=z.device, dtype=torch.bool)
         active = present & ((labels > 0) & valid).any(-1)
         count = active.float().sum()
+        if self.cf_loss_weight:
+            cf_terms, cf_active, cf_gap, cf_margin_met, cf_positive, cf_controls = self.counterfactual_terms(
+                output, labels, active)
+            # Reduce counts and detached diagnostics together. In particular,
+            # a rank with no eligible CF positive must not dilute the global
+            # mean gap/accuracy merely by logging its local zero mean.
+            counts = torch.stack((count, cf_active.float().sum(), cf_gap.sum(), cf_margin_met.sum(),
+                                  cf_positive.float().sum(),
+                                  (cf_controls*cf_positive[..., None]).float().sum()))
         world = 1
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(count)
+            torch.distributed.all_reduce(counts if self.cf_loss_weight else count)
             world = torch.distributed.get_world_size()
+        if self.cf_loss_weight:
+            count = counts[0]
         zero = sum(p.sum()*0 for p in self.parameters())+torch.nan_to_num(z).sum()*0
         def bce(value):
             value = torch.where(valid, value, torch.zeros_like(value))
             per_sample = (F.binary_cross_entropy_with_logits(value, labels, reduction='none')*valid).sum(-1)/valid.sum(-1).clamp(min=1)
             return (per_sample*active).sum()*world/count.clamp(min=1)+zero
-        losses = dict(loss_birs_crs=(1-self.final_mix)*bce(base),
+        losses = dict(loss_birs_crs=self.crs_bce_weight*bce(base),
                       loss_birs_final=self.final_mix*bce(z))
+        if self.cf_loss_weight:
+            losses['loss_birs_cf'] = (cf_terms.sum()*world/counts[1].clamp(min=1)+zero)*self.cf_loss_weight
         corrected, harmed, changed, reachable = [], [], [], []
         for bi, (old, new) in enumerate(zip(output['before_orders'], output['after_orders'])):
             h, w = img_metas[bi]['img_shape'][:2]
@@ -284,9 +386,18 @@ class AdaptiveBindingResidualScoring(BindingInteractionResidualScoring):
                        eligible=output['eligible'].float().sum()/output['candidate_mask'].sum().clamp(min=1),
                        delta_abs=output['delta'].detach().abs().sum()/denominator,
                        null_attention=(attn[..., -1]*mask).sum()/denominator,
-                       sparse_reference_count=((attn[..., :-1] > 0).sum(-1)*mask).sum()/denominator,
+                       sparse_reference_count=(output['selected_sparse_reference_count']*mask).sum()/denominator,
                        refer_in_topn=(((labels > 0) & output['candidate_mask']).any(-1) & present).float().sum()/present.sum().clamp(min=1),
                        reachable=z.new_tensor(reachable).sum()/present.sum().clamp(min=1),
                        corrected=z.new_tensor(corrected).mean(), harmed=z.new_tensor(harmed).mean(),
                        rank_changed=z.new_tensor(changed).mean())
+        if self.attention_soft_mix:
+            metrics['mixed_reference_count'] = ((attn[..., :-1] > 0).sum(-1)*mask).sum()/denominator
+        if self.cf_loss_weight:
+            cf_count = counts[1].clamp(min=1)
+            metrics.update(cf_samples=counts[1],
+                           cf_gap=counts[2]/cf_count,
+                           cf_margin_met=counts[3]/cf_count,
+                           cf_positive_count=counts[4]/cf_count,
+                           cf_control_count=counts[5]/cf_count)
         return losses, metrics

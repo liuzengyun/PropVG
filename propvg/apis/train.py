@@ -18,6 +18,17 @@ except:
     pass
 
 
+# Only suppress these fields in the human-readable console/text log. Keep
+# collecting them for optimization, trained-step bookkeeping, and tracking.
+HIDDEN_BIRS_LOG_FIELDS = frozenset({
+    "loss_birs_final", "birs_supervised_samples", "birs_strength",
+    "birs_target_count", "birs_target_cap_rate", "birs_reference_count",
+    "birs_eligible", "birs_delta_abs", "birs_null_attention",
+    "birs_sparse_reference_count", "birs_refer_in_topn", "birs_reachable",
+    "birs_corrected", "birs_harmed", "birs_rank_changed",
+})
+
+
 def set_random_seed(seed, deterministic=False, strict=False):
     """Args:
     seed (int): Seed to be used.
@@ -188,7 +199,8 @@ def train_model(epoch, cfg, model, optimizer, loader):
                     + f"loss_refer: {sum(loss_refer_list) / len(loss_refer_list):.4f}, "
                     + f"loss_filter: {sum(loss_filter_list) / len(loss_filter_list):.4f}, "
                     + f"lr: {optimizer.param_groups[0]['lr']:.6f}, "
-                    + "".join(f"{key}: {sum(values) / len(values):.4f}, " for key, values in crv_history.items())
+                    + "".join(f"{key}: {sum(values) / len(values):.4f}, "
+                              for key, values in crv_history.items() if key not in HIDDEN_BIRS_LOG_FIELDS)
                 )
 
                 values = {

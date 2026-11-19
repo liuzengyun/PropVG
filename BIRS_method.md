@@ -1,8 +1,99 @@
 # 航拍视觉指代的文本条件竞争集合与关系绑定细化（BIRS）
 
-## 当前主方案：v3 自适应竞争范围与稀疏反事实关系细化
+## 当前主方案：第四版 v4——竞争式反事实关系细化
+
+更新日期：2026-11-18。代码：`propvg/models/heads/binding_residual_v4.py`。
+主配置选择 `birs_version="v4"`，`enable_birs=False` 时完全不调用该模块。
+v1/v2继续保留；`birs_version="v3"` 对齐用户指定的`PropVG-birs3+bcem8/20261118_084936`实验归档，而非更早Git提交。该实验已将CRS BCE改为1，融合BCE为0.5，无CF损失、无软注意力混合。
+v3与v4的两项BCE均为1/0.5；v4另加0.1倍CF损失。公平消融仍需区分新增CF监督与结构改动的收益。
+
+### 1. 动机：不只是让真实关系比打乱关系高
+
+旧正候选hinge只能要求正确候选自己的真实支持分高于对照分。若错误候选也获得同样增量，两者排名仍然不变；该损失甚至可为零。另一个实际风险是null选项垄断注意力：事实和对照都只读零关系，绑定差失去作用。v4因此同时处理“相对竞争监督不足”“空关系塌缩”“目标自身信息泄漏”和“无效反事实对照”。这些是待验证的工程与学习目标改进，不等价于已证明的因果识别或性能提升。
+
+### 2. 数据流与各操作目的
+
+设B为batch，M通常256个目标候选，P为原检测候选数，C=256，L通常64，D=128，R=min(64,P)。
+
+```text
+原编码器/检测解码器 → 原CRS → 原logit z[B,M,1]
+                    ↓ 原目标特征Q[B,M,C]（可经过BCEM/Grab）
+Q聚类8类 + CRS前3名所处簇 → 连续Top-N竞争范围（最少5、最多32）
+                    ↓ q[B,K,D]，K为本batch最大N
+原检测器Top64置信度 → IoU去重 → 参考v[B,R,D]（BCEM之前）
+                    ↓ 每目标独立排除自身/重叠泄漏参考
+参考语义 + 9维几何 + 目标 → 关系token[B,K,R,D]
+                    ↓ 读取完整文本[B,L,D]
+事实评分/注意力 → 对关注的至多4个合法参考交换中心位置，保留各自尺寸
+                    ↓ 用同一评分器重新评分，过滤无效对照
+Δ = 事实support - 有效对照support均值[B,K]
+                    ↓ β=2 sigmoid(a)，初值0.1
+z_final = z_CRS + βΔ → 只在连续Top-N中输出排序
+```
+
+1. **竞争范围不变。** 沿用v3确定性聚类、自适应连续前缀；离散选择不反传，不引入GT候选，不重新跑编码器/解码器。未进入前缀的候选仍计算完整定位BCE，但不输出、不参与该次反事实排序。
+2. **参考池不变，防泄漏更严。** 仍按检测置信度先Top64再IoU≥0.8去重，不补满；参考特征来自原pre-BCEM解码器，经原refer_adapter。除同query和原IoU排除外，计算交集分别除以目标面积、参考面积，两者最大值≥`reference_coverage=0.5`时排除。目的：排除大框包住目标或小框只截取目标一部分的伪参考；并非要求所有参考IoU严格为0。
+3. **稳定稀疏选择。** 合法参考+null一起做masked sparsemax。非法槽位用−∞参与排序，累计和时用0跳过无效尾部，避免旧−1e4占位值超过合法极低logit。始终保留合法null，避免全掩码softmax。
+4. **参考专用软路径。** `a=(1-ε)*sparsemax(refs+null)+ε*softmax(legal refs)`，默认ε=0.1。有合法参考时，真实参考总权重至少ε；无合法参考时软路径退回null。目的：即使稀疏路径只选null，关系value仍有读取/学习路径。它保证的是总权重，不保证参考正确，也不保证每个注意力logit永不饱和。训练和测试使用同一规则。
+5. **聚焦少量文本相关参考。** 按事实路径文本条件注意力，从合法参考中取至多`control_reference_topk=4`个，只在这些参考内部做确定性非原样循环置换，其他参考不动。选择截断梯度、不读GT。目的：避免大量低相关参考的改变稀释干预。早期注意力可能不准，仍须消融验证。
+6. **位置干预与尺寸解耦。** 置换参考中心位置，但保持各参考原宽高。重新一致计算offset、方向、距离和目标尺度归一化offset；原9维中的宽高比保持。若任何合法参考交换后超出图像边界，整次对照忽略。目的：减少“交换整套几何后外观—尺寸不一致”的简单检测捷径，不伪造图像像素。
+7. **检查对照有效性。** 除几何实际变化外，至少有一个被移动合法参考与交换来源的投影特征余弦距离大于`semantic_difference=0.05`。近乎相同的参考互换可能只是集合重排列，不能强迫网络制造差异。无有效对照时该目标Δ=0，训练CF也忽略；不因CF损失开关改变推理有效性规则。保留的对照仍不保证违反文本含义。
+8. **融合不换评分范式。** support是未校准标量而非概率；Δ为事实支持相对有效位置对照的差，β可学习，最终仍保留原CRS logit。没有熵门控，没有把错误候选的Δ全部压成0；错误候选也可能具有真实关系，监督的是与正确候选的相对竞争。
+
+### 3. 损失、标签与梯度
+
+全候选BCE仍用原Hungarian refer标签：匹配query为1，其余为0，不把所有IoU高的框改为正例。
+
+$$L = L_{\mathrm{det}}+L_{\mathrm{other}}+
+1\cdot L_{\mathrm{CRS\ BCE}}+0.5\cdot L_{\mathrm{final\ BCE}}+0.1\cdot L_{\mathrm{CF}}.$$
+
+原head的`loss_weight['refer']`仍乘前两项；CF只乘自身`cf_loss_weight`。检测、Grab/filter、BCEM、mask、correctness等原有权重不变。BCE每图按全部有效候选平均，再按全局有效图像平均，**不是只监督前N个**。
+
+CF正例p：原Hungarian正query、进入Top-N、有有效对照、预测框与refer GT的IoU严格>`cf_positive_iou=0.5`。
+CF负例n：同一图Top-N内原负query、有有效对照、与refer GT的IoU**恰好为0**，按原CRS logit选最多`cf_negative_topk=8`个。0<IoU≤0.5不参与CF负监督；没有合格正负对则跳过该图CF，不跳过BCE。
+
+$$L_{\mathrm{CF}}^{(b)}=\frac{1}{|\mathcal P_b|}
+\sum_{(p,n)\in\mathcal P_b}
+\max\left(0,m+\operatorname{sg}(z_n^{CRS}-z_p^{CRS})
+-\beta(\Delta_p-\Delta_n)\right),\quad m=0.2.$$
+
+目的：让新增反事实证据足以克服原错误排序的分差，而非仅提高正确候选的绝对支持差。若原排序已满足margin且反事实不破坏它，CF可为0；不强迫所有样本额外增大β。这里不再额外叠加旧正例hinge。
+
+- `detach_inputs=False`默认联合训练：最终BCE影响原CRS、候选/文本上游、关系评分器和β；CF影响关系评分器、β及共享候选/文本上游。
+- CF式中仅原logit差截断，不能通过改变该项的原CRS分差来投机降低CF。CF不直接优化CRS评分网络参数，但共享上游会间接影响CRS。
+- 框、聚类、参考筛选、有效性、正负选择均不反传；没有新增框回归。
+- `detach_inputs=True`时新增分支截断候选、参考、文本与其基准logit，但原CRS BCE继续训练原模型。
+- 多卡按全局CF有效图像归一化，某rank无正负对时仍参与相同collective并返回连通零梯度。
+
+### 4. 配置、兼容与验证接口
+
+当前完整配置：`configs/aerialvg/PropVG-aerialvg.py`，选择`birs_version="v4"`。切回`"v3"`选择指定实验的算法（CF=0、soft mix=0，CRS BCE=1、final BCE=0.5）。旧模型优先用归档配置测试。更早Git版本的0.5/0.5不是本次指定的v3训练权重；该权重修正不改变旧模型推理结果。
+
+v4有独立schema=5及推理策略签名；参考coverage、特征差阈值、干预参考数、注意力/干预算法都进入签名。v3 schema=4不变。不能拿v3权重用v4配置直接评估/恢复；也不能更改v4这些推理参数后静默声称测试同一个模型。训练用margin/正负选择阈值/CF权重只影响训练，不进入推理签名。
+
+接口延续`with model.head.birs.diagnostics():`与`extra_dict['birs_samples']`，保留全query索引、选中索引、合法参考、事实/对照support及注意力。新增/沿用`cf_valid_controls[B,K,P_cf]`表示真正计入Δ的对照；不可把所有`selected_controls`直接均值当作v4有效对照均值。
+
+CF指标在v4中的含义：`cf_samples`为全局有合格正负对的图像数；`cf_gap`为这些图像的平均β(Δp−Δn)；`cf_margin_met`为满足原logit差+margin要求的对比例；`cf_positive_count`为参与成对监督的正query数；`cf_control_count`为这些正query的有效对照总数。常规BIRS字段与`loss_birs_final`继续按此前要求隐藏终端/txt展示，但不删损失和完整追踪记录。
+
+测试脚本：`tools/test_birs_v4.py`。回归包含极低logit掩码、null塌缩读取、包含框过滤、尺寸保持、相同语义跳过、CF梯度边界、空GT/空参考/全padding、checkpoint重算、head训练/测试接线，以及直接读取指定实验归档源码对照v3默认前向和损失。
+
+本次验证：170项CPU回归通过（包含v4专项15项及原CRV/BIRS/Grab/BCEM/correctness/两阶段关系/可选管线测试）；实际双进程Gloo的3个小型优化步中，一侧无GT、一侧无有效CF、全局无GT的参数梯度均与单进程合并batch一致。主配置可正常解析、构造v4并格式化保存。未运行真实数据集完整训练、CUDA训练或性能评估，不能据此声称性能提升。
+
+### 5. 尚未解决的限制与实验要求
+
+语义特征相近阈值只是代理，不能判定真实关系是否被破坏；文本注意力不等于参考物真值。参考特征本身编码位置，保留尺寸与边界检查只能减少部分捷径，无法消除特征内隐位置。严格不重叠负例也可能符合多解描述；CF系数仍需小量消融，不能承诺监督无噪声。
+
+coverage可能误删真实重叠参考；Top-N之外的正确框无法被救回；无有效对照时回退CRS，不是强行制造反事实。所有超参数是可验证的初始设置，不是理论最优。禁止用test选择阈值或报告仅有利子集。
+
+建议消融：相同1+0.5 BCE的无反事实控制；v4关闭CF；v4关闭参考软路径；关闭coverage/语义过滤；全部参考干预对比聚焦干预；同一checkpoint前后Top1改对/改错、Top5覆盖、null权重、CF有效样本数与β。文本打乱只作为敏感性诊断，不直接给打乱描述伪造定位标签。
+
+---
+
+## 历史方案：v3 自适应竞争范围与稀疏反事实关系细化
 
 配置选择 `birs_version="v3"`；v1/v2的结构、参数布局和checkpoint策略仍保留，历史说明位于后文。v3是新结构，不能用v1/v2完整权重冒充恢复训练。关闭`enable_birs`仍沿用原PropVG/Grab/BCEM等流程。
+
+v3默认对齐指定实验20261118_084936（CF=0、soft mix=0、BCE为1/0.5）。以下可选正候选CF与含null软混合是2026-11-18中间方案说明，不是v4算法或当前主配置；为可选配置保留接口。当前v4详见本文首节。
 
 ### A. 动机与边界
 
@@ -34,7 +125,8 @@ BEiT-3 → 512通道共享SimFPN（不改）→ 原检测解码器
                          ↓
           关系对编码[B,K,R,128] → 读取完整文本[B,L,128]
                          ↓
-             sparsemax选择R条关系 + 1个零值空选项
+         sparsemax选择R条关系 + 1个零值空选项
+             可选混合少量masked softmax权重
                          ↓
                 真实支持r_f[B,K]
                          ↑ 同一评分器、重新计算注意力
@@ -45,6 +137,10 @@ BEiT-3 → 512通道共享SimFPN（不改）→ 原检测解码器
        回填全M个logit（集合外δ=0，专供完整定位监督）
                          ↓
       仅选中Top-N_b按最终logit排序并输出；不附加集合外候选
+
+训练额外：原Hungarian匹配的正query在Top-N内且有有效置换
+          → 真实支持 - 有效对照平均支持
+          → 正间隔hinge loss（不乘β，不增加GT候选）
 ```
 
 1. **自适应竞争范围，目的：不预先假设每图只有固定数量竞争者。** 对有效Q做确定性球面K-means（默认8簇、6轮），聚类只产生离散标签，不计算共享原型。按原CRS概率降序，取前`seed_topk=3`涉及的簇；仅在前`max_targets=32`搜索这些簇的成员。最远排名确定N，至少保留`min_targets=5`，不足时保留所有有效候选。保留连续前缀，因此排名1/3/5/6/7同簇时第2/4名也保留。新增中间成员不递归扩展其簇。种子包含多个簇，避免Top1孤立误判排除另一竞争簇。选择不读GT、不反传梯度。BCEM开启时Q是增强后的候选表示，不能声称是纯外观聚类。
@@ -52,7 +148,9 @@ BEiT-3 → 512通道共享SimFPN（不改）→ 原检测解码器
 3. **相对几何，目的：明确物体的空间归属。** 使用既有9维编码：短边归一化dx/dy、单位方向2维、log(1+距离)、log宽高比2维、目标尺寸归一化位移的tanh共2维。框是有效图像归一化cxcywh，转裁剪xyxy后使用`img_shape`，不是padding画布；这是二维图像几何，不是米制三维位置。
 4. **候选自身条件，目的：每次明确正在评估谁。** 目标q_i、参考v_j分别线性投影为D维，几何经MLP投影为D维。拼接`[q_i,v_j,g_ij,q_i*v_j]`，经Linear/GELU/LayerNorm编码为关系token。不使用Top-N均值原型、簇均值或不同目标之间的自注意力。
 5. **完整文本交互，目的：关系证据按描述读取。** 关系token为Query，投影文本为Key/Value，一层多头交叉注意力（4头，dropout=0）加残差LayerNorm；padding不参与。输出[B,K,R,D]。没有显式“黑车”类别标签或词—框监督，不能保证注意力就是正确参考物识别。
-6. **稀疏汇总，目的：避免64个参考平均稀释一两个关键证据。** 每条交互后关系token预测选择logit，额外空选项logit由目标+有效文本平均表示预测。对合法关系与空选项一起做masked sparsemax，产生精确零权重；空选项value固定为0。加权关系表示与目标、句子拼接，经MLP输出一个support标量。空选项允许少用关系，但不保证对无关系文本自动完全关闭。权重非零数可变，不强制固定1或2个。
+6. **稀疏汇总，目的：避免64个参考平均稀释一两个关键证据。** 每条交互后关系token预测选择logit，额外空选项logit由目标+有效文本平均表示预测。先对合法关系与空选项一起做masked sparsemax；空选项value固定为0。可选 `attention_soft_mix=ε` 将权重改为 `(1-ε)*sparsemax + ε*masked_softmax`，两者使用完全相同的合法掩码。v3当前配置和旧配置缺省ε=0，沿用原计算，不额外乘加；ε=0.1属于中间版可选实验，与v4参考专用soft不同。加权关系表示与目标、句子拼接，经MLP输出一个support标量。
+
+   **软分量的目的：** 纯sparsemax若只选择空项，真实和打乱路径都读取零关系，可能形成精确零梯度死区；即使增加CF损失，也可能无法恢复。小比例softmax保留合法参考的可微读取路径，不删除空项、不把非法参考补回来，不强迫选固定数量。softmax仍可能数值饱和，因此这不是梯度永不消失的保证。该混合在训练和推理时相同，不能只在训练中加软分量而测试时偷偷换回纯稀疏。
 7. **重绑定对照，目的：控制“有什么”和“有哪些位置”，只破坏对应。** 对每个目标独立在其合法参考集合内部循环置换几何；语义、目标、文本及几何集合不变，不把无效/自身槽位引入。相同评分器重新执行关系编码、文本交互、稀疏选择和support评分，不搬用真实注意力。默认2次对照，偏移由原目标query ID与对照编号确定，训练/测试一致、不使用GT/RNG，合法数≥2时非原样，少量参考时对照可能重复。它不是均匀随机置换的精确期望，也不保证是最强破坏，属于可消融的确定性采样策略。
 8. **差值与融合，目的：提取真实绑定相对对照的额外支持，保留第一阶段匹配。**
 
@@ -60,17 +158,46 @@ $$\Delta_i=r_i^{f}-\frac{1}{P_{cf}}\sum_p r_i^{cf,p},\qquad
 \ell_i^{final}=\ell_i^{CRS}+\beta\Delta_i,\qquad
 \beta=\beta_{max}\sigma(a).$$
 
-β初始0.1，上限2；不再做组内中心化，不增加门控。少于2个合法参考、全padding文本或无效目标时δ=0。刚启用尚无有效训练步的eval也令δ=0，但仍执行自适应前缀选择；因此v3未训练评估不是完整256框的原基线。真实分不必高于置换分；没有强迫每次置换为负例。
+β初始0.1，上限2；不再做组内中心化，不增加门控。少于2个合法参考、全padding文本或无效目标时δ=0。刚启用尚无有效训练步的eval也令δ=0，但仍执行自适应前缀选择；因此v3未训练评估不是完整256框的原基线。推理不强制真实分高于置换分；可选CF损失仅训练时约束合格正候选的平均支持差。
 
-### C. 损失与梯度：无独立反事实损失
+### C. 损失与梯度：完整定位监督与可选CF间隔
 
-设v为全部M个有效候选掩码、y为原Hungarian refer标签。两阶段都计算全部有效候选上的BCE，每图除以有效候选数，再按全局有效样本数平均。有效样本只要求原refer GT存在且匹配正候选有效，不要求正候选进入Top-N或有参考物。
+#### C.1 原CRS与最终定位BCE
 
-$$L=L_{det}+w_{refer}\big[(1-\lambda)L_{CRS}+\lambda L_{final}\big]+L_{其他原有},\quad\lambda=0.5.$$
+设v为全部M个有效候选掩码、y为原Hungarian refer标签。单个refer GT对应的匹配query标1，其余query标0，**不是所有IoU>0.5的框都标1**。两阶段都计算全部有效候选上的BCE，每图除以有效候选数，再按全局有效样本数平均。BCE有效样本只要求原refer GT存在且匹配正候选有效，不要求正候选进入Top-N或有参考物。
 
-在REFHead中**替换**原`loss_refer`为`(1-λ)*BCE_CRS*w_refer`，日志名仍为`loss_refer`；新增`loss_birs_final=λ*BCE_final*w_refer`。没有`loss_birs_binding`、没有独立CF损失，不把原完整refer BCE再叠加一次。`loss_det`及已有Grab/filter、mask/correctness等权重不改。CF通过最终定位BCE优化真实与对照共享评分器及β；β很小时评分器梯度也可能较弱，这是待观察限制。
+v3按指定实验保留：`loss_refer=BCE_CRS*w_refer`，`loss_birs_final=final_mix*BCE_final*w_refer`，默认1/0.5。原始refer BCE在REFHead中被这一项替换，不再额外重复加一次原始项。v4保持相同BCE系数，见首节。
 
-集合外logit保持原CRS值，仍被两阶段BCE监督，二者系数相加为1；没有缩小为Top-N-only BCE。选择/框/置换不求导。`detach_inputs=False`联合优化CRS及共享候选、文本路径（含目标侧BCEM）；True时最终分支截断CRS及输入，仅更新v3，但第一阶段BCE仍正常训练原模型。沿用现有独立梯度裁剪逻辑。DDP固定执行一次有效样本数all_reduce，无监督rank保留参数连接零梯度；没有有效样本时不增加trained_steps。
+集合外logit保持原CRS值，也继续接受完整定位BCE监督，不缩小为Top-N-only BCE。`loss_det`及原Grab/filter、mask、correctness权重不改。
+
+#### C.2 只监督匹配正候选的反事实间隔
+
+**目的：** 最终BCE允许CRS自己完成任务、关系残差保持零；新增损失直接要求正目标的真实关系比置换关系更有支持力，不依赖小β传回弱梯度。
+
+对选中的正候选i，仅保留合法参考数≥2、图文有效，且确实改变几何数值的置换集合V_i。代码检查合法槽位上几何变化的最大绝对值是否大于1e-6，检查不求导。只有索引变化但几何不变的对照不参加CF平均。选中集合由原预测确定，**不向其中塞入GT框或强行补进正query**。
+
+$$
+g_i=r_i^f-\frac{1}{|V_i|}\sum_{p\in V_i}r_i^{cf,p},\qquad
+L_{CF,b}=\frac{1}{|P_b|}\sum_{i\in P_b}\max(0,m-g_i),\quad m=0.2.
+$$
+
+P_b为Top-N内满足上述条件的原匹配正query，通常至多一个。这里使用**未乘β的原始支持差**。达到间隔后hinge为零，不继续把支持差推向无穷。正query不在Top-N、没有GT、参考不足、全padding、没有有效置换时，该图跳过CF项，但完整BCE仍按自己的有效性规则计算。不为负候选增加反向间隔，不把所有真实关系标1、所有打乱关系标0。
+
+推理残差仍使用原来的全部配置置换均值；CF项仅对有效对照求均值。因此在部分置换无效的退化情况中，CF辅助差值与推理差值可能不同，最终BCE仍负责融合校准。
+
+#### C.3 总损失、梯度与多卡归一化
+
+$$
+L=L_{det}+w_{refer}(L_{CRS}+0.5L_{final})+\lambda_{CF}L_{CF}+L_{其他原有},\qquad\lambda_{CF}=0.1.
+$$
+
+`loss_birs_cf`已乘 `cf_loss_weight`，不再乘β或refer权重；它与原 `loss_birs_binding` 不是同一个损失。`cf_loss_weight=0`完全关闭该项，缺省就是0，旧配置不会增加新训练目标。最终BCE还会继续优化β；CF本身没有通向β或原CRS logit的非零直接梯度，而是更新共享的关系评分器。`detach_inputs=False`时CF还可影响目标/参考候选、文本的上游，包括目标侧BCEM；它不直接经过CRS评分网络，但共享输入的变化仍会间接改变CRS。
+
+选择/框/置换不求导。`detach_inputs=False`保持联合优化；True时CF及最终分支截断其输入，第一阶段BCE仍正常训练原模型。沿用现有梯度裁剪逻辑。
+
+多卡按BCE、CF各自的**全局有效图像数**归一化，不让没有CF正候选的rank稀释损失。CF开启时计数及其gap/达标率统计合并为一次all_reduce；关闭时保留原标量collective。无监督rank保留参数连接零梯度。CF有效样本是BCE有效样本子集，原 `trained_steps` 更新规则不变。
+
+**监督边界：** 几何发生变化不代表表达式一定变假。无关系描述、同义参考或多解场景下，正间隔仍可能引入噪声；本版未解析文本，也没有额外关系GT来证明置换是有效负例。低权重和hinge只限制推动幅度，不能消除这一假设，需要对照验证。
 
 ### D. 只输出Top-N，不处理集合外的排序
 
@@ -86,12 +213,17 @@ birs = dict(version="v3", num_groups=8, kmeans_iters=6,
             reference_topk=64, duplicate_iou=0.8,
             model_dim=128, num_heads=4, chunk_size=8,
             permutations=2, initial_strength=0.1, max_strength=2.0,
-            final_mix=0.5, detach_inputs=False, checkpoint_chunks=True)
+            final_mix=0.5, detach_inputs=False, checkpoint_chunks=True,
+            cf_loss_weight=0.1, cf_margin=0.2, attention_soft_mix=0.1)
 ```
 
-`final_mix`是两阶段定位监督混合系数；`permutations`是置换次数；`checkpoint_chunks`只以重算换训练显存。分块只计算至本batch最大实际N，不固定计算至32；仍有batch padding开销。默认配置保留用户已有teacher、Grab、BCEM等设置，只切换BIRS到v3。建议使用独立work_dir。v1/v2分支不接收v3参数，主配置已按版本构造不同字典，不能仅将旧归档字典的version改成v3。
+`final_mix`控制新增融合BCE权重；`cf_loss_weight`控制CF是否开启及其系数；`cf_margin`是正候选支持间隔；`attention_soft_mix`控制软注意力比例，不依赖CF损失开关。若要完全恢复修改前v3行为，两项均设0：`cf_loss_weight=0, attention_soft_mix=0`。`permutations`是置换次数；`checkpoint_chunks`只以重算换训练显存。分块只计算至本batch最大实际N，不固定计算至32；仍有batch padding开销。主配置没有改动用户的teacher、Grab、BCEM、工作目录及其他开关。建议新实验使用独立work_dir。v1/v2分支不接收v3参数，主配置已按版本构造不同字典，不能仅将旧归档字典的version改成v3。
 
-v3独立checkpoint schema=4，策略摘要含聚类/搜索、参考来源、置换、输出与损失规则；错版本/错关键配置明确报错。新实验可从相同BEiT-3初始化训练；完整baseline初始化用`--finetune-from`，不能把旧BIRS完整权重当作v3 resume。v1 schema=1、v2 schema=3及关闭BIRS的旧模型路径保持。v3目前接入当前AerialVG使用的MIXRefUniModel_OMG，不宣称其他未接入head具有同样输出行为。
+v3参数名称、形状和schema=4保持不变，不增加可训练参数或持久化buffer。`attention_soft_mix`缺省/等于0时，原策略摘要逐字节不变；非零值会加入摘要，因为它改变推理。`cf_loss_weight/cf_margin`只影响训练损失，不加入推理策略摘要。旧模型按原归档配置或soft mix=0测试，仍可通过原校验；用soft mix=0.1的新配置测试纯稀疏旧模型会明确报错，而非静默改变预测。反过来，新混合注意力模型也必须保持训练时mix测试。
+
+新实验可从相同BEiT-3初始化训练；完整baseline初始化用`--finetune-from`。旧BIRS模型若要改成非零soft mix继续训练，属于新注意力策略，当前加载器不会绕过摘要保护；需另行明确设计权重迁移，不是无缝resume。v1 schema=1、v2 schema=3及关闭BIRS的旧模型路径保持。v3目前接入当前AerialVG使用的MIXRefUniModel_OMG，不宣称其他未接入head具有同样输出行为。
+
+使用当前代码测试旧v3时优先用它自己的归档配置，或在配置源码将`birs_version="v3"`后重新解析配置。当前主配置是v4，不能仅用`--cfg-options`把soft mix/CF改成0就当作v3，也不能只改`model.head.birs.version`而留下v4专用字段。完整结构参数、版本和推理策略均须与旧实验一致。
 
 启动方式不变：`python tools/train.py configs/aerialvg/PropVG-aerialvg.py`，或现有多卡脚本。未自动启动完整训练。
 
@@ -101,11 +233,38 @@ v3独立checkpoint schema=4，策略摘要含聚类/搜索、参考来源、置�
 
 主要日志：`birs_target_count`平均N、`birs_target_cap_rate`达到配置/候选数上限比例、`birs_refer_in_topn`原匹配正候选覆盖、`birs_reachable`IoU≥0.5覆盖、`birs_reference_count`去重参考数量、`birs_null_attention`平均空选项权重、`birs_sparse_reference_count`非零参考数量、`birs_delta_abs`按选中目标平均绝对修正、`birs_strength`、`birs_eligible`选中目标可用绑定比例、`birs_corrected/harmed/rank_changed`训练batch的Top1变化、`birs_supervised_samples`全局有效样本数。日志不能代替完整val诊断。
 
+2026-11-18按需精简展示：上述常规BIRS统计和 `loss_birs_final` 不再输出到终端/txt的逐batch训练日志，完整值仍保留在云端训练指标及模型诊断接口中。新增CF损失和CF相关字段仍显示。这里只过滤日志字符串，不删除损失计算、梯度、全局归一化或trained_steps更新。
+
+开启软混合时，`birs_sparse_reference_count`仍统计原sparsemax分量选中的数量，避免所有softmax非零项把“稀疏选择数”虚增；另增 `birs_mixed_reference_count`统计混合后实际非零参考数。CF开启时新增：
+
+| 日志 | 含义 |
+|---|---|
+| `loss_birs_cf` | 加权后的CF hinge，已经乘0.1 |
+| `birs_cf_samples` | 当前全局batch中有合格正候选与有效置换的图像数 |
+| `birs_cf_gap` | 这些图像正候选的平均真实减有效对照支持差，未乘β |
+| `birs_cf_margin_met` | 支持差达到margin的正候选比例（先图内平均，再全局图像平均） |
+| `birs_cf_positive_count` | 每个CF有效图像的合格正query数，通常1 |
+| `birs_cf_control_count` | 每个CF有效图像的正query有效对照总数，通常2 |
+
+gap、达标率与计数按全局有效样本归一化，无CF样本时显示0。CF有效数小于全局batch不一定报错，应先看正query是否进入Top-N、合法参考数及几何变化。
+
 必须比较：固定N/自适应N；真实关系直接评分/真实减置换；普通注意力/稀疏选择；BCEM开关。比较最终分与同checkpoint原CRS时，应同时报告完整CRS与同一自适应前缀口径，不能将筛选召回损失误认为重排收益。跨独立模型仍需同训练配置、同损失总权重及多种子验证。重点统计CRS错但集合可达的样本中残差朝GT推动比例，而非仅观察总体loss。
 
 潜在局限：种子覆盖多簇可能使N长期取满上限；聚类尾部成员可能是噪声；参考漏检/误检；稀疏选择早期全部偏向空项；网络忽略绑定或关注伪线索；确定性少量置换不充分；无关系/多解描述难以产生有用差值；联合梯度可能干扰原模型；β小导致差值网络学习慢。不能为保证下降而把所有置换强行标成负例。
 
+中间版CF与软分量不保证能纠正错误参考、消除描述歧义或超过基线。指定v3默认BCE为1/0.5；跨版本消融应匹配损失总权重，避免将重加权收益混入机制结论。
+
 ### G. 实现验证记录
+
+2026-11-18新增CF验证：
+
+- 共154项CPU单元/回归测试通过：`PYTHONPATH=.:tools python -m unittest test_crv test_birs test_birs_v3 test_optional_pipeline test_grab_paper test_bcem_ray test_correctness test_two_stage_relation`；覆盖旧BIRS v1/v2、CRV、BCEM、Grab、correctness及原模型分支。
+- 新CF的hinge方向、达标后停止梯度、只监督匹配正query、不乘β、无正候选/无GT/无参考/全padding/无变化对照跳过，以及联合/截断梯度均有单元覆盖；纯sparsemax全空项时梯度为零、加入软分量后几何评分路径获得非零梯度也已验证。
+- 已实际加载11/16单独BIRS3实验的归档类，向当前默认设置严格加载其状态并校验摘要；在相同输入与权重下，8项推理张量（含分数、残差、排序、支持与注意力）与归档实现逐值完全一致。此处没有跑完整数据集测试。
+- 新CF的两进程Gloo三步验证通过：一侧无GT、另一阶段一侧有GT但无CF参考、最后全局无监督；每步梯度均与单进程合并全局batch参考一致。
+- CUDA B=2、256候选、64文本token、C=256/D=128，开启分块checkpoint与CF，前向和全部新增参数/输入反向梯度有限；有效CF图像数为2。只做模块验证，没有启动正式训练或改动旧模型权重。
+
+以下为初版v3历史验证记录，当前损失系数及可选CF以C/E节为准：
 
 - 119项CPU单元/回归测试通过：`PYTHONPATH=.:tools python -m unittest test_birs_v3 test_birs test_optional_pipeline test_grab_paper test_bcem_ray test_correctness test_two_stage_relation`。含多种子/连续前缀/禁止递归扩簇、变长batch、置换合法集合、稀疏空项、全候选BCE/集合外正例、联合与截断梯度、无GT/全padding/无参考/全退化框、checkpoint与分块、真实REFHead训练和推理、输出裁剪/NMS/rescale/correctness对齐及既有模块回归。
 - CUDA小规模模块测试：B=2、256候选、64文本token、C=256/D=128，checkpoint开启，前向、两阶段BCE、反向梯度均为有限数；随机输入选中N=30/29。只证明实现可运行，不代表实际数据N分布或完整模型耗时。

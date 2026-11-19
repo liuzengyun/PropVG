@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-crv1116"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-birs4+bcem8"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -61,17 +61,18 @@ correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
 enable_crv = False
 crv_num_groups = 10
 crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
-crv_start_epoch = 1  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
+crv_start_epoch = 20  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
 
 # BIRS: 关闭时旧 CRS、Grab、BCEM 及其权重加载行为保持不变。
 # v1：第一版，所有有效候选按外观聚类，簇内原型/中心化，全局重排。
 # v2：第二版，CRS Top-N共用原型，只在Top-N内部重排（保留全候选BCE修复）。
 # v3：聚类自适应Top-N + 稀疏关系读取 + 显式重绑定对照，仅输出Top-N。
-enable_birs = False
-birs_version = "v3"  # "v1" / "v2" / "v3"；不改变 enable_bcem 等其他开关。
+# v4：竞争式CF监督 + 参考软读取 + 防泄漏过滤 + 聚焦位置干预。
+enable_birs = True
+birs_version = "v3"  # "v1" / "v2" / "v3" / "v4"；不改变 enable_bcem 等其他开关。
 birs_target_topn = 5
-birs_num_groups = 8  # v1/v3使用；不是只保留得分最高的一簇。
+birs_num_groups = 8  # v1/v3/v4使用；不是只保留得分最高的一簇。
 birs = dict(version=birs_version, target_topn=birs_target_topn,
             num_groups=birs_num_groups, kmeans_iters=6,  # 仅v1使用。
             reference_topk=64, duplicate_iou=0.8,
@@ -80,13 +81,26 @@ birs = dict(version=birs_version, target_topn=birs_target_topn,
             final_loss_weight=1.0, binding_loss_weight=0.1,
             negative_topk=8, detach_inputs=False)
 if birs_version == "v3":
-    # 不继承v1/v2的额外BCE/绑定排序loss，定位监督总权重保持1。
+    # 对齐20261118_084936归档v3：CRS BCE=1、融合BCE=0.5，无CF损失/软混合。
     birs = dict(version="v3", num_groups=birs_num_groups, kmeans_iters=6,
                 seed_topk=3, min_targets=5, max_targets=32,
                 reference_topk=64, duplicate_iou=0.8,
                 model_dim=128, num_heads=4, chunk_size=8,
                 permutations=2, initial_strength=0.1, max_strength=2.0,
-                final_mix=0.5, detach_inputs=False, checkpoint_chunks=True)
+                final_mix=0.5, detach_inputs=False, checkpoint_chunks=True,
+                cf_loss_weight=0.0, attention_soft_mix=0.0)
+if birs_version == "v4":
+    # v4独立策略：原CRS BCE=1，融合BCE=0.5，竞争式CF=0.1。
+    birs = dict(version="v4", num_groups=birs_num_groups, kmeans_iters=6,
+                seed_topk=3, min_targets=5, max_targets=32,
+                reference_topk=64, duplicate_iou=0.8,
+                model_dim=128, num_heads=4, chunk_size=8,
+                permutations=2, initial_strength=0.1, max_strength=2.0,
+                final_mix=0.5, detach_inputs=False, checkpoint_chunks=True,
+                cf_loss_weight=0.1, cf_margin=0.2, cf_negative_topk=8,
+                cf_positive_iou=0.5, attention_soft_mix=0.1,
+                reference_coverage=0.5, semantic_difference=0.05,
+                control_reference_topk=4)
 
 
 # CRS -> shared-reference relational refinement. Disabled preserves old models.
@@ -107,9 +121,9 @@ relation_refinement = dict(
 
 # 背景信息嵌入的候选增强模块
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = False
+enable_bcem = True
 bcem_sampling_mode = "ray"
-bcem_num_rays = 16
+bcem_num_rays = 8
 # Used only by sector mode; 8 reproduces the original direction order.
 bcem_num_sectors = 4
 
