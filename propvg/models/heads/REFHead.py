@@ -462,12 +462,18 @@ class REFHead(nn.Module):
         relation_refinement=None,
         enable_birs=False,
         birs=None,
+        enable_detector_topk=False,
+        detector_topk=64,
     ):
         super(REFHead, self).__init__()
         self.enable_grab = enable_grab
         self.enable_mask = enable_mask
         self.enable_bcem = enable_bcem
         self.enable_crv = enable_crv
+        self.enable_detector_topk = bool(enable_detector_topk)
+        if isinstance(detector_topk, bool) or int(detector_topk) != detector_topk or detector_topk < 1:
+            raise ValueError("head.detector_topk must be a positive integer")
+        self.detector_topk = int(detector_topk)
         if enable_birs and (enable_crv or enable_relation_refinement):
             raise ValueError("BIRS cannot be combined with CRV or two-stage relation refinement")
         if enable_relation_refinement and enable_crv:
@@ -618,6 +624,10 @@ class REFHead(nn.Module):
         self.birs = None
         if enable_birs:
             options = dict(birs or {})
+            if self.enable_detector_topk:
+                # BIRS still retrieves from original decoder query IDs. Limit
+                # its confidence-ranked reference bank as well as targets.
+                options["reference_topk"] = min(options.get("reference_topk", 64), self.detector_topk)
             seed = int(options.pop("init_seed", 6817))
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(seed)
@@ -633,10 +643,27 @@ class REFHead(nn.Module):
         score, attention = self.mrsm(query, text, text_mask)
         return score, attention, None
 
+    def _select_grounding_queries(self, queries, boxes, classes, source_indices=None):
+        """Cap post-Grab/pre-BCEM targets without changing DETR supervision.
+
+        Foreground channel 0 matches DETR and BIRS's confidence convention.
+        Selection reads neither text nor GT. Original query IDs survive both
+        Grab and this gather, so matching labels/self-reference masks align.
+        """
+        if not self.enable_detector_topk:
+            return queries, boxes, classes, source_indices
+        confidence = classes.detach().float().softmax(-1)[..., 0]
+        confidence = confidence.masked_fill(~torch.isfinite(classes).all(-1), -float("inf"))
+        ids = confidence.argsort(dim=-1, descending=True, stable=True)[:, :self.detector_topk]
+        source = ids if source_indices is None else source_indices.gather(1, ids)
+        def gather(value):
+            return value.gather(1, ids[..., None].expand(-1, -1, value.shape[-1]))
+        return gather(queries), gather(boxes), gather(classes), source
+
     def _binding_residual(self, queries, boxes, classes, text, text_mask, scores, logits,
                           img_metas, decoder_queries, decoder_boxes, decoder_classes, source_indices):
         # Grab may prune targets, but must not remove the original reference pool.
-        original_references = self.enable_grab or self.birs.version in ("v3", "v4", "v5")
+        original_references = self.enable_grab or self.enable_detector_topk or self.birs.version in ("v3", "v4", "v5")
         return self.birs(
             queries, boxes, classes, text, text_mask, scores, logits, img_metas,
             reference_queries=self.refer_adapter(decoder_queries) if original_references else queries,
@@ -649,12 +676,13 @@ class REFHead(nn.Module):
                           img_metas, decoder_queries, decoder_boxes, decoder_classes, source_indices):
         # Grab filters TARGET hypotheses. References must still come from the
         # original DETR pool, not the text-conditioned/pruned target pool.
-        reference_queries = self.refer_adapter(decoder_queries) if self.enable_grab else queries
+        original_references = self.enable_grab or self.enable_detector_topk
+        reference_queries = self.refer_adapter(decoder_queries) if original_references else queries
         return self.relation_refiner(
             queries, boxes, classes, text, text_mask, scores, logits, img_metas,
             reference_queries=reference_queries,
-            reference_boxes=decoder_boxes if self.enable_grab else boxes,
-            reference_classes=decoder_classes if self.enable_grab else classes,
+            reference_boxes=decoder_boxes if original_references else boxes,
+            reference_classes=decoder_classes if original_references else classes,
             source_indices=source_indices,
         )
 
@@ -822,6 +850,11 @@ class REFHead(nn.Module):
         else:
             bound_queries, filter_scores = inter_states[-1], None
             bound_boxes, selected_classes, selected_indices = outputs_coord[-1], outputs_class[-1], None
+        grab_selected_indices = selected_indices
+        bound_queries, bound_boxes, selected_classes, selected_indices = self._select_grounding_queries(
+            bound_queries, bound_boxes, selected_classes, selected_indices)
+        if self.enable_detector_topk:
+            extra_dict["grounding_source_indices"] = selected_indices.detach()
         refer_query_embed = self.refer_adapter(bound_queries)
         refer_query_embed, background_info = self._enhance_background(
             refer_query_embed, bound_boxes, multi_level_feats, multi_level_masks,
@@ -845,8 +878,11 @@ class REFHead(nn.Module):
         # prepare the target for referring
         target_gt_refer_full = self.prepare_referring_targets(indices_foreground[-1], refer_indices, self.num_queries)
         target_gt_refer = (
-            target_gt_refer_full.gather(1, selected_indices) if self.enable_grab else target_gt_refer_full
+            target_gt_refer_full.gather(1, selected_indices) if selected_indices is not None else target_gt_refer_full
         )
+        if self.enable_detector_topk:
+            extra_dict["grounding_refer_exists"] = target_gt_refer_full.sum(1) > 0
+            extra_dict["grounding_refer_retained"] = target_gt_refer.sum(1) > 0
         loss_refer = (
             F.binary_cross_entropy(refer_label.reshape(-1), target_gt_refer.reshape(-1)) * self.loss_weight["refer"]
         )
@@ -863,6 +899,10 @@ class REFHead(nn.Module):
             filter_bce = F.binary_cross_entropy_with_logits(filter_scores, filter_target)
             referred_exists = target_gt_refer_full.sum(1) > 0
             referred_kept = target_gt_refer.sum(1) > 0
+            if self.enable_detector_topk:
+                # Penalize Grab only for Grab's own pruning, never for the
+                # later detector-confidence cap (which its filter cannot fix).
+                referred_kept = target_gt_refer_full.gather(1, grab_selected_indices).sum(1) > 0
             referred_logit = (filter_scores * target_gt_refer_full).sum(1) / target_gt_refer_full.sum(1).clamp(min=1.0)
             missing = referred_exists & (~referred_kept)
             # Paper Eq. 10: average only over pruned referents, not the batch.
@@ -1038,6 +1078,10 @@ class REFHead(nn.Module):
         else:
             bound_queries = inter_states[-1]
             bound_boxes, selected_classes, selected_indices = outputs_coord[-1], outputs_class[-1], None
+        bound_queries, bound_boxes, selected_classes, selected_indices = self._select_grounding_queries(
+            bound_queries, bound_boxes, selected_classes, selected_indices)
+        if self.enable_detector_topk:
+            extra_dict["grounding_source_indices"] = selected_indices.detach()
         refer_query_embed = self.refer_adapter(bound_queries)
         refer_query_embed, background_info = self._enhance_background(
             refer_query_embed, bound_boxes, multi_level_feats, multi_level_masks,

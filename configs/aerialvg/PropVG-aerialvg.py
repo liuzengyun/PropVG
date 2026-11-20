@@ -56,6 +56,12 @@ enable_correctness = False
 correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
                    loss_weight=1.0, decision_threshold=0.5)
 
+# 可选：检测器仍输出/监督256个query，BCEM→CRS→BIRS仅处理检测置信度Top-K。
+# False（旧配置缺省同样为False）保留原行为；不改变num_queries或检测损失。
+# 若开启Grab，则在Grab保留的候选中取Top-K；BIRS参考池上限也限制到K。
+enable_detector_topk = False
+detector_topk = 64
+
 # 聚类自适应Top-N的全图mask CRV；联合训练，无熵/不确定性门控。
 # 开启CRV实验时同时设置 enable_birs=False；其他模块开关自行保持。
 enable_crv = False
@@ -194,6 +200,7 @@ model = dict(
               loss_weight={"mask": {"dice": 1.0, "bce": 1.0, "nt": 0.2, "neg": 0},
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
+              enable_detector_topk=enable_detector_topk, detector_topk=detector_topk,
               enable_correctness=enable_correctness, correctness=correctness,
               enable_relation_refinement=enable_relation_refinement,
               enable_birs=enable_birs, birs=birs,

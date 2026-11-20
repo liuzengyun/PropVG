@@ -199,6 +199,60 @@ null全选时关系分支没有有效残差，可能发生学习不足；本版�
 
 ---
 
+## 公共可选开关：检测 Top-K 后再做 BCEM / CRS / BIRS
+
+更新日期：2026-11-20。主配置新增：
+
+```python
+enable_detector_topk = False  # True启用；False或旧配置缺省保持原流程。
+detector_topk = 64
+```
+
+开关独立于 `enable_birs` 和 `birs_version`。`num_queries=256` 不变，不是把检测器改成64个query。
+开启时的数据流：
+
+```text
+检测解码器256个query → 检测头256个框/前景logit
+  ├─ 全部256个 → 原多层检测损失 / Hungarian匹配（不变）
+  └─ （若有Grab，先保留其原处理）
+       → 按检测前景概率取至多64个，特征/框/类别/原query ID同步gather
+       → BCEM（若开启）→ CRS → 所选版本BIRS（若开启）→ 最终目标框
+```
+
+前景置信度是检测二分类 `softmax(class_logits)[...,0]`，不是原始单通道logit，不是CRS分数。
+排序稳定、无GT、无文本依赖；不做额外NMS，也不强行把refer GT补进集合。训练和测试均用同一筛选。
+如果开启Grab，是在它保留的候选中按检测置信度取Top-K，不恢复已被Grab删掉的query；不开Grab时即原256个中的检测Top-K。
+
+BIRS的参考仍从原pre-BCEM检测池取，保留原query ID；其前景参考池上限自动取
+`min(birs.reference_topk, detector_topk)`，再执行原去重/v5近邻筛选。因此默认K=64时，
+BCEM/CRS目标数最多64、BIRS目标来自这64个，BIRS参考也最多为原检测Top-64，不能理解为只保留CRS Top-64。
+参考投影依旧能读取原解码器，但关系评分不会把第65名之后的框当参考。
+
+训练标签先在256个检测query上完成原Hungarian匹配，然后按最终保留的原query ID同步gather，
+不重新匹配或改变GT。BIRS v3/v4/v5沿用原有效样本规则：匹配refer正query不在保留集合时，
+该图没有有效正候选，两项定位BCE不计入该图；256个query的检测损失继续训练。仅CRS/旧其他分支
+保留各自原损失逻辑，可能会对该图保留的全负候选计算BCE。本开关没有额外修改各模块的监督定义或权重。
+Grab的keep惩罚只判断Grab自身是否删除GT，不因之后的检测Top-K删除而错误惩罚Grab过滤器。
+
+没有新增参数或buffer，默认关闭不消费随机数、不更改state_dict。旧模型仍使用原配置测试；
+旧权重用新开启配置推理会改变CRS的候选自注意力上下文和候选覆盖，不能声称与原评估等价。
+若BIRS参考上限因K改变，原有策略签名校验也可能拒绝直接加载不匹配的任务checkpoint。
+
+分析接口：`extra_dict['grounding_source_indices'][B,Q_kept]` 保存当前位置对应的原解码器query ID。
+开启本开关后，BIRS的 `target_indices` 是缩减后目标集合中的槽位；用
+`grounding_source_indices.gather(1, target_indices)` 可恢复原解码器ID。
+训练阶段另保存 `grounding_refer_exists` 和 `grounding_refer_retained` 供检查筛选召回。
+只做分析，不作为筛选条件或额外输入，不增加默认日志输出。
+
+建议先关注检测Top-64的refer召回：该步骤可能丢失真实目标，且早期检测分数未收敛时更明显。
+减少后续BCEM/CRS的候选计算量不等于缩减检测器或BEiT-3计算量，整体加速幅度需实测。
+专项CPU测试：`PYTHONPATH=.:tools python -W ignore -m unittest test_grounding_detector_topk`。
+本次203项CPU回归全部通过（其中本开关专项7项），包含原各版本BIRS、BCEM、Grab、correctness、
+可选管线和两阶段关系模块；验证了关闭开关的参数/RNG兼容、完整检测监督、标签索引对齐和Grab惩罚边界。
+未启动正式训练或GPU性能评估。
+
+---
+
 ## 历史方案：第四版 v4——竞争式反事实关系细化
 
 更新日期：2026-11-18。代码：`propvg/models/heads/binding_residual_v4.py`。
