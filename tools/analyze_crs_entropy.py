@@ -318,9 +318,6 @@ def main():
     config_path = next(experiment.glob("*_PropVG-aerialvg.py"))
     checkpoint_path = experiment / "top1_best.pth"
     cfg = Config.fromfile(str(config_path))
-    if cfg.model.head.get("enable_relation_refinement", False):
-        raise ValueError("For two-stage checkpoints use tools/analyze_two_stage_relation.py; "
-                         "this legacy entropy tool assumes the original CRS-only output contract")
     archived_world_size = int(cfg.get("world_size", 1))
     cfg.distributed, cfg.rank, cfg.world_size = False, 0, 1
     cfg.data.samples_per_gpu, cfg.data.workers_per_gpu = 1, 4

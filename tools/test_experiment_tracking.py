@@ -52,7 +52,7 @@ class TrackingTests(unittest.TestCase):
         self.work.mkdir(parents=True)
         self.cfg = Config(dict(work_dir=str(self.work), timestamp="20261020_123456", tag_name="aerialvg",
                                swanlab=dict(logdir=str(self.root / "swanlog"), finish_wait=0), seed=6666,
-                               model=dict(enable_crv=True), api_key="DO_NOT_STORE_THIS"))
+                               model=dict(enable_birs=True), api_key="DO_NOT_STORE_THIS"))
         self.logger = logging.getLogger("propvg-tracking-test-" + self.root.name)
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False

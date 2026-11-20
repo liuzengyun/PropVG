@@ -37,25 +37,6 @@ def _optimizer_parameter_names(model, optimizer):
     return [[names[id(parameter)] for parameter in group["params"]] for group in optimizer.param_groups]
 
 
-def _validate_crv_checkpoint(model, state):
-    """Do not silently evaluate an enabled but randomly initialized CRV."""
-    base = model.module if hasattr(model, "module") else model
-    head = getattr(base, "head", None)
-    crv = getattr(head, "crv", None)
-    if crv is None or not hasattr(crv, "schema_version"):
-        return
-    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
-    expected = {"head.crv." + name: value for name, value in crv.state_dict().items()}
-    version = normalized.get("head.crv.schema_version")
-    if not expected.keys() <= normalized.keys() or version is None or int(version) != int(crv.schema_version) \
-            or any(normalized[key].shape != value.shape for key, value in expected.items()):
-        raise ValueError("Enabled CRV requires a complete compatible CRV checkpoint. "
-                         "To start CRV training from a baseline, use --finetune-from instead of --load-from/--resume-from.")
-    if hasattr(crv, "policy_signature") and not torch.equal(
-            normalized["head.crv.policy_signature"].cpu(), crv.policy_signature.cpu()):
-        raise ValueError("CRV checkpoint policy differs from configuration")
-
-
 def _validate_crs_checkpoint(model, state):
     """Do not fall back to random CRS weights when loading a task checkpoint."""
     base = model.module if hasattr(model, "module") else model
@@ -67,23 +48,6 @@ def _validate_crs_checkpoint(model, state):
     if not expected.issubset(normalized):
         raise ValueError("Checkpoint has incomplete CRS weights; it cannot be used for evaluation or resume. "
                          "Use a compatible CRS checkpoint, or --finetune-from to initialize new training.")
-
-
-def _validate_relation_refinement_checkpoint(model, state):
-    """Old configs remain valid; an enabled new stage needs its exact policy."""
-    base = model.module if hasattr(model, "module") else model
-    stage = getattr(getattr(base, "head", None), "relation_refiner", None)
-    if stage is None:
-        return
-    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
-    expected = {"head.relation_refiner." + key: value for key, value in stage.state_dict().items()}
-    if not expected.keys() <= normalized.keys() or any(normalized[key].shape != value.shape for key, value in expected.items()):
-        raise ValueError("Enabled two-stage relation refinement requires its complete checkpoint. "
-                         "To start joint training from baseline weights use --finetune-from; "
-                         "for old-model evaluation disable model.head.enable_relation_refinement.")
-    for key in ("schema_version", "policy_signature"):
-        if not torch.equal(normalized["head.relation_refiner." + key].cpu(), getattr(stage, key).cpu()):
-            raise ValueError("Two-stage relation refinement checkpoint policy differs from config: " + key)
 
 
 def _validate_birs_checkpoint(model, state):
@@ -150,23 +114,6 @@ def _load_optimizer_state(model, optimizer, checkpoint, model_state):
                                "state": {key: value for key, value in saved["state"].items() if key in retained_ids}})
 
 
-def _validate_correctness_checkpoint(model, state):
-    """Old checkpoints remain valid with the default-disabled new branch."""
-    base = model.module if hasattr(model, "module") else model
-    correctness = getattr(getattr(base, "head", None), "correctness", None)
-    if correctness is None:
-        return
-    normalized = {key[7:] if key.startswith("module.") else key: value for key, value in state.items()}
-    expected = {"head.correctness." + name for name in correctness.state_dict()}
-    version = normalized.get("head.correctness.schema_version")
-    steps = normalized.get("head.correctness.trained_steps")
-    if not expected.issubset(normalized) or version is None or int(version) != int(correctness.schema_version) \
-            or steps is None or int(steps) <= 0:
-        raise ValueError("Enabled correctness head requires its complete trained checkpoint. "
-                         "For old-model evaluation set model.head.enable_correctness=False. "
-                         "To train the new head from baseline weights use --finetune-from, not --resume-from/--load-from.")
-
-
 def log_loaded_info(ckpt, load_file, dataset=None):
     logger = get_root_logger()
     log_str = f"loaded checkpoint from {load_file}\n"
@@ -211,8 +158,6 @@ def load_pretrained_checkpoint(model, finetune_from=None, amp=False, dataset=Non
     if is_paral_state(state) and not is_paral_model(model):
         state = de_parallel(state)
     state_copy = copy.deepcopy(state)
-    if any((key[7:] if key.startswith("module.") else key).startswith("head.crv.") for key in state_copy):
-        _validate_crv_checkpoint(model, state_copy)
     if any((key[7:] if key.startswith("module.") else key).startswith("head.birs.") for key in state_copy):
         _validate_birs_checkpoint(model, state_copy)
     # state_copy.pop("lan_enc.embedding.weight")
@@ -224,12 +169,6 @@ def load_pretrained_checkpoint(model, finetune_from=None, amp=False, dataset=Non
     # # finetuning on RES since pretraining is only performed on REC
     # if model_seq_embed_dim != state_seq_embed_dim:
     #     state_copy.pop("head.transformer.seq_positional_encoding.embedding.weight")
-    # Baseline -> new stage intentionally leaves the new branch initialized.
-    # If a stage IS supplied, never overwrite its policy buffer with weights
-    # trained under a different same-shape Top-K/aggregation configuration.
-    if any((key[7:] if key.startswith("module.") else key).startswith("head.relation_refiner.")
-           for key in state_copy):
-        _validate_relation_refinement_checkpoint(model, state_copy)
     missing_keys, unexpected_keys = model.load_state_dict(state_copy, strict=False)
     if is_main():
         logger = get_root_logger()
@@ -256,10 +195,7 @@ def load_checkpoint(model, resume_from=None, load_from=None, amp=False, optimize
             ema_state = de_parallel(ema_state)
     if is_paral_state(state) and not is_paral_model(model):
         state = de_parallel(state)
-    _validate_crv_checkpoint(model, state)
-    _validate_correctness_checkpoint(model, state)
     _validate_crs_checkpoint(model, state)
-    _validate_relation_refinement_checkpoint(model, state)
     _validate_birs_checkpoint(model, state)
     try:
         model.load_state_dict(state, strict=True)

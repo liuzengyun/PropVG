@@ -48,15 +48,6 @@ freeze_beit3 = False
 enable_grab = False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
-# Optional detached correctness estimation; False preserves previous models.
-enable_correctness = False
-correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
-                   loss_weight=1.0, decision_threshold=0.5)
-# Joint cluster-adaptive full-scene CRV; disabled retains the previous pipeline.
-enable_crv = False
-crv_num_groups = 10
-crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
-crv_start_epoch = 22  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
 
 img_size = 586
 patch_size = 16
@@ -185,19 +176,6 @@ model = dict(
         MTD=dict(K=250),
         enable_grab=enable_grab,
         enable_mask=enable_mask,
-        enable_correctness=enable_correctness,
-        correctness=correctness,
-        enable_crv=enable_crv,
-        crv=dict(num_groups=crv_num_groups, kmeans_iters=6,
-                 seed_topk=3, min_targets=3, max_targets=32, grid_size=crv_grid_size,
-                 start_epoch=crv_start_epoch,
-                 scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
-                 inner_scale=1.5, outer_scale=2.0,
-                 initial_strength=0.1, max_strength=2.0,
-                 negative_gt_coverage=0.01, gt_loss_weight=0.1,
-                 cf_loss_weight=0.1, fusion_loss_weight=1.0,
-                 positive_margin=1.0, ranking_margin=0.5,
-                 checkpoint_chunks=True),
     ),
     post_params=dict(
         score_weighted=False,

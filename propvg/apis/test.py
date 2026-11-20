@@ -18,8 +18,7 @@ import numpy as np
 import copy
 from propvg.utils.dist import all_gather, synchronize
 from tqdm import tqdm
-from propvg.utils.experiment_tracking import log_evaluation, log_metrics
-from propvg.evaluations.correctness import correctness_record, summarize_correctness, log_correctness
+from propvg.utils.experiment_tracking import log_evaluation
 
 
 def mask_overlaps(gt_mask, pred_masks, is_crowd):
@@ -260,17 +259,12 @@ def _evaluate_model(prefex, cfg, model, loader):
         return F1_score_rec, N_acc, T_acc, gIoU_res, cIoU_res, PR_list_res
     elif cfg.dataset == "AerialVG":
         top1, top5, miou = aerialvg_box_metrics(pred_bboxes, gt_bboxes)
-        correctness = getattr(getattr(model.module if hasattr(model, "module") else model, "head", None), "correctness", None)
-        records = [correctness_record(prediction, target) for prediction, target in zip(pred_bboxes, gt_bboxes)
-                   if "top1_correct_probability" in prediction]
-        quality = summarize_correctness(records, correctness.decision_threshold) if records and correctness is not None else None
         if is_main():
             split_name = getattr(loader.dataset, "which_set", prefex)
             get_root_logger().info(
                 f"------------ {split_name} ------------ time: {(time.time() - start):.2f}, "
                 f"Top-1 Acc@0.5: {top1:.2f}%, Top-5 Acc@0.5: {top5:.2f}%, box mIoU: {miou:.2f}%"
             )
-            log_correctness(quality, get_root_logger(), prefex, log_metrics)
         return top1, top5, miou
     elif cfg.dataset == "RefZOM":
         mIoU, oIoU, macc, PR_list = refzom_evaluate(

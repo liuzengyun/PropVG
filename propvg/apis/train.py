@@ -55,19 +55,13 @@ def set_random_seed(seed, deterministic=False, strict=False):
 
 
 def clip_training_gradients(model, max_norm):
-    """Independent heads must not change the base model's clipping norm."""
+    """Detached BIRS must not change the base model's clipping norm."""
     base_model = model.module if hasattr(model, "module") else model
     head = getattr(base_model, "head", base_model)
-    independent = [branch for branch in (getattr(head, "crv", None), getattr(head, "correctness", None))
-                   if branch is not None and not getattr(branch, "joint_training", False)]
-    relation = getattr(head, "relation_refiner", None)
+    independent = []
     birs = getattr(head, "birs", None)
     if birs is not None and birs.detach_inputs:
         independent.append(birs)
-    if relation is not None and relation.detach_inputs:
-        # Detaching the loss is insufficient on its own: including new head
-        # gradients in a global norm would still change the CRS update scale.
-        independent.append(relation)
     if not independent:
         return torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
     independent_parameters = [list(branch.parameters()) for branch in independent]
@@ -91,7 +85,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
     end = time.time()
 
     loss_det_list, loss_mask_list, loss_label_nt_list, loss_refer_list, loss_filter_list = [], [], [], [], []
-    crv_history = {}
+    auxiliary_history = {}
     iteration_times, data_times = [], []
     for batch, inputs in enumerate(loader):
         data_time = time.time() - end
@@ -106,18 +100,6 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss_refer = losses.pop("loss_refer", torch.tensor([0.0], device=device))
         loss_filter = losses.pop("loss_filter", torch.tensor([0.0], device=device))
         loss = loss_det + loss_mask + loss_label_nt + loss_refer + loss_filter
-        crv_values = {}
-        if "loss_crv_cf" in losses:
-            # Collect the independent CRV loss terms and diagnostics;
-            # CRV-disabled baseline logging is unchanged.
-            for key in tuple(losses):
-                if key.startswith("loss_crv_"):
-                    value = losses.pop(key)
-                    loss = loss + value
-                    crv_values[key] = value.detach()
-                elif key.startswith("metric_crv_"):
-                    crv_values[key[len("metric_"):]] = losses.pop(key).detach()
-        correctness_values = {}
         birs_values = {}
         if "loss_birs_final" in losses:
             for key in tuple(losses):
@@ -127,21 +109,6 @@ def train_model(epoch, cfg, model, optimizer, loader):
                     birs_values[key] = value.detach()
                 elif key.startswith("metric_birs_"):
                     birs_values[key[len("metric_"):]] = losses.pop(key).detach()
-        relation_values = {}
-        if "loss_relation_final" in losses:
-            value = losses.pop("loss_relation_final")
-            loss = loss + value
-            relation_values["loss_relation_final"] = value.detach()
-            for key in tuple(losses):
-                if key.startswith("metric_relation_refinement_"):
-                    relation_values[key[len("metric_"):]] = losses.pop(key).detach()
-        if "loss_correctness" in losses:
-            value = losses.pop("loss_correctness")
-            loss = loss + value
-            correctness_values["loss_correctness"] = value.detach()
-            for key in tuple(losses):
-                if key.startswith("metric_correctness_"):
-                    correctness_values[key[len("metric_"):]] = losses.pop(key).detach()
         # loss = loss_det
         optimizer.zero_grad()
         if cfg.use_fp16:
@@ -152,21 +119,9 @@ def train_model(epoch, cfg, model, optimizer, loader):
         if cfg.grad_norm_clip:
             clip_training_gradients(model, cfg.grad_norm_clip)
         optimizer.step()
-        if crv_values and crv_values.get("crv_supervised_samples", torch.tensor(0.)).item() > 0:
-            base_model = model.module if hasattr(model, "module") else model
-            base_model.head.crv.mark_optimizer_step()
         if birs_values and birs_values["birs_supervised_samples"].item() > 0:
             base_model = model.module if hasattr(model, "module") else model
             base_model.head.birs.mark_optimizer_step()
-        crv_values.update(birs_values)
-        if correctness_values and correctness_values["correctness_valid_samples"].item() > 0:
-            base_model = model.module if hasattr(model, "module") else model
-            base_model.head.correctness.mark_optimizer_step()
-        crv_values.update(correctness_values)
-        if relation_values and relation_values["relation_refinement_supervised_samples"].item() > 0:
-            base_model = model.module if hasattr(model, "module") else model
-            base_model.head.relation_refiner.mark_optimizer_step()
-        crv_values.update(relation_values)
 
         if cfg.distributed:
             loss_det = reduce_mean(loss_det)
@@ -179,10 +134,10 @@ def train_model(epoch, cfg, model, optimizer, loader):
         loss_label_nt_list.append(loss_label_nt.item())
         loss_refer_list.append(loss_refer.item())
         loss_filter_list.append(loss_filter.item())
-        for key, value in crv_values.items():
+        for key, value in birs_values.items():
             if cfg.distributed:
                 value = reduce_mean(value)
-            crv_history.setdefault(key, []).append(value.item())
+            auxiliary_history.setdefault(key, []).append(value.item())
 
         iteration_times.append(time.time() - end)
         data_times.append(data_time)
@@ -200,7 +155,7 @@ def train_model(epoch, cfg, model, optimizer, loader):
                     + f"loss_filter: {sum(loss_filter_list) / len(loss_filter_list):.4f}, "
                     + f"lr: {optimizer.param_groups[0]['lr']:.6f}, "
                     + "".join(f"{key}: {sum(values) / len(values):.4f}, "
-                              for key, values in crv_history.items() if key not in HIDDEN_BIRS_LOG_FIELDS)
+                              for key, values in auxiliary_history.items() if key not in HIDDEN_BIRS_LOG_FIELDS)
                 )
 
                 values = {
@@ -210,14 +165,14 @@ def train_model(epoch, cfg, model, optimizer, loader):
                         "loss_refer": sum(loss_refer_list) / len(loss_refer_list),
                         "loss_filter": sum(loss_filter_list) / len(loss_filter_list),
                         "lr": optimizer.param_groups[0]["lr"],
-                        **{key: sum(values) / len(values) for key, values in crv_history.items()},
+                        **{key: sum(values) / len(values) for key, values in auxiliary_history.items()},
                     }
                 set_tracking_context(epoch=epoch + 1, global_step=epoch * batches + batch + 1)
                 # Reuse already-reduced CPU values: no new model forward,
                 # tensor transfer, gradient scan or distributed collective.
                 history = dict(loss_det=loss_det_list, loss_mask=loss_mask_list,
                                loss_label_nt=loss_label_nt_list, loss_refer=loss_refer_list,
-                               loss_filter=loss_filter_list, **crv_history)
+                               loss_filter=loss_filter_list, **auxiliary_history)
                 window = batch % cfg.log_interval + 1
                 metrics = dict(values)  # Retain old chart names for comparisons.
                 for key, series in history.items():

@@ -10,8 +10,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 from propvg.datasets import build_dataset, build_dataloader, extract_data
 from propvg.models import build_model
-from propvg.utils import load_checkpoint, get_root_logger
-from propvg.evaluations.correctness import correctness_record, summarize_correctness, log_correctness
+from propvg.utils import load_checkpoint
 
 
 def box_iou(boxes, target):
@@ -26,7 +25,6 @@ def box_iou(boxes, target):
 @torch.no_grad()
 def evaluate(model, loader):
     top1, top5, top1_iou = [], [], []
-    correctness_records = []
     model.eval()
     for inputs in tqdm(loader, total=len(loader), desc="Evaluating AerialVG", dynamic_ncols=True):
         img_metas = inputs["img_metas"].data[0]
@@ -42,9 +40,6 @@ def evaluate(model, loader):
         inputs = extract_data(inputs)
         outputs = model(**inputs, return_loss=False, with_bbox=True, with_mask=False, rescale=False)
         for prediction, target in zip(outputs["pred_bboxes"], targets):
-            record = correctness_record(prediction, target)
-            if record is not None:
-                correctness_records.append(record)
             ranking = prediction.get("ranking_logits", prediction["scores"]).reshape(-1).argsort(
                 descending=True, stable="ranking_logits" in prediction)
             if ranking.numel() == 0:
@@ -57,10 +52,6 @@ def evaluate(model, loader):
             top1.append((ious[0] >= 0.5).float())
             top5.append((ious[:5].max() >= 0.5).float())
             top1_iou.append(ious[0])
-    correctness = getattr(getattr(model, "head", None), "correctness", None)
-    if correctness_records and correctness is not None:
-        log_correctness(summarize_correctness(correctness_records, correctness.decision_threshold),
-                        get_root_logger(), getattr(loader.dataset, "which_set", "eval"))
     return tuple(100.0 * torch.stack(values).mean().item() for values in (top1, top5, top1_iou))
 
 
@@ -69,7 +60,7 @@ def main():
     parser.add_argument("config")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--split", choices=("val", "test"), default="val")
-    parser.add_argument("--cfg-options", nargs="+", action=DictAction, help="Override e.g. model.head.enable_correctness=False")
+    parser.add_argument("--cfg-options", nargs="+", action=DictAction, help="Override model or dataset configuration")
     args = parser.parse_args()
     cfg = Config.fromfile(args.config)
     if args.cfg_options:

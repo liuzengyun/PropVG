@@ -51,7 +51,7 @@ SWANLAB_MODE=disabled bash gpu1.sh # 关闭监控
 
 | 内容 | 说明 / 图表横轴 |
 |---|---|
-| `train/*` | 当前 epoch 累计 loss 与 CRV 诊断均值 / global_step |
+| `train/*` | 当前 epoch 累计 loss 与 BIRS 诊断均值 / global_step |
 | `train_current/*`、`train_window/*` | 最近 batch / 最近日志窗口的指标 / global_step |
 | `lr/*`、`time/*`、`perf/*`、`memory/*` | 学习率、耗时、名义吞吐、训练进程的显存缓存统计 / global_step |
 | `val/*` | 原有验证指标 / epoch |

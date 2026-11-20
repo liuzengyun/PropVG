@@ -286,7 +286,7 @@ def main():
         raise RuntimeError("Expected exactly one archived AerialVG configuration")
     config_path = config_paths[0]
     cfg = Config.fromfile(str(config_path))
-    for name in ("enable_grab", "enable_bcem", "enable_crv", "enable_relation_scoring", "enable_relation_refinement"):
+    for name in ("enable_grab", "enable_bcem", "enable_relation_scoring"):
         if cfg.model.head.get(name, False):
             raise ValueError("This CRS-only BASE diagnostic requires {}=False".format(name))
     cfg.model.vis_enc.pretrain = None  # The trained checkpoint already includes BEiT-3.

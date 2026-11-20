@@ -186,8 +186,7 @@ def extract(args):
         raise RuntimeError("Expected exactly one archived configuration")
     config_path = paths[0]
     cfg = Config.fromfile(str(config_path))
-    for flag in ("enable_grab", "enable_bcem", "enable_crv", "enable_relation_scoring",
-                 "enable_relation_refinement", "enable_correctness"):
+    for flag in ("enable_grab", "enable_bcem", "enable_relation_scoring"):
         if cfg.model.head.get(flag, False):
             raise ValueError("This BASE diagnostic requires {}=False".format(flag))
     cfg.model.vis_enc.pretrain = None  # Full trained weights include BEiT-3.

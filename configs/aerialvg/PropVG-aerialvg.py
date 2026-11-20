@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-birs3"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-birs5+bcem8"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -50,25 +50,12 @@ freeze_beit3 = False
 enable_grab=False
 # Do not allocate segmentation-only modules; shared 512-channel FPN is unchanged.
 enable_mask = False
-# Optional observational Top-1 correctness head; never changes boxes/ranking.
-# False (or absent in old configs) preserves previous checkpoints/experiments.
-enable_correctness = False
-correctness = dict(hidden_dim=128, topk=5, duplicate_iou=0.8,
-                   loss_weight=1.0, decision_threshold=0.5)
 
 # 可选：检测器仍输出/监督256个query，BCEM→CRS→BIRS仅处理检测置信度Top-K。
 # False（旧配置缺省同样为False）保留原行为；不改变num_queries或检测损失。
 # 若开启Grab，则在Grab保留的候选中取Top-K；BIRS参考池上限也限制到K。
 enable_detector_topk = False
 detector_topk = 64
-
-# 聚类自适应Top-N的全图mask CRV；联合训练，无熵/不确定性门控。
-# 开启CRV实验时同时设置 enable_birs=False；其他模块开关自行保持。
-enable_crv = False
-crv_num_groups = 10
-crv_grid_size = 48  # Pool complete original/intervened feature maps; no local crops.
-crv_start_epoch = 20  # 1-based: no CRV training or reranking before this epoch; 1 starts immediately.
-
 
 # BIRS: 关闭时旧 CRS、Grab、BCEM 及其权重加载行为保持不变。
 # v1：第一版，所有有效候选按外观聚类，簇内原型/中心化，全局重排。
@@ -77,7 +64,7 @@ crv_start_epoch = 20  # 1-based: no CRV training or reranking before this epoch;
 # v4：竞争式CF监督 + 参考软读取 + 防泄漏过滤 + 聚焦位置干预。
 # v5：每候选最近8个零重叠参考 + 文本稀疏筛选/null；保留v3两项BCE。
 enable_birs = True
-birs_version = "v3"  # "v1" / "v2" / "v3" / "v4" / "v5"；切v5即可启用新方案，其他开关不变。
+birs_version = "v5"  # "v1" / "v2" / "v3" / "v4" / "v5"；切v5即可启用新方案，其他开关不变。
 birs_target_topn = 5
 birs_num_groups = 8  # v1/v3/v4/v5使用；不是只保留得分最高的一簇。
 birs = dict(version=birs_version, target_topn=birs_target_topn,
@@ -118,25 +105,9 @@ if birs_version == "v5":
                 final_mix=0.5, detach_inputs=False, checkpoint_chunks=True)
 
 
-# CRS -> shared-reference relational refinement. Disabled preserves old models.
-# Train alongside CRS; independent of teacher/auxiliary GT; not with CRV.
-enable_relation_refinement = False
-relation_detach_inputs = True  # True: added final loss trains only stage 2; False: joint gradients.
-relation_target_topk = 32
-relation_reference_topk = 64  # Detector confidence Top-K FIRST, then duplicate removal.
-relation_refinement = dict(
-    target_topk=relation_target_topk, reference_topk=relation_reference_topk,
-    detach_inputs=relation_detach_inputs,
-    duplicate_iou=0.8, model_dim=128, num_heads=4,
-    prior_temperature=1.0, relation_temperature=1.0, prior_uniform_mix=0.2,
-    discriminability_floor=0.1, initial_strength=0.1, max_strength=2.0,
-    loss_weight=1.0, aggregation="competitive",
-    use_geometry=True, use_reference_semantics=True,
-)
-
 # 背景信息嵌入的候选增强模块
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = False
+enable_bcem = True
 bcem_sampling_mode = "ray"
 bcem_num_rays = 8
 # Used only by sector mode; 8 reproduces the original direction order.
@@ -201,22 +172,7 @@ model = dict(
                            "bbox": 0.1, "allbbox": 0.1, "refer": 1.0}, MTD={"K": 250},
               enable_grab=enable_grab, enable_mask=enable_mask,
               enable_detector_topk=enable_detector_topk, detector_topk=detector_topk,
-              enable_correctness=enable_correctness, correctness=correctness,
-              enable_relation_refinement=enable_relation_refinement,
               enable_birs=enable_birs, birs=birs,
-              relation_refinement=relation_refinement,
-              enable_crv=enable_crv,
-              crv=dict(num_groups=crv_num_groups, kmeans_iters=6,
-                       seed_topk=3, min_targets=3, max_targets=32,
-                       grid_size=crv_grid_size,
-                       start_epoch=crv_start_epoch,
-                       scorer_dim=128, scorer_heads=4, scorer_layers=2, chunk_size=8,
-                       inner_scale=1.5, outer_scale=2.0,
-                       initial_strength=0.1, max_strength=2.0,
-                       negative_gt_coverage=0.01, gt_loss_weight=0.1,
-                       cf_loss_weight=0.1, fusion_loss_weight=1.0,
-                       positive_margin=1.0, ranking_margin=0.5,
-                       checkpoint_chunks=True),
               enable_bcem=enable_bcem,
               bcem=dict(context_dim=128, num_heads=4, num_sectors=bcem_num_sectors,
                         sampling_mode=bcem_sampling_mode, num_rays=bcem_num_rays,

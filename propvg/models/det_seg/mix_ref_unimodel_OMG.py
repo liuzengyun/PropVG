@@ -312,16 +312,6 @@ class MIXRefUniModel_OMG(OneStageModel):
                     cur_predict_dict["ranking_logits"] = rank_logits
                     if self.with_nms:
                         cur_predict_dict["filtered_ranking_logits"] = rank_logits[filtered_indices]
-                if "top1_correct_probability" in pred:
-                    # The observational head must refer to exactly the same
-                    # Top-1 as the CPU evaluator, including clipping and ties.
-                    metric_scores = (rank_logits if rank_logits is not None else score).detach().cpu()
-                    order = metric_scores.argsort(descending=True, stable=rank_logits is not None)
-                    expected_index = int(kept.nonzero(as_tuple=True)[0][order[0]]) if len(order) else -1
-                    if int(pred["top1_correct_query_index"][ind]) != expected_index:
-                        raise RuntimeError("Correctness head/evaluator Top-1 candidate mismatch")
-                    for key in ("top1_correct_probability", "top1_correct_logit", "top1_grouped_entropy"):
-                        cur_predict_dict[key] = pred[key][ind].detach()
                 parts_list["pred_scores"].append(score.cpu().detach().numpy())
                 parts_list["pred_box_parts"].append(pred_box.cpu().detach().numpy())
                 parts_list["det_scores"].append(det_score.cpu().detach().numpy())

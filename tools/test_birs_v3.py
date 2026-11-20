@@ -407,7 +407,7 @@ class BIRSV3Tests(unittest.TestCase):
         self.assertAlmostEqual(float(model.head.birs.weight),1.2,places=5)
         self.assertEqual(int(model.head.birs.trained_steps),1)
 
-    def test_shortlist_postprocessing_aligns_clipping_scores_nms_and_correctness(self):
+    def test_shortlist_postprocessing_aligns_clipping_scores_and_nms(self):
         from propvg.models.det_seg.mix_ref_unimodel_OMG import MIXRefUniModel_OMG
         for nms in [False,True]:
             model=MIXRefUniModel_OMG.__new__(MIXRefUniModel_OMG);nn.Module.__init__(model)
@@ -416,9 +416,7 @@ class BIRSV3Tests(unittest.TestCase):
                       pred_bbox_allobj=torch.tensor([[[.2,.2,.1,.1],[1.2,.3,.1,.1],[.7,.7,.1,.1],[.8,.8,.1,.1]]]),
                       refer_label=torch.tensor([[[.1],[.9],[.8],[.7]]]),
                       ranking_priority=torch.tensor([[[0.],[3.],[2.],[1.]]]),
-                      candidate_output_mask=torch.tensor([[False,True,True,True]]),
-                      top1_correct_query_index=torch.tensor([2]),top1_correct_probability=torch.tensor([.6]),
-                      top1_correct_logit=torch.tensor([.4]),top1_grouped_entropy=torch.tensor([.2]))
+                      candidate_output_mask=torch.tensor([[False,True,True,True]]))
             out=model.get_predictions_parts(pred,[dict(img_shape=(100,100),scale_factor=[2.]*4)],
                                             rescale=True,with_bbox=True)['pred_bboxes'][0]
             self.assertEqual(len(out['boxes']),2)

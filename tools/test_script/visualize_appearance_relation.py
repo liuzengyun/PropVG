@@ -110,7 +110,7 @@ def extract(source, output):
     cfg.model.vis_enc.pretrain = None
     cfg.model.process_visual = False
     cfg.distributed, cfg.rank, cfg.world_size = False, 0, 1
-    for flag in ("enable_grab", "enable_bcem", "enable_crv", "enable_relation_refinement", "enable_birs"):
+    for flag in ("enable_grab", "enable_bcem", "enable_birs"):
         if cfg.model.head.get(flag, False):
             raise ValueError("Expected the original BASE, not " + flag)
     dataset = build_dataset(cfg.data[metadata["split"]])

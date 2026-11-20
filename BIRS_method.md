@@ -1,5 +1,18 @@
 # 航拍视觉指代的文本条件竞争集合与关系绑定细化（BIRS）
 
+> 2026-11-20清理：旧独立 `relation_refinement` 模块及其专属实现、评估、分析脚本、测试和设计文档已移除，
+> CRV实现、专用聚类辅助文件、配置、训练/推理接入、校验和文档也已移除。
+> correctness观察预测头及其训练/评估接入、配置、专属测试和文档也已移除；普通定位指标和错误分析保留。
+> BIRS v1–v5、BCEM、CRS及检测Top-K开关保留。旧归档配置里的关闭字段仍可接收，但不构建任何分支；
+> 设置旧 `enable_relation_refinement=True` 会明确报已移除。历史测试记录中的该模块仅指当时的版本，不代表现可运行；
+> 实验目录及其代码备份未删除。旧模块若需恢复可从Git历史取回。
+> `enable_crv=False`及旧`crv`字典仅作兼容接收；设为True会明确报已移除。历史CRV测试记录仅代表当时状态。
+> `enable_correctness=False`及旧`correctness`字典同样兼容接收，不构建任何参数；设为True明确报已移除。
+> 移除correctness后180项CPU回归通过，包含原关闭配置的参数/RNG/逐值前向兼容、BIRS/BCEM/Grab、
+> 检测Top-K和实验追踪；训练内验证与独立评估均保持Top1/Top5/mIoU，且GT不传入模型。未启动正式训练。
+> 两个旧模块清理后191项CPU回归通过，包含旧关闭配置的初始化/RNG、严格权重加载及逐值前向兼容检查，
+> 以及BIRS、BCEM、Grab、correctness、检测Top-K和实验追踪回归；未启动正式训练。
+
 ## 第五版 v5：候选专属近邻参考的关系竞争细化
 
 更新日期：2026-11-20。实现：`propvg/models/heads/binding_residual_v5.py`，类名
@@ -562,7 +575,7 @@ Top-N 筛选和中心化本身不是创新；关系绑定与条件竞争集合�
 - 可选 Grab / BCEM 的原流程保持；BCEM 在 CRS 前增强表示，BIRS 不读取其空间路径或图像特征图。
 - Grab 若筛掉部分目标候选，参考支路仍读原检测池的 refer_adapter 特征，不从 Grab 筛选结果裁剪参考。
 - 不需要 teacher、关系标签、额外参考物 GT、文本人工拆解或外部模型。
-- BIRS 与旧 CRV / two-stage relation refinement 互斥，避免多个重排器叠加。
+- 旧 CRV / two-stage relation refinement 已移除，不再叠加这些重排器。
 - 关闭 enable_birs 时不构建新模块，不增加损失、参数或collective。
 
 ## 3. v2完整数据流与维度
@@ -710,7 +723,7 @@ birs = dict(
 )
 ```
 
-`target_topn`只影响v2；`num_groups/kmeans_iters`只影响v1。要复跑第一版，设置`birs_version="v1"`，其余配置保持对照一致。默认版本为v2，旧的v2配置不写version也仍使用v2；第一版旧归档配置测试时必须显式补上`model.head.birs.version="v1"`。原CRV和relation_refinement保持关闭。启动方式不变，建议设置独立work_dir：
+`target_topn`只影响v2；`num_groups/kmeans_iters`只影响v1。要复跑第一版，设置`birs_version="v1"`，其余配置保持对照一致。默认版本为v2，旧的v2配置不写version也仍使用v2；第一版旧归档配置测试时必须显式补上`model.head.birs.version="v1"`。旧CRV和relation_refinement已移除。启动方式不变，建议设置独立work_dir：
 
 ```bash
 conda activate propvg
@@ -719,7 +732,7 @@ CUDA_VISIBLE_DEVICES=1 python tools/train.py configs/aerialvg/PropVG-aerialvg.py
 
 兼容范围：
 
-- enable_birs=False（旧配置没有此参数时也默认False）：仍沿用原PropVG/Grab/BCEM/correctness等已有路径，既有非BIRS模型可以继续训练/测试，不要求新增BIRS参数。
+- enable_birs=False（旧配置没有此参数时也默认False）：仍沿用原PropVG/Grab/BCEM等已有路径，既有非BIRS模型可以继续训练/测试，不要求新增BIRS参数。correctness观察头现已移除。
 - v1恢复第一版聚类计算，使用原schema=1及原策略摘要，可加载匹配的第一版权重；v2保留schema=3及其全候选损失/target_topn摘要，现有修复版v2权重可继续加载。两版显式校验策略，不能交叉加载或悄悄切换排序语义；中间的Top-N-only-BCE/schema=2仍不支持。
 - 配置中的用户版本v1/v2与checkpoint内部schema=1/3不是同一套编号。不再提供candidate_mode别名。
 - 归档实验源码、归档配置和权重没有删除；如需要复查旧实验，可在对应归档环境运行，而非要求当前代码复现旧BIRS。

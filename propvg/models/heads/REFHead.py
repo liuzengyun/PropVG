@@ -26,10 +26,7 @@ from .unet_head import SimpleFPN, UnetDecoder
 from propvg.models.losses.segloss import seg_loss
 from .grab_binding import GrabGraphBinding
 from .optional_modules import build_optional_module
-from .counterfactual_refinement import CounterfactualRefinement
 from .background_context import BackgroundContextEnhancement
-from .top1_correctness import Top1CorrectnessHead
-from .two_stage_relation import TwoStageRelationRefinement
 from .binding_residual import BindingInteractionResidualScoring
 from .binding_residual_v3 import AdaptiveBindingResidualScoring
 from .binding_residual_v4 import CompetitiveBindingResidualScoring
@@ -450,14 +447,16 @@ class REFHead(nn.Module):
         enable_mask=True,
         enable_bcem=False,
         bcem=None,
-        enable_crv=False,
+        enable_crv=False,  # Retired: accept disabled fields in archived configs.
         crv=None,
-        enable_correctness=False,
+        enable_correctness=False,  # Retired: accept disabled fields in archived configs.
         correctness=None,
         # Accept disabled settings in archived configs, without constructing
         # the retired replacement head or consuming any random numbers.
         enable_relation_scoring=False,
         relation_scoring=None,
+        # No-op compatibility with disabled fields in archived configurations.
+        # The implementation is retired; enabling it must fail explicitly.
         enable_relation_refinement=False,
         relation_refinement=None,
         enable_birs=False,
@@ -469,15 +468,16 @@ class REFHead(nn.Module):
         self.enable_grab = enable_grab
         self.enable_mask = enable_mask
         self.enable_bcem = enable_bcem
-        self.enable_crv = enable_crv
+        if enable_crv:
+            raise ValueError("CRV has been removed; set enable_crv=False")
+        if enable_correctness:
+            raise ValueError("Top-1 correctness head has been removed; set enable_correctness=False")
         self.enable_detector_topk = bool(enable_detector_topk)
         if isinstance(detector_topk, bool) or int(detector_topk) != detector_topk or detector_topk < 1:
             raise ValueError("head.detector_topk must be a positive integer")
         self.detector_topk = int(detector_topk)
-        if enable_birs and (enable_crv or enable_relation_refinement):
-            raise ValueError("BIRS cannot be combined with CRV or two-stage relation refinement")
-        if enable_relation_refinement and enable_crv:
-            raise ValueError("Use either two-stage relation refinement or CRV, not two sequential rerankers")
+        if enable_relation_refinement:
+            raise ValueError("Two-stage relation refinement has been removed; set enable_relation_refinement=False")
         if enable_relation_scoring:
             raise ValueError("Relation scoring has been removed; use the original CRS configuration")
         self._omitted_parameter_names = []
@@ -594,33 +594,8 @@ class REFHead(nn.Module):
         # baseline's parameters and RNG stream are unchanged when disabled.
         self.bcem = (BackgroundContextEnhancement(hidden_channels=hidden_channels, **(bcem or {}))
                      if enable_bcem else None)
-        self.crv = None
-        if enable_crv:
-            options = dict(crv or {})
-            seed = options.pop("init_seed", 1717)
-            # Seed only the CPU generator and restore it afterwards. Do not
-            # torch.manual_seed here: that would also reset CUDA generators.
-            with torch.random.fork_rng(devices=[]):
-                torch.random.default_generator.manual_seed(seed)
-                self.crv = CounterfactualRefinement(hidden_channels=hidden_channels, **options)
-        # Observational head: no allocation/RNG draws when disabled, and no
-        # changes to legacy initialization or dropout streams when enabled.
-        self.correctness = None
-        if enable_correctness:
-            options = dict(correctness or {})
-            seed = options.pop("init_seed", 2717)
-            with torch.random.fork_rng(devices=[]):
-                torch.random.default_generator.manual_seed(seed)
-                self.correctness = Top1CorrectnessHead(hidden_channels=hidden_channels, **options)
         # No allocation/RNG draws when disabled. Enabling the new stage also
         # preserves initialization of every existing branch and CPU/CUDA RNG.
-        self.relation_refiner = None
-        if enable_relation_refinement:
-            options = dict(relation_refinement or {})
-            seed = int(options.pop("init_seed", 4717))
-            with torch.random.fork_rng(devices=[]):
-                torch.random.default_generator.manual_seed(seed)
-                self.relation_refiner = TwoStageRelationRefinement(hidden_channels=hidden_channels, **options)
         self.birs = None
         if enable_birs:
             options = dict(birs or {})
@@ -638,7 +613,7 @@ class REFHead(nn.Module):
                 self.birs = branch(hidden_channels=hidden_channels, **options)
 
     def _score_referring(self, query, text, text_mask):
-        if self.enable_crv or self.correctness is not None or self.relation_refiner is not None or self.birs is not None:
+        if self.birs is not None:
             return self.mrsm(query, text, text_mask, return_logits=True)
         score, attention = self.mrsm(query, text, text_mask)
         return score, attention, None
@@ -671,35 +646,6 @@ class REFHead(nn.Module):
             reference_classes=decoder_classes if original_references else classes,
             source_indices=source_indices,
         )
-
-    def _refine_relations(self, queries, boxes, classes, text, text_mask, scores, logits,
-                          img_metas, decoder_queries, decoder_boxes, decoder_classes, source_indices):
-        # Grab filters TARGET hypotheses. References must still come from the
-        # original DETR pool, not the text-conditioned/pruned target pool.
-        original_references = self.enable_grab or self.enable_detector_topk
-        reference_queries = self.refer_adapter(decoder_queries) if original_references else queries
-        return self.relation_refiner(
-            queries, boxes, classes, text, text_mask, scores, logits, img_metas,
-            reference_queries=reference_queries,
-            reference_boxes=decoder_boxes if original_references else boxes,
-            reference_classes=decoder_classes if original_references else classes,
-            source_indices=source_indices,
-        )
-
-    @staticmethod
-    def _crv_refer_gt(targets, img_metas):
-        result = []
-        for boxes, meta in zip(targets["bbox"], img_metas):
-            indices = meta["refer_target_index"]
-            if len(indices) > 1:
-                raise ValueError("CRV requires a single referring target per sample")
-            if not len(indices):
-                result.append(None)
-                continue
-            height, width = meta["img_shape"][:2]
-            box = boxes[indices[0]].detach().reshape(4)
-            result.append(box / box.new_tensor([width, height, width, height]))
-        return result
 
     def _enhance_background(self, queries, boxes, visuals, visual_masks, text, text_mask, img_metas):
         if not self.enable_bcem:
@@ -943,31 +889,6 @@ class REFHead(nn.Module):
             refer_logits = binding["final_logits"]
             if "diagnostics" in binding:
                 extra_dict["birs_samples"] = binding["diagnostics"]
-        if self.relation_refiner is not None:
-            relation = self._refine_relations(
-                refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,
-                refer_label, refer_logits, img_metas, inter_states[-1], outputs_coord[-1],
-                outputs_class[-1], selected_indices,
-            )
-            refer_score, ranking_priority = relation["scores"], relation["ranking_priority"]
-            value, metrics = self.relation_refiner.loss(relation, targets["bbox"], img_metas)
-            loss_dict["loss_relation_final"] = value
-            metrics.update(relation["metrics"])
-            loss_dict.update({"metric_relation_refinement_" + key: val for key, val in metrics.items()})
-            if "diagnostics" in relation:
-                extra_dict["relation_refinement_samples"] = relation["diagnostics"]
-        if self.enable_crv:
-            refer_score, ranking_priority, crv_losses, crv_info = self.crv(
-                multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
-                refer_label, refer_logits, img_metas, refer_query_embed,
-                refer_gt=self._crv_refer_gt(targets, img_metas),
-                epoch=targets.get("epoch"),
-            )
-            loss_dict.update(crv_losses)
-            for key in self.crv.metric_names:
-                loss_dict["metric_crv_" + key] = crv_info["crv_" + key]
-            refer_logits = crv_info["crv_final_logits"]
-            extra_dict.update(crv_info)
 
         pred_dict = {
             "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
@@ -980,14 +901,6 @@ class REFHead(nn.Module):
             pred_dict["ranking_priority"] = ranking_priority.detach()
         if self.birs is not None and self.birs.version in ("v3", "v4", "v5"):
             pred_dict["candidate_output_mask"] = binding["output_mask"].detach()
-        if self.enable_crv:
-            pred_dict["candidate_output_mask"] = crv_info["crv_output_mask"]
-        if self.correctness is not None:
-            observation = self.correctness(refer_query_embed, bound_boxes, lan_feat, lan_mask,
-                                           refer_score, refer_logits, selected_classes, img_metas, ranking_priority)
-            value, metrics = self.correctness.loss(observation, targets["bbox"], img_metas)
-            loss_dict["loss_correctness"] = value
-            loss_dict.update({"metric_correctness_" + key: metric for key, metric in metrics.items()})
         return loss_dict, pred_dict, extra_dict
 
     def forward_test(self, x, cls_feat=None, lan_feat=None, lan_mask=None, img=None, targets=None, with_mask=True):
@@ -1105,23 +1018,6 @@ class REFHead(nn.Module):
             refer_logits = binding["final_logits"]
             if "diagnostics" in binding:
                 extra_dict["birs_samples"] = binding["diagnostics"]
-        if self.relation_refiner is not None and int(self.relation_refiner.trained_steps) > 0:
-            relation = self._refine_relations(
-                refer_query_embed, bound_boxes, selected_classes, lan_feat, lan_mask,
-                refer_label, refer_logits, img_metas, inter_states[-1], outputs_coord[-1],
-                outputs_class[-1], selected_indices,
-            )
-            refer_score, ranking_priority = relation["scores"], relation["ranking_priority"]
-            if "diagnostics" in relation:
-                extra_dict["relation_refinement_samples"] = relation["diagnostics"]
-        if self.enable_crv:
-            # No GT (including targets['bbox']) is read during inference.
-            refer_score, ranking_priority, _, crv_info = self.crv(
-                multi_level_feats[0], multi_level_masks[0], bound_boxes, lan_feat, lan_mask,
-                refer_label, refer_logits, img_metas, refer_query_embed,
-            )
-            refer_logits = crv_info["crv_final_logits"]
-            extra_dict.update(crv_info)
 
         pred_dict = {
             "pred_global_mask": pred_seg.detach() if pred_seg is not None else None,
@@ -1134,14 +1030,4 @@ class REFHead(nn.Module):
             pred_dict["ranking_priority"] = ranking_priority.detach()
         if self.birs is not None and self.birs.version in ("v3", "v4", "v5"):
             pred_dict["candidate_output_mask"] = binding["output_mask"].detach()
-        if self.enable_crv:
-            pred_dict["candidate_output_mask"] = crv_info["crv_output_mask"]
-        if self.correctness is not None:
-            self.correctness.require_trained()
-            observation = self.correctness(refer_query_embed, bound_boxes, lan_feat, lan_mask,
-                                           refer_score, refer_logits, selected_classes, img_metas, ranking_priority)
-            pred_dict.update(top1_correct_probability=observation["probability"].detach(),
-                             top1_correct_logit=observation["logit"].detach(),
-                             top1_correct_query_index=observation["index"],
-                             top1_grouped_entropy=observation["entropy"])
         return pred_dict, extra_dict
