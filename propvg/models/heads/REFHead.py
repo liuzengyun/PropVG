@@ -33,6 +33,7 @@ from .two_stage_relation import TwoStageRelationRefinement
 from .binding_residual import BindingInteractionResidualScoring
 from .binding_residual_v3 import AdaptiveBindingResidualScoring
 from .binding_residual_v4 import CompetitiveBindingResidualScoring
+from .binding_residual_v5 import LocalBindingResidualScoring
 
 
 class GlobalCrossAttention(nn.Module):
@@ -621,7 +622,8 @@ class REFHead(nn.Module):
             with torch.random.fork_rng(devices=[]):
                 torch.random.default_generator.manual_seed(seed)
                 branch = {"v3": AdaptiveBindingResidualScoring,
-                          "v4": CompetitiveBindingResidualScoring}.get(
+                          "v4": CompetitiveBindingResidualScoring,
+                          "v5": LocalBindingResidualScoring}.get(
                               options.get("version"), BindingInteractionResidualScoring)
                 self.birs = branch(hidden_channels=hidden_channels, **options)
 
@@ -634,7 +636,7 @@ class REFHead(nn.Module):
     def _binding_residual(self, queries, boxes, classes, text, text_mask, scores, logits,
                           img_metas, decoder_queries, decoder_boxes, decoder_classes, source_indices):
         # Grab may prune targets, but must not remove the original reference pool.
-        original_references = self.enable_grab or self.birs.version in ("v3", "v4")
+        original_references = self.enable_grab or self.birs.version in ("v3", "v4", "v5")
         return self.birs(
             queries, boxes, classes, text, text_mask, scores, logits, img_metas,
             reference_queries=self.refer_adapter(decoder_queries) if original_references else queries,
@@ -892,7 +894,7 @@ class REFHead(nn.Module):
             )
             refer_score, ranking_priority = binding["scores"], binding["ranking_priority"]
             birs_losses, birs_metrics = self.birs.loss(binding, targets["bbox"], img_metas, target_gt_refer)
-            if self.birs.version in ("v3", "v4"):
+            if self.birs.version in ("v3", "v4", "v5"):
                 # Replace, not add another complete localization objective.
                 loss_dict["loss_refer"] = birs_losses.pop("loss_birs_crs") * self.loss_weight["refer"]
                 birs_losses["loss_birs_final"] = birs_losses["loss_birs_final"] * self.loss_weight["refer"]
@@ -936,7 +938,7 @@ class REFHead(nn.Module):
         }
         if ranking_priority is not None:
             pred_dict["ranking_priority"] = ranking_priority.detach()
-        if self.birs is not None and self.birs.version in ("v3", "v4"):
+        if self.birs is not None and self.birs.version in ("v3", "v4", "v5"):
             pred_dict["candidate_output_mask"] = binding["output_mask"].detach()
         if self.enable_crv:
             pred_dict["candidate_output_mask"] = crv_info["crv_output_mask"]
@@ -1086,7 +1088,7 @@ class REFHead(nn.Module):
         }
         if ranking_priority is not None:
             pred_dict["ranking_priority"] = ranking_priority.detach()
-        if self.birs is not None and self.birs.version in ("v3", "v4"):
+        if self.birs is not None and self.birs.version in ("v3", "v4", "v5"):
             pred_dict["candidate_output_mask"] = binding["output_mask"].detach()
         if self.enable_crv:
             pred_dict["candidate_output_mask"] = crv_info["crv_output_mask"]

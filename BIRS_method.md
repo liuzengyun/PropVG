@@ -1,6 +1,205 @@
 # 航拍视觉指代的文本条件竞争集合与关系绑定细化（BIRS）
 
-## 当前主方案：第四版 v4——竞争式反事实关系细化
+## 第五版 v5：候选专属近邻参考的关系竞争细化
+
+更新日期：2026-11-20。实现：`propvg/models/heads/binding_residual_v5.py`，类名
+`LocalBindingResidualScoring`。本版独立接入，不修改 v3/v4 源文件；下文保留历史版本说明。
+配置通过 `enable_birs=True`、`birs_version="v5"` 启用。为避免影响原实验，主配置当前仍默认
+`"v3"`，且不自动改变用户设置的 BCEM、Grab、teacher、工作目录等选项。
+
+### 1. 动机与修改边界
+
+同一张航拍图中的不同候选，通常处于不同的局部物体配置中。全图前景池虽然覆盖较广，但也把远处、
+与当前候选关系较弱的物体一起送入关系评分。v5 先为各目标假设建立独立的局部参考集，再利用完整文本
+判断哪些邻居有用，使关系验证围绕该候选附近的场景展开。
+
+这不是新增一个目标检测器，也不解析“黑车”“左边”等文本成分。不需要关系标注、参考物 GT 或新外部模型。
+仍保留原 CRS 初始评分，以及 v3 的聚类自适应连续 Top-N、关系支持差、可学习残差和完整候选 BCE。
+文本交互、sparsemax 和 null 本来就存在于 v3；本次核心变化是**候选专属、最多8个的零重叠近邻池**。
+本版是待实验验证的结构改动，不保证性能提升，也不声称实现了严格因果识别。
+
+### 2. 每一步的做法与目的
+
+#### 2.1 保留 v3 的目标竞争集合
+
+对原候选特征做8类确定性聚类，依据 CRS 前3名所属的簇，在前32名中找最远覆盖位置，得到至少5、
+最多32个的连续排名前缀。所有中间排名都纳入，不仅保留某个簇。目的：保持原实验的可比较性，
+仅对已有较高响应的目标假设做关系细化。
+
+#### 2.2 先找可靠的前景参考池
+
+使用原检测器前景置信度，从原解码器候选中**先取 Top-64，再按置信度以 IoU≥0.8 去重**，不补满。
+参考特征仍来自 pre-BCEM 的原解码器，经原 `refer_adapter`；不因为 Grab 裁剪了目标集合而丢掉原参考池。
+目的：不直接把256个候选中的低质量背景框都当作参考。Top-64仅是前景置信度排序上限，并非绝对置信度保证。
+
+#### 2.3 每个候选分别选最近8个合法邻居
+
+对于目标假设 i：
+
+1. 排除与自己源 query ID 相同的参考。
+2. 排除与自己有任意正面积交集的参考，要求 `IoU(target, reference)==0`。边界相接、交集面积为0的框允许保留。
+3. 按候选中心与参考中心的欧氏距离排序，选最近至多 `neighbour_topk=8` 个。距离相同保留前景池原顺序。
+4. 不足8个不补重复框，空槽严格掩码；每个候选的参考集独立计算，允许不同候选共享某个真实参考。
+
+框先按原有效图像宽高归一化。计算距离时再乘 `[W/min(H,W), H/min(H,W)]`，恢复等比例距离：
+
+$$d_{ij}=\sqrt{\left(\frac{x_j-x_i}{\min(H,W)}\right)^2+
+                      \left(\frac{y_j-y_i}{\min(H,W)}\right)^2},$$
+
+上式 x、y 为有效图像中的像素中心坐标；实现不依赖 padding 大小，不把非方图横向和纵向距离错误地等权缩放。
+目的：邻居代表当前候选附近的独立物体，而不是同一目标的另一个框、局部框或包含目标的大框。
+
+“零重叠”指**参考与当前候选**之间；参考彼此只沿用前景池的近重复去重，未强制所有参考之间 IoU=0。
+这避免改变之前约定的 Top-64 去重策略，也不把真实不同但部分重叠的物体全部删除。
+
+#### 2.4 文本筛选：最多8个，不是必须使用8个
+
+沿用 v3 的共享关系评分器。目标、参考分别投影到 D=128；相对位置、方向、距离、宽高比、
+目标尺度归一化偏移组成9维几何，并投影到128维。对每个邻居构造：
+
+$$e_{ij}=\operatorname{MLP}([q_i;v_j;\phi(g_{ij});q_i\odot v_j]).$$
+
+这些关系 token 读取完整文本 T，再得到每个参考的 evidence logit；目标和句子表示共同产生 null logit：
+
+$$a_i=\operatorname{sparsemax}([\ell_{i1},\ldots,\ell_{iH},\ell_{i\varnothing}]),
+\qquad H\le8.$$
+
+非法槽位永远权重0，null始终合法且 value=0。无额外软注意力保底、无强制参考最小权重。
+稀疏选择后的有效参考数量可以为0至8；它是模型选中的证据数量，不等于真实参考物数量。
+本版采用稳定的 masked sparsemax，避免非法槽位的有限负占位数超过极低的合法 logit。
+
+汇聚关系后，沿用 v3 的目标＋句子＋关系汇聚 support MLP，得到未校准的标量支持分，**不是概率**。
+目的：几何近邻只负责提供局部证据，文本决定哪些邻居对这句描述有用，不手工拆解描述。
+
+#### 2.5 固定局部集合做反事实对照
+
+事实分支用真实语义—几何对应。对照分支固定同一目标、同一文本、同一参考语义集合及其数量，
+只在该候选合法的局部参考内部做两次确定性非原样循环置换，交换完整9维几何向量：
+
+$$S_i^+=F(q_i,\{(v_j,g_{ij})\},T),\qquad
+S_{i,m}^-=F(q_i,\{(v_j,g_{i\pi_m(j)})\},T).$$
+
+沿用 v3 的完整几何重绑定，**不是 v4 的中心交换/尺寸保持策略**。不移动图像像素、不修改检测框，
+不重新搜索邻居，不让 null 参与置换，不引入 GT。每个分支共享评分器并重新计算文本注意力，
+允许破坏对应后参考的相关性发生改变。最多8个关系 token 真正进入评分，而非对64个全部计算后才掩码。
+目的：比较当前候选得到的支持是否来自语义与空间配置的正确结合，而不仅是附近物体的存在。
+
+#### 2.6 无参考就不用关系残差
+
+若合法邻居不足两个，无法构造置换对照，令关系差为0。若事实路径完全选择null，也令关系差为0，
+即使某个对照路径重新分配注意力给真实参考，也不据此强加负残差。
+
+$$\Delta_i=\begin{cases}
+S_i^+-\frac1M\sum_m S_{i,m}^-, &\text{至少两个合法邻居且事实路径读取了真实参考},\\
+0,&\text{否则}.
+\end{cases}$$
+
+$$z_i^{\mathrm{final}}=z_i^{\mathrm{CRS}}+\beta\Delta_i,
+\qquad\beta=2\operatorname{sigmoid}(a),\quad\beta_{\mathrm{init}}=0.1.$$
+
+不使用熵门控、不添加新融合网络；仅在原连续 Top-N 内输出排序。新分支未进行任何优化步时，
+测试仍回退原 CRS 分数。注意：回退分数不等于取消原有 Top-N 输出限制。
+
+### 3. 整体数据流与维度
+
+设 B 为 batch，P 通常256个原检测候选，N 为每图自适应竞争数，K 为本 batch 最大 N，
+R=min(64,P) 为带掩码的全局参考池宽度，H=min(8,R) 为局部带掩码宽度，L 为文本长度。
+
+```text
+BEiT-3 + SimFPN + 原检测解码器
+  ├─ 目标候选特征（可经原Grab/BCEM）[B,P,256] → 原CRS logits[B,P,1]
+  │     └─ v3聚类/排序选择 → 目标[B,K,128]，目标框[B,K,4]
+  └─ pre-BCEM原检测特征 + 检测前景得分
+        └─ Top64再去重 → 参考池[B,R,128]，框[B,R,4]，有效mask[B,R]
+               ↓ 每目标：排除自身/正面积重叠，按等比例中心距离取最近8个
+        局部参考[B,K,H,128]、原query索引[B,K,H]、合法mask[B,K,H]
+               ↓ 目标 + 局部参考 + 9维几何 + 逐元素交互
+        关系token[B,K,H,128] ← 完整文本[B,L,128]
+               ↓ 文本交叉注意力 + sparsemax(局部参考/null)
+        事实support[B,K]、注意力[B,K,H+1]
+               ↓ 固定局部集合、两次几何循环重绑定，共享评分器
+        对照support[B,K,2]
+               ↓ 有参考时计算差值，否则0
+        Δ[B,K] → scatter至原候选[B,P] → 原CRS logit + βΔ
+               ↓ 仅在Top-N内排序，返回目标框；检测框本身不变
+```
+
+单个目标的文本注意力实际 query 数最多8。为兼容已有分析接口，保存的 `selected_attention`
+会将局部权重 scatter 回 `[B,K,R+1]`，未入近邻的全局参考权重为0，最后一位仍为null。
+
+### 4. 损失、梯度和训练/测试一致性
+
+$$\mathcal L=\mathcal L_{\mathrm{det}}+\mathcal L_{\mathrm{other}}
+              +1.0\mathcal L_{\mathrm{CRS\ BCE}}+0.5\mathcal L_{\mathrm{final\ BCE}}.$$
+
+两项BCE保持 v3 的原 Hungarian refer 标签、全有效候选监督、每图/全局有效样本归一化。
+不只监督Top-N，未进入Top-N的候选也保留BCE。原 head 的 refer 权重仍乘两项BCE；其余检测、
+Grab、BCEM 等损失不变。本版不加独立CF hinge，不采用v4的软参考路径。
+
+`detach_inputs=False`默认联合优化：最终BCE可影响CRS、关系评分器、融合强度和候选/文本上游。
+框坐标、前景排序、去重、近邻和几何置换均为离散/截断路径，不通过该模块新增框坐标梯度。
+`detach_inputs=True`保留 v3 行为：新增分支截断输入，原CRS BCE仍训练原模型。
+空GT/空参考/全padding时保持有限损失和连通零梯度，兼容DDP无效样本。
+
+训练和测试使用同一前景池、近邻筛选、文本读取和确定性对照；只有loss读取GT，不因测试结果改变阈值。
+
+### 5. 使用、旧版本兼容和验证接口
+
+主配置 `configs/aerialvg/PropVG-aerialvg.py` 中：
+
+```python
+enable_birs = True
+birs_version = "v5"  # 原默认仍为v3，手动改这一项启用。
+# v5配置分支中：
+# neighbour_topk=8, reference_topk=64, duplicate_iou=0.8,
+# final_mix=0.5, detach_inputs=False, checkpoint_chunks=True
+```
+
+建议自行给v5设置独立 `work_dir`；原配置当前 BCEM 开关保持用户已有值，切版本不会自动开启BCEM。
+若对照组合实验，须自行保持两组 `enable_bcem` 等其余配置一致。
+
+v5 schema=6，近邻数/距离定义/零重叠规则/对照/null策略进入独立策略签名。
+v3/v4权重不能当v5直接测试或断点恢复；要初始化新分支，使用原有 `--finetune-from` 工作流。
+v3评估仍使用v3归档配置；`enable_birs=False` 仍不构建分支，旧baseline/Grab/BCEM模型加载规则不变。
+本次没有更改 `binding_residual_v3.py`、`binding_residual_v4.py` 或通用checkpoint加载器。
+
+通过 `with model.head.birs.diagnostics():` 和 `extra_dict['birs_samples']` 可检查：
+
+- `target_indices[B,K]` / `target_valid`：目标假设的原候选索引和有效性。
+- `local_reference_indices[B,K,H]`：原检测query索引；无效槽为−1，必须结合 `local_reference_valid`。
+- `local_reference_slots[B,K,H]`：在共享Top-64池内的槽位，用于对齐权重。
+- `local_reference_distances[B,K,H]`：短边归一化中心距离；无效槽存0，不可把它当真实最近距离。
+- `reference_boxes` / `reference_confidence`：全局前景池的框与检测置信度。
+- `selected_attention[B,K,R+1]` / `selected_control_attention[B,K,2,R+1]`：事实/对照文本权重。
+- `selected_support[B,K]` / `selected_controls[B,K,2]` / `delta[B,P]` / `eligible[B,P]`：支持分、最终残差及适用mask。
+
+`null` 这个历史诊断字段依旧表示**对照support均值**，不是null注意力！null权重须读取
+`selected_attention[..., -1]`。`reference_count`仍统计共享池；局部数量读取
+`local_reference_valid.sum(-1)`，文本后有效数量读取 `selected_sparse_reference_count`。
+
+专项测试：`PYTHONPATH=.:tools python -W ignore -m unittest test_birs_v5`。
+测试覆盖等比例近邻距离、严格零重叠、变长/空参考、固定对照池、null回退、全候选BCE权重、
+梯度边界、checkpoint重算、策略签名、head训练/测试和原模型初始化隔离；旧v3归档数值回归另外保留。
+这些是CPU小型逻辑验证，不代表完整GPU训练或性能验证。
+
+2026-11-20验证记录：196项CPU回归通过，包含v5专项13项，以及v1/v2/v3/v4、BCEM、Grab、
+correctness、可选管线和原两阶段关系模块；其中保留直接加载指定v3实验归档源码的逐值数值对照。
+未启动正式数据训练，也未运行CUDA或多进程DDP训练；不能用本记录声称性能改善。
+
+### 6. 待验证的局限与建议实验
+
+最近8个可能漏掉远处真正参考；严格零重叠会排除真实重叠物体；检测Top-64不保证参考都是前景。
+局部邻居外观相近时，重绑定可能只是近似等价的排列；几何破坏也不保证违反这句文本。
+null全选时关系分支没有有效残差，可能发生学习不足；本版不为了防塌缩强制读取参考。
+离散近邻选择无梯度，但关系特征仍参与联合训练，不能把“离散筛选截断”误解为整个模块冻结。
+
+建议与相同训练设置的v3比较：Top1/Top5/mIoU、每候选局部数量、文本筛选后数量、null权重、
+关系残差、改对/改错数和近邻可视化。若退化，先区分“近邻漏参考”“null垄断”“反事实无区分度”，
+不要直接叠加额外损失。近邻数4/8/12只能在val消融，不能用test选超参数。
+
+---
+
+## 历史方案：第四版 v4——竞争式反事实关系细化
 
 更新日期：2026-11-18。代码：`propvg/models/heads/binding_residual_v4.py`。
 主配置选择 `birs_version="v4"`，`enable_birs=False` 时完全不调用该模块。

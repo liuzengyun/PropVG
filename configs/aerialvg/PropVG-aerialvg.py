@@ -5,7 +5,7 @@ from propvg.datasets.aerialvg import AerialVG  # noqa: F401
 from propvg.datasets.aerialvg_pipeline import LoadAerialVGAnnotations  # noqa: F401
 del AerialVG, LoadAerialVGAnnotations
 
-work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-birs4+bcem8"
+work_dir = "/media/vision/lzy/PropVG/work_dir/aerialvg/PropVG-birs3"
 
 # AerialVG provides one referred target (regions[0]); optional additional
 # region boxes serve only as proposal/teacher-style supervision.
@@ -69,10 +69,11 @@ crv_start_epoch = 20  # 1-based: no CRV training or reranking before this epoch;
 # v2：第二版，CRS Top-N共用原型，只在Top-N内部重排（保留全候选BCE修复）。
 # v3：聚类自适应Top-N + 稀疏关系读取 + 显式重绑定对照，仅输出Top-N。
 # v4：竞争式CF监督 + 参考软读取 + 防泄漏过滤 + 聚焦位置干预。
+# v5：每候选最近8个零重叠参考 + 文本稀疏筛选/null；保留v3两项BCE。
 enable_birs = True
-birs_version = "v3"  # "v1" / "v2" / "v3" / "v4"；不改变 enable_bcem 等其他开关。
+birs_version = "v3"  # "v1" / "v2" / "v3" / "v4" / "v5"；切v5即可启用新方案，其他开关不变。
 birs_target_topn = 5
-birs_num_groups = 8  # v1/v3/v4使用；不是只保留得分最高的一簇。
+birs_num_groups = 8  # v1/v3/v4/v5使用；不是只保留得分最高的一簇。
 birs = dict(version=birs_version, target_topn=birs_target_topn,
             num_groups=birs_num_groups, kmeans_iters=6,  # 仅v1使用。
             reference_topk=64, duplicate_iou=0.8,
@@ -102,6 +103,14 @@ if birs_version == "v4":
                 reference_coverage=0.5, semantic_difference=0.05,
                 control_reference_topk=4)
 
+if birs_version == "v5":
+    birs = dict(version="v5", num_groups=birs_num_groups, kmeans_iters=6,
+                seed_topk=3, min_targets=5, max_targets=32,
+                reference_topk=64, duplicate_iou=0.8, neighbour_topk=8,
+                model_dim=128, num_heads=4, chunk_size=8,
+                permutations=2, initial_strength=0.1, max_strength=2.0,
+                final_mix=0.5, detach_inputs=False, checkpoint_chunks=True)
+
 
 # CRS -> shared-reference relational refinement. Disabled preserves old models.
 # Train alongside CRS; independent of teacher/auxiliary GT; not with CRV.
@@ -121,7 +130,7 @@ relation_refinement = dict(
 
 # 背景信息嵌入的候选增强模块
 # Candidate background enhancement before CRS; disable for the PropVG baseline.
-enable_bcem = True
+enable_bcem = False
 bcem_sampling_mode = "ray"
 bcem_num_rays = 8
 # Used only by sector mode; 8 reproduces the original direction order.
