@@ -14,28 +14,36 @@ from .binding_residual_v3 import AdaptiveBindingResidualScoring
 
 
 class LocalBindingResidualScoring(AdaptiveBindingResidualScoring):
-    def __init__(self, version="v5", neighbour_topk=8, **kwargs):
+    def __init__(self, version="v5", neighbour_topk=8, allow_null=False, **kwargs):
         if version != "v5":
             raise ValueError("LocalBindingResidualScoring requires version='v5'")
         if isinstance(neighbour_topk, bool) or int(neighbour_topk) != neighbour_topk or neighbour_topk < 1:
             raise ValueError("BIRS v5 neighbour_topk must be a positive integer")
+        if not isinstance(allow_null, bool):
+            raise ValueError("BIRS v5 allow_null must be a bool")
         # This experiment changes reference retrieval, not the v3 objective.
         if kwargs.get("cf_loss_weight", 0) != 0 or kwargs.get("attention_soft_mix", 0) != 0:
             raise ValueError("BIRS v5 keeps cf_loss_weight=0 and attention_soft_mix=0")
         super().__init__(version="v3", **kwargs)
         self.version, self.neighbour_topk = "v5", int(neighbour_topk)
+        self.allow_null = allow_null
         policy = dict(parent_signature=self.policy_signature.tolist(), version="v5",
                       neighbour_topk=self.neighbour_topk, distance="image_short_side_center_l2",
                       overlap="target_reference_iou_exact_zero", references="nearest_after_topk_nms",
                       controls="fixed_local_set_full_geometry_cyclic_v1",
                       attention="stable_sparsemax_with_null_v1", null="factual_null_only_zero_delta")
+        # Keep the archived v5 policy byte-for-byte for explicit legacy tests.
+        # New v5 cannot choose null whenever at least one real neighbour exists.
+        if not self.allow_null:
+            policy.update(attention="stable_sparsemax_real_references_only_v1",
+                          null="empty_pool_fallback_only", allow_null=False)
         digest = hashlib.sha256(json.dumps(policy, sort_keys=True).encode()).digest()
         self.policy_signature.copy_(torch.tensor(list(digest), dtype=torch.uint8))
-        self.schema_version.fill_(6)
+        self.schema_version.fill_(6 if self.allow_null else 7)
 
     @staticmethod
     def sparse_weights(logits, allowed):
-        """Stable masked sparsemax; the null slot is always legal."""
+        """Stable masked sparsemax; caller ensures an allowed real/fallback slot."""
         z = logits.float().masked_fill(~allowed, float('-inf'))
         z = z-z.max(-1, keepdim=True).values
         ordered = z.sort(-1, descending=True).values
@@ -76,10 +84,17 @@ class LocalBindingResidualScoring(AdaptiveBindingResidualScoring):
         read, _ = self.text_attention(tokens, t, t, key_padding_mask=mask, need_weights=False)
         read = self.read_norm(tokens+read).reshape(b, k, h, d)
         sentence = sentence[:, None].expand(-1, k, -1)
-        null = self.null_logit(torch.cat((target, sentence), -1))
+        evidence = self.evidence_logit(read).squeeze(-1)
+        if self.allow_null:
+            null = self.null_logit(torch.cat((target, sentence), -1))
+            null_allowed = legal.new_ones(b, k, 1)
+        else:
+            # Retain null_logit parameters for legacy checkpoint layout only;
+            # never evaluate them or let their logits compete with references.
+            null = evidence.new_zeros(b, k, 1)
+            null_allowed = ~legal.any(-1, keepdim=True)
         attention = self.sparse_weights(
-            torch.cat((self.evidence_logit(read).squeeze(-1), null), -1),
-            torch.cat((legal, legal.new_ones(b, k, 1)), -1))
+            torch.cat((evidence, null), -1), torch.cat((legal, null_allowed), -1))
         pooled = (attention[..., :-1, None]*read).sum(-2)
         support = self.support(torch.cat((target, sentence, pooled), -1)).squeeze(-1)
         return support, attention, (attention[..., :-1] > 0).sum(-1)
@@ -158,9 +173,10 @@ class LocalBindingResidualScoring(AdaptiveBindingResidualScoring):
                 control_attentions.append(torch.stack(branch_attentions[1:], 2))
         actual, counter = torch.cat(factual, 1), torch.cat(controls, 1)
         attention, legal = torch.cat(attentions, 1), torch.cat(legal_parts, 1)
-        # A factual null-only selection means no relation evidence, even if a
-        # corrupted arrangement could make a real reference receive attention.
-        eligible_selected = selected_valid & (legal.sum(-1) >= 2) & (attention[..., :-1].sum(-1) > 0)
+        eligible_selected = selected_valid & (legal.sum(-1) >= 2)
+        if self.allow_null:
+            # Historical policy: factual null-only selection disables residual.
+            eligible_selected &= attention[..., :-1].sum(-1) > 0
         evidence = torch.where(eligible_selected, actual-counter.mean(-1), torch.zeros_like(actual))
         strength = self.max_strength*self.strength_logit.sigmoid()
         selected_delta = evidence*strength

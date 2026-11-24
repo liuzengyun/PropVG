@@ -100,8 +100,8 @@ class BIRSV5Tests(unittest.TestCase):
         for key in ('scores','delta','local_reference_indices','selected_controls'):
             torch.testing.assert_close(out[key],again[key],rtol=0,atol=0)
 
-    def test_null_only_returns_crs_even_if_control_reads_references(self):
-        m=self.branch();calls=[0]
+    def test_legacy_null_only_returns_crs_even_if_control_reads_references(self):
+        m=self.branch(allow_null=True);calls=[0]
         def scorer(target,reference,geometry,text,padding,sentence,legal):
             b,k,h=legal.shape
             attn=target.new_zeros(b,k,h+1)
@@ -126,6 +126,31 @@ class BIRSV5Tests(unittest.TestCase):
         torch.testing.assert_close(attn,torch.tensor([[.5,0.,.5],[0.,0.,1.]]))
         attn.sum().backward()
         self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_real_references_mandatory_and_null_scorer_not_called(self):
+        m=self.branch()
+        with torch.no_grad():
+            m.null_logit.weight.zero_();m.null_logit.bias.fill_(1e6)
+            m.evidence_logit.weight.zero_();m.evidence_logit.bias.fill_(-1e6)
+        with patch.object(m.null_logit,'forward',side_effect=AssertionError('null scorer must be unused')):
+            with m.diagnostics():out=self.forward(m)
+        legal=out['legal_references'].gather(1,out['target_indices'][...,None].expand(-1,-1,out['reference_indices'].shape[1]))
+        has=legal.any(-1)
+        self.assertTrue(has.any())
+        for attn in (out['selected_attention'],*out['diagnostics']['selected_control_attention'].unbind(2)):
+            self.assertTrue((attn[...,-1][has]==0).all())
+            torch.testing.assert_close(attn[...,:-1].sum(-1)[has],torch.ones_like(attn[...,0][has]))
+            self.assertTrue(((attn[...,:-1]>0).sum(-1)[has]>=1).all())
+            self.assertTrue((attn[...,-1][~has]==1).all())
+        self.assertTrue(torch.equal(out['eligible'].gather(1,out['target_indices']),out['target_valid'] & (legal.sum(-1)>=2)))
+
+    def test_no_reference_fallback_is_not_a_learned_null_choice(self):
+        m=self.branch();args=list(legacy.BIRSTests().inputs())
+        out=self.forward(m,args,reference_queries=torch.full_like(args[0],float('nan')))
+        self.assertFalse(out['local_reference_valid'].any())
+        self.assertTrue((out['selected_attention'][...,-1]==1).all())
+        self.assertEqual(float(out['delta'].abs().sum()),0)
+        torch.testing.assert_close(out['scores'],args[5],rtol=0,atol=0)
 
     def test_bce_full_candidates_weights_and_gradients(self):
         m=self.branch(min_targets=3,max_targets=3)
@@ -187,6 +212,7 @@ class BIRSV5Tests(unittest.TestCase):
         wrap=lambda b:SimpleNamespace(head=SimpleNamespace(birs=b))
         state={'head.birs.'+k:v for k,v in m.state_dict().items()}
         _validate_birs_checkpoint(wrap(self.branch()),state)
+        with self.assertRaises(ValueError):_validate_birs_checkpoint(wrap(self.branch(allow_null=True)),state)
         with self.assertRaises(ValueError):_validate_birs_checkpoint(wrap(self.branch(neighbour_topk=4)),state)
         old=AdaptiveBindingResidualScoring(hidden_channels=16,model_dim=16,num_heads=4,
               reference_topk=8,seed_topk=2,min_targets=3,max_targets=7,num_groups=2,chunk_size=2)
@@ -204,8 +230,32 @@ class BIRSV5Tests(unittest.TestCase):
         exec(compile(source.replace('birs_version = "v3"','birs_version = "v5"',1),str(path),'exec'),new)
         self.assertEqual(new['model']['head']['birs']['version'],'v5')
         self.assertEqual(new['model']['head']['birs']['neighbour_topk'],8)
+        self.assertFalse(new['model']['head']['birs']['allow_null'])
         for key in ('enable_bcem','enable_grab','teacher','work_dir'):
             self.assertEqual(old[key],new[key])
+
+    def test_explicit_legacy_policy_matches_archived_v5(self):
+        root=Path(__file__).resolve().parents[1]
+        archives=list((root/'work_dir/aerialvg/PropVG-birs5+bcem8').glob(
+            '20261120_161005*/propvg/models/heads/binding_residual_v5.py'))
+        if not archives:self.skipTest('Archived first v5 experiment unavailable')
+        path=archives[0]
+        namespace={'__name__':'propvg.models.heads._archived_v5','__package__':'propvg.models.heads'}
+        exec(compile(path.read_text(),str(path),'exec'),namespace)
+        new=self.branch(allow_null=True)
+        old=namespace['LocalBindingResidualScoring'](hidden_channels=16,model_dim=16,num_heads=4,
+            reference_topk=8,seed_topk=2,min_targets=3,max_targets=7,num_groups=2,
+            chunk_size=2,checkpoint_chunks=False)
+        torch.testing.assert_close(new.policy_signature,old.policy_signature,rtol=0,atol=0)
+        self.assertEqual(int(new.schema_version),int(old.schema_version))
+        old.load_state_dict(new.state_dict(),strict=True)
+        args=legacy.BIRSTests().inputs()
+        a,b=self.forward(old,args),self.forward(new,args)
+        for key in ('scores','final_logits','delta','selected_attention','selected_support','selected_controls'):
+            torch.testing.assert_close(a[key],b[key],rtol=0,atol=0)
+        targets,labels=legacy.BIRSTests().supervision()
+        for key,value in old.loss(a,targets,args[-1],labels)[0].items():
+            torch.testing.assert_close(value,new.loss(b,targets,args[-1],labels)[0][key],rtol=0,atol=0)
 
     def test_real_head_v5_and_baseline_initialization_unchanged(self):
         options=legacy.BIRSTests().head_options();options.pop('birs',None);options['enable_birs']=False

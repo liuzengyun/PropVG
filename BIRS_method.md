@@ -17,8 +17,10 @@
 
 更新日期：2026-11-20。实现：`propvg/models/heads/binding_residual_v5.py`，类名
 `LocalBindingResidualScoring`。本版独立接入，不修改 v3/v4 源文件；下文保留历史版本说明。
-配置通过 `enable_birs=True`、`birs_version="v5"` 启用。为避免影响原实验，主配置当前仍默认
-`"v3"`，且不自动改变用户设置的 BCEM、Grab、teacher、工作目录等选项。
+2026-11-21修订：v5默认 `allow_null=False`，有合法近邻必须读取真实参考，防止学成主动全选null。
+旧v5的可选null模式仅通过 `allow_null=True` 显式保留，用于已有模型复测。
+配置通过 `enable_birs=True`、`birs_version="v5"` 启用。不自动改变用户设置的
+BCEM、Grab、teacher、工作目录等选项；v3仍可通过版本开关独立选择。
 
 ### 1. 动机与修改边界
 
@@ -28,7 +30,8 @@
 
 这不是新增一个目标检测器，也不解析“黑车”“左边”等文本成分。不需要关系标注、参考物 GT 或新外部模型。
 仍保留原 CRS 初始评分，以及 v3 的聚类自适应连续 Top-N、关系支持差、可学习残差和完整候选 BCE。
-文本交互、sparsemax 和 null 本来就存在于 v3；本次核心变化是**候选专属、最多8个的零重叠近邻池**。
+文本交互和sparsemax本来就存在于v3；本次核心变化是**候选专属、最多8个的零重叠近邻池**。
+最新v5移除了“有邻居却可主动选null”的竞争路径，不改变v3/v4的null机制。
 本版是待实验验证的结构改动，不保证性能提升，也不声称实现了严格因果识别。
 
 ### 2. 每一步的做法与目的
@@ -72,14 +75,17 @@ $$d_{ij}=\sqrt{\left(\frac{x_j-x_i}{\min(H,W)}\right)^2+
 
 $$e_{ij}=\operatorname{MLP}([q_i;v_j;\phi(g_{ij});q_i\odot v_j]).$$
 
-这些关系 token 读取完整文本 T，再得到每个参考的 evidence logit；目标和句子表示共同产生 null logit：
+这些关系token读取完整文本T，再得到每个合法参考的evidence logit。新模式只在真实参考之间分配权重：
 
-$$a_i=\operatorname{sparsemax}([\ell_{i1},\ldots,\ell_{iH},\ell_{i\varnothing}]),
-\qquad H\le8.$$
+$$a_i=\operatorname{sparsemax}([\ell_{ij}]_{j\in\mathcal R_i}),
+\qquad 1\le|\mathcal R_i|\le8,\quad\sum_{j\in\mathcal R_i}a_{ij}=1.$$
 
-非法槽位永远权重0，null始终合法且 value=0。无额外软注意力保底、无强制参考最小权重。
-稀疏选择后的有效参考数量可以为0至8；它是模型选中的证据数量，不等于真实参考物数量。
+非法槽位永远权重0。有合法邻居时null槽位被硬掩码，不计算null评分；文本筛选后至少一个真实参考权重大于0，
+最多8个，不是强制所有邻居都非零。只在整个邻居池为空时，固定零value占位槽权重为1，避免全掩码数值错误。
+这是无合法参考的处理，不是可学习的“选择不使用参考”。不会填入自身、重叠框、低于前景池范围的框来凑数。
+无额外softmax混合或参考权重下限。有效参考数量是模型选中的证据数量，不等于真实参考物数量。
 本版采用稳定的 masked sparsemax，避免非法槽位的有限负占位数超过极低的合法 logit。
+`allow_null=True`仅复现旧v5：合法参考与可学习null共同竞争，允许全部选择null；不是新实验默认行为。
 
 汇聚关系后，沿用 v3 的目标＋句子＋关系汇聚 support MLP，得到未校准的标量支持分，**不是概率**。
 目的：几何近邻只负责提供局部证据，文本决定哪些邻居对这句描述有用，不手工拆解描述。
@@ -99,11 +105,12 @@ S_{i,m}^-=F(q_i,\{(v_j,g_{i\pi_m(j)})\},T).$$
 
 #### 2.6 无参考就不用关系残差
 
-若合法邻居不足两个，无法构造置换对照，令关系差为0。若事实路径完全选择null，也令关系差为0，
-即使某个对照路径重新分配注意力给真实参考，也不据此强加负残差。
+合法邻居不足两个时无法构造置换对照，令关系差为0。一个邻居时仍读取该邻居，事实/对照配置相同；
+零邻居时只用固定占位，回退CRS。两个以上合法邻居时，新模式不再以“事实路径是否选null”关闭残差。
+旧 `allow_null=True` 模式继续保留事实全选null时关闭残差的旧规则。
 
 $$\Delta_i=\begin{cases}
-S_i^+-\frac1M\sum_m S_{i,m}^-, &\text{至少两个合法邻居且事实路径读取了真实参考},\\
+S_i^+-\frac1M\sum_m S_{i,m}^-, &\text{至少两个合法邻居},\\
 0,&\text{否则}.
 \end{cases}$$
 
@@ -128,7 +135,7 @@ BEiT-3 + SimFPN + 原检测解码器
         局部参考[B,K,H,128]、原query索引[B,K,H]、合法mask[B,K,H]
                ↓ 目标 + 局部参考 + 9维几何 + 逐元素交互
         关系token[B,K,H,128] ← 完整文本[B,L,128]
-               ↓ 文本交叉注意力 + sparsemax(局部参考/null)
+               ↓ 文本交叉注意力 + sparsemax(仅合法真实参考)
         事实support[B,K]、注意力[B,K,H+1]
                ↓ 固定局部集合、两次几何循环重绑定，共享评分器
         对照support[B,K,2]
@@ -138,7 +145,8 @@ BEiT-3 + SimFPN + 原检测解码器
 ```
 
 单个目标的文本注意力实际 query 数最多8。为兼容已有分析接口，保存的 `selected_attention`
-会将局部权重 scatter 回 `[B,K,R+1]`，未入近邻的全局参考权重为0，最后一位仍为null。
+会将局部权重scatter回 `[B,K,R+1]`，未入近邻的全局参考权重为0。新模式最后一位仅作空池占位：
+有合法参考时严格为0，零合法参考时为1；旧模式才将它作为可学习的null选项。
 
 ### 4. 损失、梯度和训练/测试一致性
 
@@ -162,16 +170,21 @@ Grab、BCEM 等损失不变。本版不加独立CF hinge，不采用v4的软参�
 
 ```python
 enable_birs = True
-birs_version = "v5"  # 原默认仍为v3，手动改这一项启用。
+birs_version = "v5"  # 设置为v5启用；v3/v4保持各自原策略。
 # v5配置分支中：
 # neighbour_topk=8, reference_topk=64, duplicate_iou=0.8,
-# final_mix=0.5, detach_inputs=False, checkpoint_chunks=True
+# allow_null=False, final_mix=0.5, detach_inputs=False, checkpoint_chunks=True
 ```
 
 建议自行给v5设置独立 `work_dir`；原配置当前 BCEM 开关保持用户已有值，切版本不会自动开启BCEM。
 若对照组合实验，须自行保持两组 `enable_bcem` 等其余配置一致。
 
-v5 schema=6，近邻数/距离定义/零重叠规则/对照/null策略进入独立策略签名。
+新版v5 schema=7，近邻数/距离定义/零重叠规则/对照/禁止null策略进入独立策略签名。
+旧可选null的v5保留schema=6与原策略签名。为了保持权重布局，父类 `null_logit` 参数保留，
+但 `allow_null=False` 不调用该层、不使用其logit，只有通用DDP零梯度连接，不会参与参考竞争。
+不能把schema=6旧模型直接用禁止null的新策略评估/断点恢复；会明确报策略不匹配。
+复测 `20261120_161005` 等旧v5时，在原归档配置上覆盖 `model.head.birs.allow_null=True`。
+新策略应作为新实验训练；当前加载器不提供跨策略BIRS权重无缝迁移，不能直接拿旧v5作新策略resume。
 v3/v4权重不能当v5直接测试或断点恢复；要初始化新分支，使用原有 `--finetune-from` 工作流。
 v3评估仍使用v3归档配置；`enable_birs=False` 仍不构建分支，旧baseline/Grab/BCEM模型加载规则不变。
 本次没有更改 `binding_residual_v3.py`、`binding_residual_v4.py` 或通用checkpoint加载器。
@@ -186,12 +199,13 @@ v3评估仍使用v3归档配置；`enable_birs=False` 仍不构建分支，旧ba
 - `selected_attention[B,K,R+1]` / `selected_control_attention[B,K,2,R+1]`：事实/对照文本权重。
 - `selected_support[B,K]` / `selected_controls[B,K,2]` / `delta[B,P]` / `eligible[B,P]`：支持分、最终残差及适用mask。
 
-`null` 这个历史诊断字段依旧表示**对照support均值**，不是null注意力！null权重须读取
-`selected_attention[..., -1]`。`reference_count`仍统计共享池；局部数量读取
+`null`这个历史诊断字段依旧表示**对照support均值**，不是null注意力！最后一槽权重须读取
+`selected_attention[..., -1]`；在新版中它只代表空邻居池占位，`birs_null_attention`因此不再表示主动null偏好。
+`reference_count`仍统计共享池；局部数量读取
 `local_reference_valid.sum(-1)`，文本后有效数量读取 `selected_sparse_reference_count`。
 
 专项测试：`PYTHONPATH=.:tools python -W ignore -m unittest test_birs_v5`。
-测试覆盖等比例近邻距离、严格零重叠、变长/空参考、固定对照池、null回退、全候选BCE权重、
+测试覆盖等比例近邻距离、严格零重叠、变长/空参考、固定对照池、真实参考强制归一化、空池回退、全候选BCE权重、
 梯度边界、checkpoint重算、策略签名、head训练/测试和原模型初始化隔离；旧v3归档数值回归另外保留。
 这些是CPU小型逻辑验证，不代表完整GPU训练或性能验证。
 
@@ -199,15 +213,22 @@ v3评估仍使用v3归档配置；`enable_birs=False` 仍不构建分支，旧ba
 correctness、可选管线和原两阶段关系模块；其中保留直接加载指定v3实验归档源码的逐值数值对照。
 未启动正式数据训练，也未运行CUDA或多进程DDP训练；不能用本记录声称性能改善。
 
+2026-11-21禁止null修订验证：183项CPU回归通过，包含16项v5专项、v3/v4及其他保留模块。
+验证了事实/对照有合法邻居时真实参考总权重为1、null严格为0、null评分器不被调用，
+空邻居安全回退、全候选BCE/梯度/重算，以及显式 `allow_null=True` 与首版v5归档前向/损失逐值一致。
+新旧v5策略交叉加载会被拒绝。未启动正式训练或CUDA性能评估。
+
 ### 6. 待验证的局限与建议实验
 
 最近8个可能漏掉远处真正参考；严格零重叠会排除真实重叠物体；检测Top-64不保证参考都是前景。
 局部邻居外观相近时，重绑定可能只是近似等价的排列；几何破坏也不保证违反这句文本。
-null全选时关系分支没有有效残差，可能发生学习不足；本版不为了防塌缩强制读取参考。
+旧v5曾发生null垄断，新版有邻居必须读取，但这不保证邻居与文本相关，也不保证几何破坏后支持差有区分度。
+没有参考物的描述也会读取邻居，可能引入无关证据；模型仍可通过事实/对照支持差接近0或降低融合强度减少影响。
+强制读取解决的是“完全绕开参考”的退化，不能据此保证Top1/Top5改善。
 离散近邻选择无梯度，但关系特征仍参与联合训练，不能把“离散筛选截断”误解为整个模块冻结。
 
-建议与相同训练设置的v3比较：Top1/Top5/mIoU、每候选局部数量、文本筛选后数量、null权重、
-关系残差、改对/改错数和近邻可视化。若退化，先区分“近邻漏参考”“null垄断”“反事实无区分度”，
+建议与相同训练设置的v3和旧v5比较：Top1/Top5/mIoU、每候选局部数量、文本筛选后数量、空参考比例、
+关系残差、改对/改错数和近邻可视化。若退化，先区分“近邻漏参考”“无关参考”“反事实无区分度”，
 不要直接叠加额外损失。近邻数4/8/12只能在val消融，不能用test选超参数。
 
 ---
